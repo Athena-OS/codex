@@ -1,0 +1,261 @@
+---
+title: Domains & Subdomains
+description: Passive enumeration of an organization's domain footprint via certificate transparency logs, DNS records, and third-party services - building a target list without touching the target.
+mitre: [T1590.001, T1590.002, T1596.001, T1596.003, T1593]
+d3fend: [D3-NTA]
+impact: [InternalAccess]
+sidebar:
+  order: 2
+  label: Domains & Subdomains
+---
+
+## TL;DR
+
+Start with a primary domain. End with a list of every subdomain, vHost, mail server, name server, and IP address the organization exposes. Three primary sources, all queryable without touching the target's infrastructure:
+
+```
+# 1. Certificate Transparency - every TLS cert ever issued, public log
+curl -s 'https://crt.sh/?q=target.com&output=json' | jq -r '.[].name_value' | sort -u
+
+# 2. DNS - A/AAAA/MX/NS/TXT/SOA records, queried via a public resolver
+dig any target.com @8.8.8.8
+
+# 3. Hostname brute-force - for subdomains that have no public cert
+dnsenum --dnsserver 1.1.1.1 -f /usr/share/seclists/Discovery/DNS/subdomains-top1million-110000.txt target.com
+```
+
+Success indicator: a deduplicated list of FQDNs, each resolved to an IP, each IP classified as "company-owned" or "third-party hosted."
+
+## SSL certificate inspection
+
+Every TLS cert tells you which hostnames it covers. The browser's lock icon is your first recon tool - click it, view the certificate, read the **Subject Alternative Name** field. A single cert often covers multiple subdomains because operations teams provision wildcards or SAN lists for convenience.
+
+This is free intel and the target can't tell you looked. Same for the issuer field (which CA do they use - Let's Encrypt suggests automation; DigiCert/Sectigo suggests a procurement process; an internal CA suggests an internal PKI).
+
+## Certificate Transparency logs
+
+[Certificate Transparency](https://en.wikipedia.org/wiki/Certificate_Transparency) ([RFC 6962](https://tools.ietf.org/html/rfc6962)) requires CAs to log every certificate they issue to public audit logs. The intent was detection of misissued certs. The side effect: a searchable database of every hostname any CA has ever issued a cert for.
+
+[crt.sh](https://crt.sh/) is the public web frontend over the logs. Search by domain, get every cert ever issued for it.
+
+```shell
+# Web UI: https://crt.sh/?q=inlanefreight.com
+# JSON output for scripting:
+curl -s 'https://crt.sh/?q=inlanefreight.com&output=json' | jq .
+```
+
+Sample output (truncated):
+
+```json
+[
+  {
+    "issuer_name": "C=US, O=Let's Encrypt, CN=R3",
+    "common_name": "matomo.inlanefreight.com",
+    "name_value": "matomo.inlanefreight.com",
+    "not_before": "2021-08-21T05:00:16",
+    "not_after": "2021-11-19T05:00:15"
+  },
+  {
+    "issuer_name": "C=US, O=Let's Encrypt, CN=R3",
+    "common_name": "smartfactory.inlanefreight.com",
+    "name_value": "smartfactory.inlanefreight.com",
+    "not_before": "2021-07-26T23:32:47"
+  }
+]
+```
+
+For a clean list of unique subdomains:
+
+```shell
+curl -s 'https://crt.sh/?q=inlanefreight.com&output=json' \
+  | jq -r '.[].name_value' \
+  | sed 's/^\*\.//' \
+  | sort -u
+```
+
+```
+account.ttn.inlanefreight.com
+blog.inlanefreight.com
+bots.inlanefreight.com
+console.ttn.inlanefreight.com
+ct.inlanefreight.com
+inlanefreight.com
+iot.inlanefreight.com
+mail.inlanefreight.com
+marina.inlanefreight.com
+matomo.inlanefreight.com
+shop.inlanefreight.com
+smartfactory.inlanefreight.com
+www.inlanefreight.com
+```
+
+What this *doesn't* show:
+
+- Subdomains that never had a public cert (internal-only services using a private CA, or HTTP-only services)
+- Subdomains where the cert is on a wildcard (`*.inlanefreight.com` is one entry that covers many real hostnames)
+- Subdomains with very short-lived certs that have expired and aged out of some log aggregators
+
+Treat crt.sh as a strong starting point, not a complete inventory.
+
+## Resolving to IPs
+
+Once you have a hostname list, resolve each to an IP and filter for hosts the organization actually controls (rather than third-party hosted assets you can't test).
+
+```shell
+# Resolve each subdomain, print "hostname IP" pairs
+for sub in $(cat subdomains.txt); do
+  host "$sub" | grep "has address" | grep "$DOMAIN" | awk '{print $1, $NF}'
+done
+```
+
+```
+blog.inlanefreight.com 10.129.24.93
+inlanefreight.com 10.129.27.33
+matomo.inlanefreight.com 10.129.127.22
+www.inlanefreight.com 10.129.127.33
+s3-website-us-west-2.amazonaws.com 10.129.95.250
+```
+
+The last entry - `s3-website-us-west-2.amazonaws.com` - is hosted on AWS. Testing that bucket directly is testing AWS infrastructure, which is out of scope unless explicitly authorized. Note it, move on. (See [Cloud Resources](/codex/network/recon/cloud-resources/) for how to legitimately enumerate cloud buckets the org *owns*.)
+
+## DNS records - the `dig any` query
+
+After hostnames, query the DNS server itself for everything it'll disclose. The `ANY` query type asks for all record types in one shot:
+
+```shell
+dig any inlanefreight.com
+```
+
+```
+;; ANSWER SECTION:
+inlanefreight.com.      300     IN      A       10.129.27.33
+inlanefreight.com.      3600    IN      MX      1 aspmx.l.google.com.
+inlanefreight.com.      3600    IN      MX      5 alt1.aspmx.l.google.com.
+inlanefreight.com.      21600   IN      NS      ns.inwx.net.
+inlanefreight.com.      21600   IN      NS      ns2.inwx.net.
+inlanefreight.com.      3600    IN      TXT     "MS=ms92346782372"
+inlanefreight.com.      21600   IN      TXT     "atlassian-domain-verification=IJdXMt1rKCy68JFszSdCKVpwPN"
+inlanefreight.com.      3600    IN      TXT     "google-site-verification=O7zV5-xFh_jn7JQ31"
+inlanefreight.com.      3600    IN      TXT     "logmein-verification-code=87123gff5..."
+inlanefreight.com.      300     IN      TXT     "v=spf1 include:mailgun.org include:_spf.google.com include:spf.protection.outlook.com include:_spf.atlassian.net ip4:10.129.24.8 ip4:10.129.27.2 ~all"
+inlanefreight.com.      21600   IN      SOA     ns.inwx.net. hostmaster.inwx.net. ...
+```
+
+### What each record type tells you
+
+| Record | What it reveals |
+| --- | --- |
+| **A / AAAA** | IPv4 / IPv6 addresses for the hostname. Cross-check against your subdomain list - DNS may show hosts that crt.sh missed. |
+| **MX** | Mail servers. `google.com` MX = Google Workspace. `outlook.com` = Microsoft 365. Self-hosted MX = internal mail server worth investigating. |
+| **NS** | Authoritative name servers. The hosting provider is often inferrable from the NS suffix. |
+| **TXT** | The kitchen sink. Domain verification tokens for SaaS products (Atlassian, Google, Microsoft), SPF, DMARC, DKIM records. Each token reveals a SaaS the org uses. |
+| **CNAME** | Aliases. Often point to SaaS-hosted services (`support.target.com` → `target.zendesk.com` reveals Zendesk). |
+| **SOA** | Authoritative server + admin email. The admin email is sometimes a real person's mailbox. |
+
+### Reading the TXT field for infrastructure
+
+The TXT records in the example above tell you the company uses:
+
+- **Atlassian** (Jira/Confluence/Bitbucket) - software development & collaboration. Inventory their public Jira/Confluence instances; check for unauthenticated access to projects or pages.
+- **Google Workspace** (Gmail + GDrive) - credential phishing pretexts, and any link-shared Drive files are publicly accessible.
+- **LogMeIn** - centralized remote-access management. Compromising one admin account here gets you full systems control.
+- **Mailgun** - transactional email API. Worth checking for exposed Mailgun API keys in code/configs (IDOR/SSRF on the API).
+- **Outlook / Office 365** - Azure AD likely, OneDrive likely, Azure Files (SMB-over-cloud) likely.
+- **INWX** - domain registrar; the `MS=` token is a verification ID similar to a username.
+
+The IP addresses inside the SPF record (`ip4:10.129.24.8 ip4:10.129.27.2 ip4:10.72.82.106`) are mail servers authorized to send mail for the domain. Each is a host the company controls. Add them to your target list.
+
+## Querying a specific DNS server
+
+If you've identified the target's own authoritative name server (from the `NS` records), you can query it directly. Useful for:
+
+- Picking up records that public resolvers cache differently
+- Testing whether the server allows zone transfers (see the [DNS service page](/codex/network/services/dns/))
+- Bypassing query restrictions on resolvers that filter "noisy" record types
+
+```shell
+dig any inlanefreight.com @ns.inlanefreight.htb
+```
+
+## Brute-forcing subdomains
+
+Subdomains that never had a public certificate won't appear in crt.sh. To find them, brute-force using a wordlist.
+
+### Bash one-liner (transparent, no extra tools)
+
+```shell
+for sub in $(cat /usr/share/seclists/Discovery/DNS/subdomains-top1million-110000.txt); do
+  dig +short "${sub}.target.com" @ns.target.com 2>/dev/null \
+    | grep -E '^[0-9]' && echo "  → ${sub}.target.com"
+done
+```
+
+### `dnsenum`
+
+```shell
+dnsenum --dnsserver 10.129.14.128 --enum \
+  -p 0 -s 0 \
+  -o subdomains.txt \
+  -f /usr/share/seclists/Discovery/DNS/subdomains-top1million-110000.txt \
+  inlanefreight.htb
+```
+
+Output:
+
+```
+Brute forcing with subdomains-top1million-110000.txt:
+ns.inlanefreight.htb.       604800   IN    A    10.129.34.136
+mail1.inlanefreight.htb.    604800   IN    A    10.129.18.201
+app.inlanefreight.htb.      604800   IN    A    10.129.18.15
+dev.inlanefreight.htb.      604800   IN    A    10.129.42.5
+```
+
+### Recursive brute-force on discovered subdomains
+
+If `dnsenum` finds `dev.inlanefreight.htb`, immediately re-run against the new level - there are often dev/staging hostnames underneath:
+
+```shell
+dnsenum --dnsserver 10.129.14.128 -p 0 -s 0 \
+  -f /usr/share/seclists/Discovery/DNS/fierce-hostlist.txt \
+  dev.inlanefreight.htb
+```
+
+```
+dev1.dev.inlanefreight.htb.     604800   IN    A   10.12.3.6
+ns.dev.inlanefreight.htb.       604800   IN    A   127.0.0.1
+win2k.dev.inlanefreight.htb.    604800   IN    A   10.12.3.203
+```
+
+A subdomain pointing to `127.0.0.1` is a leak - the org provisioned a public DNS record for a host they only intended to access internally. A subdomain called `win2k` suggests a legacy Windows 2000 host that's almost certainly unpatched.
+
+## DNS version probe
+
+The DNS server may disclose its own version via a `CHAOS` class `TXT` query. Works on misconfigured BIND9 instances:
+
+```shell
+dig CH TXT version.bind @ns.target.com
+```
+
+```
+;; ANSWER SECTION:
+version.bind.       0       CH      TXT     "9.10.6-P1"
+;; ADDITIONAL SECTION:
+version.bind.       0       CH      TXT     "9.10.6-P1-Debian"
+```
+
+Version data feeds into CVE lookup. Useful if the next stage is "is this BIND instance vulnerable to anything?"
+
+## Putting it together
+
+A clean recon-of-DNS workflow:
+
+```
+1. crt.sh           → starter subdomain list from cert transparency
+2. dig any DOMAIN   → MX/NS/TXT records reveal mail provider, SaaS, additional IPs
+3. host lookup loop → resolve subdomains to IPs, separate company-owned vs third-party
+4. dnsenum on root  → brute-force subdomains that lack public certs
+5. dnsenum on each  → recursive brute-force on every discovered subdomain
+6. dig CH TXT       → opportunistic version probe on the authoritative NS
+```
+
+Persist everything. The artifact you produce here is the input to every active enumeration step that follows.

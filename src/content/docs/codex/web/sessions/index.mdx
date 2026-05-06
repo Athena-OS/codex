@@ -1,0 +1,108 @@
+---
+title: Sessions
+description: Operator reference for attacks against web session state - hijacking stolen tokens, fixating them, harvesting them via sniffing/post-exploit/XSS, and the client-side primitives (XSS, CSRF, open redirect) that yield them in modern apps.
+mitre: [T1539, T1550.004, T1185, T1557]
+d3fend: [D3-CBV, D3-OTP]
+impact: [SessionTakeover, CredentialTheft, AuthBypass]
+owasp: [A01, A07]
+sidebar:
+  order: 1
+  label: Overview
+---
+
+## TL;DR
+
+A session attack is any path from "anonymous attacker outside the application" to "logged-in user inside it" that doesn't require knowing the victim's password. The session identifier (a cookie, almost always) is the only thing the server checks for every request after login - so anything that puts a valid identifier in the attacker's hands grants the victim's identity.
+
+```
+# 1. Identify the session identifier
+#    Browser DevTools → Storage → Cookies; look for HttpOnly, Secure, SameSite flags
+
+# 2. Harvest it via one of:
+#    - Sniffing plaintext HTTP            (network position required)
+#    - XSS that exfiltrates document.cookie (HttpOnly absent)
+#    - Open redirect that leaks tokens in URL parameters
+#    - Post-exploit retrieval from /var/lib/php/sessions or the DB
+
+# 3. Ride it
+#    Browser: open private window, paste cookie, navigate, you are logged in
+#    curl:    curl -b 'session=ABC...' http://target/account
+#    Burp:    swap cookie in Repeater/Intercept
+
+# 4. Chain when sessions are well-defended
+#    XSS → bypasses SameSite (request originates from the target's own origin)
+#    Open redirect → leaks tokens included in redirect URLs
+#    CSRF token theft via HTML injection → bypasses anti-CSRF on POST
+```
+
+Success indicator: the attacker's browser, curl, or Burp lab is making authenticated requests on the victim's behalf - the server treats the requests as the victim's own.
+
+## The session model in one paragraph
+
+HTTP is stateless. Every request stands alone - the server has no way to know it's the same user from one request to the next *except* by what the request itself carries. Web apps solve this by issuing a session identifier (random string) at login, storing it as a cookie in the browser, and looking up the user's state in a server-side store on every subsequent request that presents that identifier. The session identifier is therefore equivalent to the user's authenticated identity for the duration of the session. Steal it, and you're them.
+
+A "session attack" is any of:
+
+| Attack | What it does | When it works |
+| --- | --- | --- |
+| **Hijacking** | Take a session identifier you already have, use it | Always - the question is how you got the identifier |
+| **Fixation** | Force the victim to use an identifier *you* set, then ride it after they log in | When the app reuses pre-login session IDs after auth |
+| **Sniffing** | Read identifiers off the wire | Plaintext HTTP traffic + network position |
+| **XSS exfiltration** | JavaScript in the victim's browser reads `document.cookie` and sends it to you | XSS + `HttpOnly` not set on cookies |
+| **CSRF** | Issue authenticated requests in the victim's name *without* needing the cookie value | The server checks cookies but no anti-CSRF token (or you can bypass it) |
+| **Open redirect token leak** | Coerce the app to include the token in a URL pointing to attacker-controlled domain | App's redirect doesn't validate target + tokens travel in URLs or POST bodies that follow redirects |
+| **Post-exploitation retrieval** | Read session-store files from a server you've already compromised | RCE on the app server |
+| **Database session theft** | Read session table from a compromised database | DB compromise + sessions stored in DB |
+
+The TL;DR's flow - **identify → harvest → ride → chain** - is the four-step lens you apply to every engagement.
+
+## Where session state lives
+
+Knowing *where* the identifier is stored tells you which attacks are viable:
+
+| Storage | Stealable via | Survives across |
+| --- | --- | --- |
+| **Cookie** (HTTP `Cookie:` header) | XSS (unless `HttpOnly`), sniffing (unless `Secure`+TLS), CSRF without needing the value | Tabs, restarts (if persistent) |
+| **URL parameter** | Referer header leak, browser history, server logs, screen-share recordings | URL navigation only |
+| **Hidden form field** | XSS (read the DOM), HTML injection (leak via crafted markup) | Page reload only - gone on navigation |
+| **`localStorage`** | XSS (any script can read it; HttpOnly doesn't apply) | Browser restart |
+| **`sessionStorage`** | XSS (same scope as localStorage) | Tab close |
+| **HTTP `Authorization:` header** (Bearer token) | XSS + JS reads from app state, sniffing without TLS, RCE on app server | Session lifetime |
+| **Server-side file** | Post-exploit RCE on app server | Until session expires server-side |
+| **Server-side DB row** | DB compromise (SQLi, credential theft) | Until session expires server-side |
+
+The **cookie with `HttpOnly` + `Secure` + `SameSite=Strict`** is the strongest browser-side configuration. Cookies without these flags are XSS-readable, sniff-able, and CSRF-rideable respectively. Tokens stored in `localStorage` are *always* JavaScript-accessible - moving a token from a `HttpOnly` cookie to `localStorage` for "convenience" downgrades security.
+
+## What this cluster covers
+
+| Page | Focus |
+| --- | --- |
+| [Hijacking](/codex/web/sessions/hijacking/) | The mechanics of riding a stolen identifier - DevTools cookie swap, Burp swap, curl with `-b`/`-c` |
+| [Fixation](/codex/web/sessions/fixation/) | Forcing a known identifier on the victim; auth-doesn't-regenerate detection |
+| [Obtaining tokens](/codex/web/sessions/obtaining-tokens/) | Sniffing (Wireshark, mitmproxy, ARP poisoning context), post-exploit retrieval (PHP/Java/.NET paths), DB extraction |
+| [XSS to session](/codex/web/sessions/xss-to-session/) | XSS as a cookie-stealing primitive; cookie-logger PHP server; HttpOnly check; XSSHunter/Collaborator/Interactsh callback infra |
+| [CSRF](/codex/web/sessions/csrf/) | CSRF fundamentals; HTML auto-submit forms; GET vs POST; SameSite; anti-CSRF tokens |
+| [CSRF token bypass](/codex/web/sessions/csrf-token-bypass/) | Weak token analysis (`md5(username)`), null/blank/random token bypass, cross-account tokens, Referer regex bypass, method tampering |
+| [XSS + CSRF chain](/codex/web/sessions/xss-csrf-chain/) | When SameSite blocks cross-origin requests: stage the request from the target's own origin via XSS; the `XMLHttpRequest` token-extract pattern |
+| [Open redirect](/codex/web/sessions/open-redirect/) | Discovery patterns (`?url=`, `?redirect=`, `?next=`...); leaking session tokens that travel with redirects; phishing chains |
+| [Chaining final](/codex/web/sessions/chaining-final/) | End-to-end engagement: XSS in profile + open redirect on admin endpoint → admin session theft, the canonical real-world chain |
+
+## Cross-cluster references
+
+This cluster overlaps with several others; each link gives the operator-level details the sessions material assumes:
+
+| Topic | Page |
+| --- | --- |
+| Cookie attributes deep-dive | [Auth: cookie tampering](/codex/web/auth/cookie-tampering/) |
+| Session fixation fundamentals | [Auth: session fixation](/codex/web/auth/session-fixation/) |
+| JWT-specific attacks | [Auth: JWT](/codex/web/auth/jwt/) |
+| Password reset flows | [Auth: reset tokens](/codex/web/auth/reset-tokens/) |
+| File upload that delivers XSS | [Uploads](/codex/web/uploads/) |
+| Server-side compromise to access sessions | [LFI](/codex/web/lfi/), [Server-side](/codex/web/server-side/) |
+| SQL injection to dump session tables | [SQLi cluster](/codex/web/sqli/) |
+
+## A philosophical note on scope
+
+XSS and CSRF have full pentest curricula of their own - XSS especially has its own taxonomy (reflected, stored, DOM-based, mutation, blind). This cluster covers them through the lens of **what makes them useful for stealing or hijacking sessions specifically**, which is one of the highest-impact outcomes of those vulnerabilities. The page on XSS-to-session doesn't try to be a complete XSS reference; it covers cookie exfiltration patterns and callback infrastructure. Similarly, CSRF coverage focuses on session-effective abuse (state-changing actions on the user's behalf), not on every CSRF defense or weird edge case.
+
+When a finding turns out to deserve fuller treatment beyond session-attack utility - e.g., a DOM-based XSS chain that requires deep prototype-pollution understanding - that's the moment to escalate beyond this cluster.

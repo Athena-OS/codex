@@ -1,0 +1,88 @@
+---
+title: Service Footprinting
+description: Active per-service enumeration once recon has produced a host list - protocol behavior, default configurations, dangerous settings, and footprinting commands across the 16 most common services exposed by Linux and Windows hosts.
+mitre: [T1046, T1018, T1133, T1210, T1135, T1087]
+d3fend: [D3-NTA, D3-IDA]
+sidebar:
+  order: 1
+  label: Overview
+---
+
+## TL;DR
+
+Once [reconnaissance](/codex/network/recon/) hands you a host list with banners, the next stage is per-service enumeration. Each service has its own protocol, default config, common misconfigurations, and operator playbook. This cluster covers the 16 services that account for the vast majority of "open port → finding" paths in real engagements.
+
+```
+# Port-driven decision flow:
+#  port 21          → FTP                       (anon auth, file enum)
+#  port 22          → SSH                       (banner version, auth methods, key files)
+#  port 25/587/465  → SMTP                      (VRFY user enum, open relay)
+#  port 53          → DNS                       (AXFR zone transfer, version probe)
+#  port 110/995     → POP3                      (cred test, IMAP fallback)
+#  port 111/2049    → NFS                       (showmount, mount, file enum)
+#  port 135         → MS-RPC / WMI              (wmiexec)
+#  port 139/445     → SMB                       (anonymous shares, RID enum)
+#  port 143/993     → IMAP                      (cred test, folder browse)
+#  port 161/udp     → SNMP                      (community string bruteforce, OID walk)
+#  port 512/513/514 → R-services                (rlogin/rsh, .rhosts trust)
+#  port 623/udp     → IPMI                      (RAKP hash extraction)
+#  port 873         → Rsync                     (share enum, anon access)
+#  port 1433        → MSSQL                     (sa creds, xp_cmdshell)
+#  port 1521        → Oracle TNS                (SID enum, default creds)
+#  port 3306        → MySQL                     (empty root, db enum)
+#  port 3389        → RDP                       (NLA check, cert info)
+#  port 5985/5986   → WinRM                     (credentialed shell)
+```
+
+Success indicator: per-service findings - credentials, file access, configuration disclosures, or chained vulnerabilities that lead to host compromise.
+
+## Operator mindset for this cluster
+
+Each page follows the same four-act structure because that's how an operator actually approaches a service:
+
+1. **Protocol overview** - what's the service for, what's the wire protocol, what's the default port? You need a working mental model before you can spot what's wrong.
+2. **Default configuration** - what does an out-of-the-box deployment look like? Knowing the baseline lets you spot deviations, which is where the findings come from.
+3. **Dangerous settings** - the specific config knobs that admins flip for convenience and forget to flip back. Each one maps to a class of finding.
+4. **Footprinting commands** - the actual commands that test for each dangerous setting and surface the data the operator needs.
+
+Every page is a self-contained reference. Read it linearly the first time you encounter the service; thereafter, jump to the footprinting section.
+
+## How services group operationally
+
+Different services share tooling and mental models. For triage:
+
+| Family | Pages | Shared concern |
+| --- | --- | --- |
+| **File shares** | [FTP](/codex/network/services/ftp/), [SMB](/codex/network/services/smb/), [NFS](/codex/network/services/nfs/), [Rsync](/codex/network/services/rsync/) | Anonymous access, world-readable shares, file enumeration |
+| **Mail** | [SMTP](/codex/network/services/smtp/), [IMAP / POP3](/codex/network/services/imap-pop3/) | User enumeration, open relay, credential testing |
+| **Name resolution** | [DNS](/codex/network/services/dns/) | Zone transfer, subdomain disclosure |
+| **Network management** | [SNMP](/codex/network/services/snmp/), [IPMI](/codex/network/services/ipmi/) | Community string defaults, hash retrieval |
+| **Databases** | [MySQL](/codex/network/services/mysql/), [MSSQL](/codex/network/services/mssql/), [Oracle TNS](/codex/network/services/oracle-tns/) | Default credentials, schema enumeration, file write primitives |
+| **Linux remote management** | [SSH](/codex/network/services/ssh/), [R-services](/codex/network/services/r-services/) | Auth method enum, weak trust relationships |
+| **Windows remote management** | [RDP](/codex/network/services/rdp/), [WinRM](/codex/network/services/winrm/), [WMI](/codex/network/services/wmi/) | Credential reuse, NLA checks, named pipes |
+
+These families share tooling: `smbclient`/`rpcclient` cover several Windows-adjacent services; `impacket` covers most of them; `nmap`'s NSE scripts have per-service coverage for everything in this list.
+
+## What this cluster doesn't cover
+
+- **Web services (HTTP/HTTPS)** - handled in the [web cluster](/codex/web/). HTTP is its own universe and gets its own treatment.
+- **Active Directory–specific protocols** (LDAP, Kerberos, MS-RPC AD enumeration) - coming in a future cluster. SMB and WinRM here cover the basics that bleed into AD work but the AD-domain semantics need their own pages.
+- **VPN / IPSec / SSL-VPN protocols** - coming in a future cluster.
+- **Industrial control / IoT protocols** (Modbus, BACnet, MQTT) - niche, not currently covered.
+
+## A note on stealth
+
+Active enumeration is loud. Every connection you make to a target service shows up in its logs and can trigger IDS/IPS alerts. Patterns to keep in mind:
+
+- **Nmap default scripts** identify themselves explicitly. RDP scans send a cookie `mstshash=nmap`; SMTP scans send recognizable HELO patterns. On hardened targets, these get caught.
+- **Authentication failures cascade.** A brute-force attempt against SSH that locks out an account creates a help-desk ticket and possibly a detection alert. `fail2ban` will block your source after a few failures.
+- **Specific NSE scripts are noisier than others.** `smb-vuln-*` scripts probe known CVEs and will trip any modern SIEM. `mssql-brute` and `mysql-brute` attempt credential pairs.
+- **Volume matters.** Scanning every port on every host at full speed across a /24 is unmistakable. Slow scans (`-T2` or `-T1` in nmap) trade time for stealth.
+
+Calibrate to the engagement. Black-box pen-tests usually accept the noise; red-team engagements often require careful pacing.
+
+## Order to work through this cluster
+
+If you're learning the cluster sequentially: file shares first (highest immediate-finding rate), then databases (often defaulted credentials), then mail (cleanest user-enum primitives), then management protocols (highest-impact when credentials work).
+
+If you've found a specific port open: jump directly to the relevant page from the port lookup table at the top of this page.

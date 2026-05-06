@@ -1,0 +1,104 @@
+/* =========================================================================
+   Codex - Background Layer
+   What gets shown behind the content (and blurred by --codex-blur).
+
+   Each preset sets --codex-bg-opacity which is the *baseline* opacity for
+   that background. The actual rendered opacity is computed in codex.css as:
+
+       opacity: calc(var(--codex-bg-opacity) * (1 - var(--codex-blur-num) / 200));
+
+   This means the blur slider also modulates opacity - fading the bg as blur
+   increases. Without this, blur on a solid color would be invisible (no
+   pixels to blur), and the blur slider would feel broken.
+   ========================================================================= */
+
+/* =========================================================================
+   Active background preset
+   ========================================================================= */
+
+/* DEFAULT: no static background pattern.
+   Particles carry the visual interest now (see ParticleBackground.astro);
+   the .codex-bg-overlay scrim still sits behind content for separation.
+
+   To restore the hex pattern OR switch to a different preset, comment out
+   this empty .codex-bg-layer block and uncomment one of the presets below.
+
+   Note: --codex-bg-opacity is still set so the blur slider behaves
+   consistently if you re-enable a pattern later. */
+.codex-bg-layer {
+  --codex-bg-opacity: 0;
+}
+
+/* PRESET: hex tile (the original Codex pattern) */
+/*
+.codex-bg-layer {
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='90' height='104' viewBox='0 0 90 104'><path fill='none' stroke='%23b48ead' stroke-width='1.6' stroke-opacity='0.85' d='M45 0L0 26v52l45 26 45-26V26z'/></svg>");
+  background-size: 90px 104px;
+  background-repeat: repeat;
+  --codex-bg-opacity: 0.45;
+}
+*/
+
+/* =========================================================================
+   Alternate background presets - uncomment ONE to replace the default.
+   ========================================================================= */
+
+/* OPTION: Athena OS image background
+   Drop your image at public/codex-bg.png (or wherever) and uncomment:
+
+.codex-bg-layer {
+  background-image: url('/codex-bg.png');
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+  --codex-bg-opacity: 0.50;
+}
+*/
+
+/* OPTION: Solid accent color (no texture)
+   Blur slider effectively becomes a color-intensity slider via opacity.
+
+.codex-bg-layer {
+  background: var(--codex-accent);
+  --codex-bg-opacity: 0.10;
+}
+*/
+
+/* OPTION: Radial gradient (atmospheric, hue-rotating)
+
+.codex-bg-layer {
+  background: radial-gradient(
+    circle at 30% 20%,
+    var(--codex-accent) 0%,
+    transparent 50%
+  );
+  --codex-bg-opacity: 0.30;
+}
+*/
+
+/* OPTION: Diagonal stripes (hue-rotating)
+
+.codex-bg-layer {
+  background: repeating-linear-gradient(
+    45deg,
+    transparent 0px,
+    transparent 14px,
+    var(--codex-accent-soft) 14px,
+    var(--codex-accent-soft) 16px
+  );
+  --codex-bg-opacity: 1;
+}
+*/
+
+/* OPTION: Dotted grid (hue-rotating)
+
+.codex-bg-layer {
+  background-image: radial-gradient(
+    circle,
+    var(--codex-accent) 1px,
+    transparent 1px
+  );
+  background-size: 20px 20px;
+  --codex-bg-opacity: 0.20;
+}
+*/

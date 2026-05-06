@@ -1,0 +1,93 @@
+---
+title: SSRF
+description: Server-Side Request Forgery - making an application issue requests on your behalf. Overview, methodology, and decision flow into SSRF sub-pages.
+mitre: [T1190, T1199]
+d3fend: [D3-MH, D3-NI, D3-OTF]
+impact: [InternalAccess, CloudMetadata]
+noise: moderate
+sidebar:
+  order: 1
+  label: Overview
+---
+import { Aside } from '@astrojs/starlight/components';
+
+## TL;DR
+
+SSRF is when the application fetches a URL/host you control, on its own behalf, against its own networking stack. The application becomes your proxy into the internal network, the cloud metadata service, the local filesystem (via `file://`), or whatever else its libraries can reach.
+
+```
+# Confirm
+?url=http://<COLLAB>             # OOB callback proves request reaches your host
+?url=file:///etc/passwd          # local file read via file:// schema
+?url=http://127.0.0.1:80         # localhost port reachable
+
+# Escalate
+?url=http://169.254.169.254/...  # cloud metadata → credential theft
+?url=gopher://127.0.0.1:6379/... # protocol smuggling → Redis RCE
+```
+
+Success indicator: response contains data the application server has access to but you don't.
+
+## Where to look
+
+Any parameter whose value gets fetched, parsed, rendered, or resolved by the server:
+
+- **URL parameters** - `?url=`, `?image=`, `?webhook=`, `?fetch=`, `?redirect=`, `?next=`
+- **File upload features** - fetch-from-URL alternatives ("import from web," "from URL")
+- **PDF / image generators** - many use Chromium or `wkhtmltopdf` to render HTML you supply
+- **Webhook configurations** - outbound webhook URLs that the server validates by hitting first
+- **OAuth/SAML/OIDC callback URLs** - sometimes server-side validated
+- **API integrations** - "test connection" buttons, RSS importers, OPML readers
+- **HTTP headers** - `Referer`, `X-Forwarded-For`, `Host` rewrites, `User-Agent` sometimes triggers fetches in monitoring/analytics
+- **Subdomain or vhost values** - when the app routes by Host header to internal services
+
+If you can describe the feature with the words "the server fetches/imports/converts/validates," it's an SSRF candidate.
+
+## Decision flow
+
+1. **Confirm reachability** - does the server actually fetch your URL? → [Schemas](/codex/web/server-side/ssrf/schemas/)
+2. **What schemas work?** - http? file? gopher? → [Schemas](/codex/web/server-side/ssrf/schemas/)
+3. **Internal network reachable?** - what's behind the firewall? → [Internal discovery](/codex/web/server-side/ssrf/internal-discovery/)
+4. **Filter blocking your URL?** - `127.0.0.1` rejected, `localhost` rejected? → [Filter bypass](/codex/web/server-side/ssrf/filter-bypass/)
+5. **Cloud-hosted target?** - AWS/Azure/GCP? → [Cloud metadata](/codex/web/server-side/ssrf/cloud-metadata/)
+6. **No reflected response?** - output suppressed? → [Blind & time-based](/codex/web/server-side/ssrf/blind/)
+7. **Internal service has its own bug?** - chain it. → [Chained SSRF](/codex/web/server-side/ssrf/chained/)
+8. **Exam time, single-page reference?** → [Cheatsheet](/codex/web/server-side/ssrf/cheatsheet/)
+
+## Impact ladder
+
+The reason SSRF is rated so high in OWASP and bug bounty payouts:
+
+| Tier | What you get | Typical reach |
+| --- | --- | --- |
+| 1 | OOB confirmation only | "Yep, it's SSRF" - minimum bug |
+| 2 | Read-only http:// to internal services | Internal hostname enumeration, status pages, debug endpoints |
+| 3 | `file://` schema works | Local file disclosure (`/etc/passwd`, app source code) |
+| 4 | Cloud metadata reachable | IAM credentials → cloud account compromise |
+| 5 | `gopher://` available | Redis/Memcached/SMTP smuggling → RCE on internal services |
+| 6 | Chained with internal vuln | RCE on internal app via SSRF-as-transport |
+
+Most engagements stop at tier 2 or 3 because the easy wins are already enough. Push to 4-6 when scope permits.
+
+<Aside type="caution">
+SSRF on cloud-hosted apps almost always reaches the metadata service unless the platform default has been hardened. AWS IMDSv1 → IAM credentials → S3/EC2/Lambda access. Azure → managed identity tokens. GCP → service account tokens. The blast radius from one SSRF can be the entire cloud account. Confirm scope before exploiting metadata.
+</Aside>
+
+## Operating notes
+
+The single most useful habit: **set up an OOB listener before you start probing.** Burp Collaborator, interactsh, or your own VPS. Half the SSRF vulnerabilities you'll find are blind, and starting with a listener already running means you spot them on the first probe instead of the third.
+
+The second most useful habit: **try `file:///etc/passwd` early.** If `file://` works, you have local file disclosure without needing internal network reachability - and the same payload often reads source code, leading to discovery of additional bugs offline.
+
+The notes pages that follow assume you're working through them roughly in order. If you already know it's SSRF and know the schema, skip to [filter-bypass](/codex/web/server-side/ssrf/filter-bypass/) or [cloud-metadata](/codex/web/server-side/ssrf/cloud-metadata/) directly.
+
+## Next move
+
+- **Got reflected response (saw internal page or banner)** → start [internal discovery](/codex/web/server-side/ssrf/internal-discovery/) - scan internal CIDR, identify other internal services
+- **Request fires but no reflection (OOB callback only)** → blind SSRF - see [blind](/codex/web/server-side/ssrf/blind/) for time-based fingerprinting and DNS-only payloads
+- **In AWS/Azure/GCP environment** → immediately try [cloud-metadata](/codex/web/server-side/ssrf/cloud-metadata/) - IMDS credentials are the highest-value pivot
+- **`file://` works** → read `/etc/passwd`, `/proc/self/environ`, app source, SSH keys, app config (database creds often live there)
+- **Filter blocks `http://`, `localhost`, `127.0.0.1`** → [filter-bypass](/codex/web/server-side/ssrf/filter-bypass/) (IP encodings, DNS rebinding, alternate hostnames like `[::]`, `127.1`, `0.0.0.0`)
+- **Schema restricted to `http(s)`** → try [other schemas](/codex/web/server-side/ssrf/schemas/) (`gopher://`, `dict://`, `ldap://`) for protocol smuggling
+- **Reached internal service via SSRF** → check what auth it expects - many internal services trust source IP, so SSRF gives you implicit auth as the app server itself
+- **Internal service is Redis / Elasticsearch / Memcached** → [chained SSRF](/codex/web/server-side/ssrf/chained/) - Gopher payloads can write to Redis for RCE or query Elastic without auth

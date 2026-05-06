@@ -1,0 +1,769 @@
+---
+// src/components/OperatorConsole.astro
+//
+// Floating-button operator profile. Six inputs that substitute live into
+// every code block on the current page:
+//
+//   TARGET   →  replaces <TARGET>, <INTERNAL_HOST>
+//   ATTACKER →  replaces <ATTACKER>, <ATTACKER_IP>, <COLLAB>, <LHOST>
+//   LPORT    →  replaces <LPORT>
+//   USER     →  replaces <USER>
+//   DOMAIN   →  replaces <DOMAIN>
+//   PASSWORD →  replaces <PASSWORD>, <PASS>  (in-memory only, not persisted)
+//
+// Substitution happens in-place on rendered code blocks — no rebuild,
+// no copy-button hijacking required (Expressive Code's copy button reads
+// from the DOM text, which we've modified, so copies pick up substitutions
+// automatically).
+//
+// State (except PASSWORD) persists in localStorage so an operator working
+// a single engagement gets their target IP showing in every command they
+// look at, all day, across every page.
+//
+// Visual treatment: replaced placeholders get a subtle accent-tinted
+// background so the operator can confirm at a glance which values are
+// their own vs. still-unconfigured defaults.
+//
+// Composes with the existing PaletteTuner floating button — they sit side
+// by side at the bottom-right corner of the viewport.
+---
+
+<div class="codex-console" id="codex-console">
+
+  <!-- Floating toggle button (sits to the left of PaletteTuner) -->
+  <button
+    type="button"
+    class="codex-console__toggle"
+    aria-label="Operator console"
+    aria-expanded="false"
+    aria-controls="codex-console-panel"
+    title="Operator console — substitute targets in code blocks"
+  >
+    <!-- terminal-prompt glyph; matches the codex.athenaos.org tab title -->
+    <svg
+      width="18"
+      height="18"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      stroke-width="2"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      aria-hidden="true"
+    >
+      <polyline points="4 17 10 11 4 5"></polyline>
+      <line x1="12" y1="19" x2="20" y2="19"></line>
+    </svg>
+    <!-- Small dot when any field is populated; CSS shows/hides via :has() -->
+    <span class="codex-console__dot" aria-hidden="true"></span>
+  </button>
+
+  <!-- Panel -->
+  <div
+    class="codex-console__panel"
+    id="codex-console-panel"
+    role="dialog"
+    aria-label="Operator console"
+    aria-hidden="true"
+  >
+    <div class="codex-console__header">
+      <span class="codex-console__title">Operator console</span>
+      <button
+        type="button"
+        class="codex-console__close"
+        aria-label="Close operator console"
+      >
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <line x1="18" y1="6" x2="6" y2="18"></line>
+          <line x1="6" y1="6" x2="18" y2="18"></line>
+        </svg>
+      </button>
+    </div>
+
+    <p class="codex-console__lede">
+      Set your target values. Placeholders in every code block on this page
+      will substitute live. Values persist across pages (except password).
+    </p>
+
+    <div class="codex-console__body">
+
+      <div class="codex-console__field">
+        <label class="codex-console__label" for="codex-op-target">
+          <span class="codex-console__placeholder">&lt;TARGET&gt;</span>
+          target host / IP
+        </label>
+        <input
+          type="text"
+          id="codex-op-target"
+          class="codex-console__input"
+          data-op-key="target"
+          autocomplete="off"
+          spellcheck="false"
+          placeholder="10.10.10.42"
+        />
+        <span class="codex-console__aliases">also: &lt;INTERNAL_HOST&gt;</span>
+      </div>
+
+      <div class="codex-console__field">
+        <label class="codex-console__label" for="codex-op-attacker">
+          <span class="codex-console__placeholder">&lt;ATTACKER&gt;</span>
+          attacker / listener
+        </label>
+        <input
+          type="text"
+          id="codex-op-attacker"
+          class="codex-console__input"
+          data-op-key="attacker"
+          autocomplete="off"
+          spellcheck="false"
+          placeholder="10.10.14.3"
+        />
+        <span class="codex-console__aliases">also: &lt;LHOST&gt; · &lt;ATTACKER_IP&gt; · &lt;COLLAB&gt;</span>
+      </div>
+
+      <div class="codex-console__field">
+        <label class="codex-console__label" for="codex-op-lport">
+          <span class="codex-console__placeholder">&lt;LPORT&gt;</span>
+          listener port
+        </label>
+        <input
+          type="text"
+          id="codex-op-lport"
+          class="codex-console__input"
+          data-op-key="lport"
+          autocomplete="off"
+          spellcheck="false"
+          placeholder="4444"
+        />
+      </div>
+
+      <div class="codex-console__field">
+        <label class="codex-console__label" for="codex-op-user">
+          <span class="codex-console__placeholder">&lt;USER&gt;</span>
+          username
+        </label>
+        <input
+          type="text"
+          id="codex-op-user"
+          class="codex-console__input"
+          data-op-key="user"
+          autocomplete="off"
+          spellcheck="false"
+          placeholder="bob"
+        />
+      </div>
+
+      <div class="codex-console__field">
+        <label class="codex-console__label" for="codex-op-domain">
+          <span class="codex-console__placeholder">&lt;DOMAIN&gt;</span>
+          domain
+        </label>
+        <input
+          type="text"
+          id="codex-op-domain"
+          class="codex-console__input"
+          data-op-key="domain"
+          autocomplete="off"
+          spellcheck="false"
+          placeholder="corp.local"
+        />
+      </div>
+
+      <div class="codex-console__field">
+        <label class="codex-console__label" for="codex-op-password">
+          <span class="codex-console__placeholder">&lt;PASSWORD&gt;</span>
+          password
+          <span class="codex-console__hint">(in-memory only)</span>
+        </label>
+        <input
+          type="password"
+          id="codex-op-password"
+          class="codex-console__input"
+          data-op-key="password"
+          autocomplete="off"
+          spellcheck="false"
+          placeholder="••••••••"
+        />
+        <span class="codex-console__aliases">also: &lt;PASS&gt;</span>
+      </div>
+
+      <button type="button" class="codex-console__clear" id="codex-console-clear">
+        clear all
+      </button>
+
+    </div>
+  </div>
+
+</div>
+
+<script is:inline>
+  (function () {
+    'use strict';
+
+    // ──────────────────────────────────────────────────────────────────
+    // Configuration: placeholder mapping.
+    // Each field maps to one or more placeholder tokens. Multiple tokens
+    // per field exist because the corpus uses synonyms (e.g., ATTACKER /
+    // ATTACKER_IP / COLLAB / LHOST all refer to the same operator host).
+    //
+    // Tokens are matched as literal strings INCLUDING the angle brackets.
+    // This means a stray `<TARGET>` in prose also gets substituted, which
+    // is fine — that's actually a small bonus for readability.
+    // ──────────────────────────────────────────────────────────────────
+
+    const FIELDS = [
+      { key: 'target',   placeholders: ['<TARGET>', '<INTERNAL_HOST>'] },
+      { key: 'attacker', placeholders: ['<ATTACKER>', '<ATTACKER_IP>', '<COLLAB>', '<LHOST>'] },
+      { key: 'lport',    placeholders: ['<LPORT>'] },
+      { key: 'user',     placeholders: ['<USER>'] },
+      { key: 'domain',   placeholders: ['<DOMAIN>'] },
+      { key: 'password', placeholders: ['<PASSWORD>', '<PASS>'] },
+    ];
+
+    // Build a flat lookup: placeholder string → field key (lowercase)
+    const PLACEHOLDER_TO_KEY = {};
+    FIELDS.forEach(function (f) {
+      f.placeholders.forEach(function (p) {
+        PLACEHOLDER_TO_KEY[p] = f.key;
+      });
+    });
+    // Master regex matching ANY placeholder token. Built once, cached.
+    const ALL_PLACEHOLDERS = Object.keys(PLACEHOLDER_TO_KEY).sort(function (a, b) {
+      return b.length - a.length;  // longest first (so <ATTACKER_IP> wins over <ATTACKER>)
+    });
+    const TOKEN_RE = new RegExp(
+      ALL_PLACEHOLDERS.map(function (p) {
+        return p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      }).join('|'),
+      'g'
+    );
+
+    // Storage keys
+    const STORAGE_PREFIX = 'codex.op.';
+    const PERSIST_KEYS = ['target', 'attacker', 'lport', 'user', 'domain'];
+    // password is NOT in PERSIST_KEYS — stays in memory only
+
+    // ──────────────────────────────────────────────────────────────────
+    // State: current values for each key. Password starts blank.
+    // ──────────────────────────────────────────────────────────────────
+
+    const state = {
+      target: '', attacker: '', lport: '',
+      user: '', domain: '', password: '',
+    };
+
+    // Hydrate from localStorage (skips password)
+    PERSIST_KEYS.forEach(function (k) {
+      try {
+        const v = localStorage.getItem(STORAGE_PREFIX + k);
+        if (v !== null) state[k] = v;
+      } catch (e) { /* private mode etc. */ }
+    });
+
+    // ──────────────────────────────────────────────────────────────────
+    // DOM lookups
+    // ──────────────────────────────────────────────────────────────────
+
+    const root      = document.getElementById('codex-console');
+    const toggleBtn = root && root.querySelector('.codex-console__toggle');
+    const closeBtn  = root && root.querySelector('.codex-console__close');
+    const clearBtn  = document.getElementById('codex-console-clear');
+    const panel     = document.getElementById('codex-console-panel');
+    const inputs    = root ? root.querySelectorAll('.codex-console__input') : [];
+
+    if (!root || !panel || !toggleBtn) return;
+
+    // ──────────────────────────────────────────────────────────────────
+    // Substitution engine.
+    //
+    // For each code block, walk text-node descendants and wrap every
+    // matched placeholder in a <span class="codex-op-sub"> with the
+    // current value. Operates idempotently — running it again replaces
+    // previous substitution spans with fresh ones.
+    //
+    // Why text-node walking and not innerHTML replace? Because the code
+    // blocks are syntax-highlighted (Expressive Code wraps tokens in
+    // span.expressive-code-*). Modifying innerHTML would destroy the
+    // highlighting. Text-node modification only touches leaf content.
+    // ──────────────────────────────────────────────────────────────────
+
+    // Collect every code-block-ish element on the page. We target both:
+    //   - <pre> blocks (multi-line code)
+    //   - <code> inline (single-line `<TARGET>` in prose)
+    // Expressive Code wraps everything in .expressive-code, so we just
+    // grab those plus any standalone inline <code>.
+    function collectCodeElements() {
+      const seen = new Set();
+      const out = [];
+      // Inline code in prose
+      document.querySelectorAll('code').forEach(function (el) {
+        // Skip code inside Expressive Code blocks — those get covered
+        // by the .expressive-code traversal below
+        if (el.closest('.expressive-code')) return;
+        // Skip Forge's command boxes. Forge owns its own substitution
+        // (re-renders on panel-open AND on the `codex:op:change` event
+        // we dispatch from this component), and walking those <code>
+        // elements here would conflict — Forge's spans don't carry the
+        // `data-original` attribute our revert path expects, so the
+        // revert would lose the placeholder info and the value would
+        // appear hardcoded.
+        if (el.closest('.codex-forge')) return;
+        if (seen.has(el)) return;
+        seen.add(el);
+        out.push(el);
+      });
+      // Expressive Code blocks
+      document.querySelectorAll('.expressive-code .frame pre, .expressive-code pre').forEach(function (el) {
+        if (seen.has(el)) return;
+        seen.add(el);
+        out.push(el);
+      });
+      return out;
+    }
+
+    // Recursively walk an element and rewrite text nodes that contain
+    // any placeholder token. Returns the count of substitutions made.
+    function substituteInElement(el) {
+      let count = 0;
+
+      // First, REVERT any prior substitution spans within this element
+      // (replace each .codex-op-sub with its data-original text node).
+      const subs = el.querySelectorAll('.codex-op-sub');
+      subs.forEach(function (sub) {
+        const original = sub.getAttribute('data-original') || sub.textContent;
+        sub.replaceWith(document.createTextNode(original));
+      });
+      // Merge any adjacent text nodes that resulted from the revert
+      el.normalize();
+
+      // Now scan text nodes for placeholders
+      const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null);
+      const toProcess = [];
+      while (walker.nextNode()) toProcess.push(walker.currentNode);
+
+      toProcess.forEach(function (textNode) {
+        const text = textNode.nodeValue;
+        if (!text || text.indexOf('<') < 0) return;  // fast reject
+        TOKEN_RE.lastIndex = 0;
+        if (!TOKEN_RE.test(text)) return;
+
+        // Build replacement fragment: alternating text and <span> nodes
+        const frag = document.createDocumentFragment();
+        let lastIndex = 0;
+        TOKEN_RE.lastIndex = 0;
+        let m;
+        while ((m = TOKEN_RE.exec(text)) !== null) {
+          // Text before the match
+          if (m.index > lastIndex) {
+            frag.appendChild(document.createTextNode(text.slice(lastIndex, m.index)));
+          }
+          const placeholder = m[0];
+          const key = PLACEHOLDER_TO_KEY[placeholder];
+          const value = state[key];
+          if (value) {
+            // Substitute with a span carrying the original for revert
+            const span = document.createElement('span');
+            span.className = 'codex-op-sub';
+            span.setAttribute('data-original', placeholder);
+            span.textContent = value;
+            frag.appendChild(span);
+            count++;
+          } else {
+            // No value configured — leave the placeholder as plain text
+            frag.appendChild(document.createTextNode(placeholder));
+          }
+          lastIndex = m.index + placeholder.length;
+        }
+        // Tail text
+        if (lastIndex < text.length) {
+          frag.appendChild(document.createTextNode(text.slice(lastIndex)));
+        }
+        textNode.parentNode.replaceChild(frag, textNode);
+      });
+
+      return count;
+    }
+
+    function applyToPage() {
+      const els = collectCodeElements();
+      let total = 0;
+      els.forEach(function (el) { total += substituteInElement(el); });
+
+      // Expressive Code's copy button reads from data-code on a sibling
+      // button, not from the DOM text we just modified. Rewrite those too.
+      document.querySelectorAll('.expressive-code .copy button[data-code]').forEach(function (btn) {
+        // Preserve the original on first touch so we can recompute from a stable base
+        let original = btn.getAttribute('data-code-original');
+        if (original === null) {
+          original = btn.getAttribute('data-code') || '';
+          btn.setAttribute('data-code-original', original);
+        }
+        // Reset and apply substitutions
+        let next = original;
+        TOKEN_RE.lastIndex = 0;
+        next = next.replace(TOKEN_RE, function (placeholder) {
+          const key = PLACEHOLDER_TO_KEY[placeholder];
+          const value = state[key];
+          return value || placeholder;
+        });
+        btn.setAttribute('data-code', next);
+      });
+
+      // Reflect "has any values" state on the toggle button for the dot indicator
+      const anyValue = FIELDS.some(function (f) { return !!state[f.key]; });
+      toggleBtn.classList.toggle('codex-console__toggle--active', anyValue);
+
+      // Tell other components (Forge, primarily) that operator state has
+      // changed so they can re-render their own placeholder displays.
+      // We don't include the new state in detail — listeners read fresh
+      // from localStorage like everyone else, keeping a single source
+      // of truth.
+      document.dispatchEvent(new CustomEvent('codex:op:change'));
+
+      return total;
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Input wiring
+    // ──────────────────────────────────────────────────────────────────
+
+    // Hydrate input fields from state
+    inputs.forEach(function (inp) {
+      const key = inp.getAttribute('data-op-key');
+      if (key && state[key]) inp.value = state[key];
+    });
+
+    // Debounce — operators type fast, don't re-run the whole substitution
+    // pass on every keystroke (especially for long pages)
+    let debounce = null;
+    function scheduleApply() {
+      if (debounce) clearTimeout(debounce);
+      debounce = setTimeout(applyToPage, 80);
+    }
+
+    inputs.forEach(function (inp) {
+      inp.addEventListener('input', function () {
+        const key = inp.getAttribute('data-op-key');
+        state[key] = inp.value;
+        if (PERSIST_KEYS.indexOf(key) !== -1) {
+          try {
+            if (inp.value) localStorage.setItem(STORAGE_PREFIX + key, inp.value);
+            else localStorage.removeItem(STORAGE_PREFIX + key);
+          } catch (e) { /* ignore */ }
+        }
+        scheduleApply();
+      });
+    });
+
+    // ──────────────────────────────────────────────────────────────────
+    // Panel open/close
+    // ──────────────────────────────────────────────────────────────────
+
+    function setOpen(open) {
+      panel.setAttribute('aria-hidden', open ? 'false' : 'true');
+      toggleBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+      root.classList.toggle('codex-console--open', open);
+    }
+    toggleBtn.addEventListener('click', function () {
+      const isOpen = panel.getAttribute('aria-hidden') === 'false';
+      setOpen(!isOpen);
+    });
+    if (closeBtn) closeBtn.addEventListener('click', function () { setOpen(false); });
+
+    // Close on Escape
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape' && panel.getAttribute('aria-hidden') === 'false') {
+        setOpen(false);
+        toggleBtn.focus();
+      }
+    });
+
+    // ──────────────────────────────────────────────────────────────────
+    // Clear all
+    // ──────────────────────────────────────────────────────────────────
+
+    if (clearBtn) {
+      clearBtn.addEventListener('click', function () {
+        FIELDS.forEach(function (f) {
+          state[f.key] = '';
+          if (PERSIST_KEYS.indexOf(f.key) !== -1) {
+            try { localStorage.removeItem(STORAGE_PREFIX + f.key); } catch (e) {}
+          }
+        });
+        inputs.forEach(function (inp) { inp.value = ''; });
+        applyToPage();
+      });
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Initial pass — run after the DOM has the code blocks rendered.
+    // Expressive Code may render asynchronously, so we run on
+    // DOMContentLoaded AND on next animation frame after that.
+    // ──────────────────────────────────────────────────────────────────
+
+    function init() {
+      applyToPage();
+      // Run again next frame in case Expressive Code finished after us
+      requestAnimationFrame(applyToPage);
+    }
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', init);
+    } else {
+      init();
+    }
+  })();
+</script>
+
+<style>
+  /* ====================================================================
+     Floating-button operator console. Sits next to PaletteTuner.
+     ==================================================================== */
+
+  .codex-console {
+    position: fixed;
+    bottom: 1.5rem;
+    /* PaletteTuner sits at right: 1.5rem with a 44px-wide button.
+       Edge-to-edge gap to OperatorConsole: 20px. So OperatorConsole's
+       right offset = 1.5rem (edge) + 44px (PaletteTuner button) + 20px (gap)
+                    = 24 + 44 + 20 = 88px = 5.5rem. */
+    right: 5.5rem;
+    z-index: 9999;
+    font-family: var(--codex-font-sans);
+  }
+
+  /* --- Toggle button --- */
+  .codex-console__toggle {
+    position: relative;
+    width: 44px;
+    height: 44px;
+    border-radius: 50%;
+    border: 1px solid var(--codex-accent-border);
+    background: var(--codex-bg-elevated, #14141a);
+    color: var(--codex-fg-dim, #aaa);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow:
+      0 4px 12px rgba(0, 0, 0, 0.25),
+      0 0 0 1px var(--codex-accent-border);
+    transition: all 0.2s ease;
+  }
+  .codex-console__toggle:hover {
+    color: var(--codex-accent-bright);
+    border-color: var(--codex-accent);
+    /* Halo reach ~18px — stops short of the 20px gap to neighbors so the
+       glow stays clearly in this button's own space (see PaletteTuner). */
+    box-shadow:
+      0 6px 16px rgba(0, 0, 0, 0.35),
+      0 0 12px 6px var(--codex-accent-soft),
+      0 0 0 1px var(--codex-accent-border-strong);
+    transform: translateY(-1px);
+  }
+  /* "Has values configured" indicator — small accent dot bottom-right */
+  .codex-console__dot {
+    position: absolute;
+    right: 6px;
+    bottom: 6px;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--codex-accent);
+    box-shadow: 0 0 6px var(--codex-accent);
+    opacity: 0;
+    transition: opacity 0.2s;
+  }
+  .codex-console__toggle--active .codex-console__dot {
+    opacity: 1;
+  }
+
+  /* --- Panel --- */
+  .codex-console__panel {
+    position: absolute;
+    bottom: calc(100% + 0.75rem);
+    right: 0;
+    width: 320px;
+    max-width: calc(100vw - 2rem);
+    background: var(--codex-bg-elevated, #14141a);
+    border: 1px solid var(--codex-accent-border);
+    border-radius: 4px;
+    padding: 0.85rem 0.9rem 0.95rem;
+    box-shadow:
+      0 8px 32px rgba(0, 0, 0, 0.4),
+      0 0 0 1px var(--codex-accent-border);
+    opacity: 0;
+    transform: translateY(8px);
+    pointer-events: none;
+    transition: opacity 0.18s ease, transform 0.18s ease;
+  }
+  .codex-console--open .codex-console__panel {
+    opacity: 1;
+    transform: translateY(0);
+    pointer-events: auto;
+  }
+  .codex-console__panel[aria-hidden="true"] {
+    visibility: hidden;
+  }
+  .codex-console--open .codex-console__panel {
+    visibility: visible;
+  }
+
+  /* --- Panel header --- */
+  .codex-console__header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 0.5rem;
+    padding-bottom: 0.45rem;
+    border-bottom: 1px solid var(--codex-border, #2a2a2e);
+  }
+  .codex-console__title {
+    font-family: var(--codex-font-mono);
+    font-size: 0.85rem;
+    font-weight: 500;
+    color: var(--codex-accent-bright);
+    letter-spacing: 0.02em;
+  }
+  .codex-console__close {
+    width: 24px;
+    height: 24px;
+    background: transparent;
+    border: none;
+    color: var(--codex-fg-muted, #666);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 2px;
+    transition: color 0.15s, background 0.15s;
+  }
+  .codex-console__close:hover {
+    color: var(--codex-fg, #e0e0e0);
+    background: var(--codex-accent-softer);
+  }
+
+  /* --- Lede paragraph --- */
+  .codex-console__lede {
+    font-size: 0.72rem;
+    line-height: 1.45;
+    color: var(--codex-fg-muted, #666);
+    margin: 0 0 0.75rem;
+  }
+
+  /* --- Field rows --- */
+  .codex-console__field {
+    margin-bottom: 0.55rem;
+  }
+  .codex-console__label {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+    font-size: 0.72rem;
+    color: var(--codex-fg-dim, #aaa);
+    margin-bottom: 0.22rem;
+    line-height: 1.3;
+  }
+  .codex-console__placeholder {
+    font-family: var(--codex-font-mono);
+    font-size: 0.7rem;
+    color: var(--codex-accent);
+    background: var(--codex-accent-softer);
+    padding: 0.05rem 0.35rem;
+    border-radius: 2px;
+    border: 1px solid var(--codex-accent-border);
+    flex-shrink: 0;
+  }
+  .codex-console__hint {
+    color: var(--codex-fg-muted, #666);
+    font-size: 0.65rem;
+    font-style: italic;
+    margin-left: auto;
+  }
+  .codex-console__input {
+    width: 100%;
+    padding: 0.4rem 0.55rem;
+    background: var(--codex-bg, #0d0d0f);
+    border: 1px solid var(--codex-border, #2a2a2e);
+    border-radius: 2px;
+    color: var(--codex-fg, #e0e0e0);
+    font-family: var(--codex-font-mono);
+    font-size: 0.82rem;
+    line-height: 1.3;
+    transition: border-color 0.15s, box-shadow 0.15s;
+  }
+  .codex-console__input:focus {
+    outline: none;
+    border-color: var(--codex-accent);
+    box-shadow: 0 0 0 1px var(--codex-accent), 0 0 8px rgba(var(--codex-accent-rgb, 180, 142, 173), 0.3);
+  }
+  .codex-console__input::placeholder {
+    color: var(--codex-fg-muted, #666);
+    opacity: 0.6;
+  }
+
+  /* Alias hints — small text under a field showing which other placeholder
+     tokens it substitutes. Helps the user understand that typing into the
+     ATTACKER field also handles <LHOST>, <ATTACKER_IP>, <COLLAB>, etc. */
+  .codex-console__aliases {
+    display: block;
+    margin-top: 0.22rem;
+    padding-left: 0.1rem;
+    font-family: var(--codex-font-mono);
+    font-size: 0.65rem;
+    color: var(--codex-fg-muted, #666);
+    line-height: 1.3;
+  }
+
+  /* --- Clear all button --- */
+  .codex-console__clear {
+    width: 100%;
+    margin-top: 0.5rem;
+    padding: 0.4rem 0.6rem;
+    background: transparent;
+    border: 1px solid var(--codex-border, #2a2a2e);
+    border-radius: 2px;
+    color: var(--codex-fg-muted, #666);
+    font-family: var(--codex-font-mono);
+    font-size: 0.75rem;
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s, background 0.15s;
+  }
+  .codex-console__clear:hover {
+    color: var(--codex-danger);
+    border-color: var(--codex-danger-border);
+    background: var(--codex-danger-soft);
+  }
+
+  @media (max-width: 640px) {
+    /* Mobile: middle position in the vertical stack of three floating
+       buttons. PaletteTuner is below (bottom: 1rem), Forge is above
+       (bottom: 9rem). Math: palette top = 16 + 44 = 60px, plus 20px
+       gap = console bottom at 80px ≈ 5rem. */
+    .codex-console {
+      bottom: 5rem;
+      right: 1rem;
+    }
+    .codex-console__panel {
+      width: calc(100vw - 2rem);
+      right: 0;
+    }
+  }
+</style>
+
+<!-- Global style: substituted placeholder visual treatment.
+     Lives outside the scoped block so it applies to spans inside
+     code blocks (which are rendered by Expressive Code, in a
+     different scope). -->
+<style is:global>
+  .codex-op-sub {
+    background: rgba(var(--codex-accent-rgb, 180, 142, 173), 0.18);
+    color: var(--codex-accent-bright);
+    padding: 0 2px;
+    border-radius: 2px;
+    border-bottom: 1px solid var(--codex-accent);
+    /* Preserve monospace alignment in code blocks */
+    font-family: inherit;
+    font-size: inherit;
+    font-weight: inherit;
+  }
+</style>

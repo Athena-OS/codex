@@ -1,0 +1,420 @@
+---
+title: IMAP & POP3
+description: Mail-retrieval protocols - IMAP (143/993) and POP3 (110/995) - for credentialed reading of user mailboxes, anonymous-binding misconfigurations, and TLS-wrapped interaction via openssl s_client and curl.
+mitre: [T1046, T1110.001, T1078]
+d3fend: [D3-NTA, D3-MENCR]
+impact: [CredentialTheft, DataExfil]
+sidebar:
+  order: 7
+  label: IMAP & POP3
+---
+
+## TL;DR
+
+Where SMTP sends mail, IMAP and POP3 *retrieve* it. Both are user-authenticated mailbox-access protocols. POP3 is simple - fetch and (usually) delete. IMAP is richer - supports server-side folders, search, and concurrent client access. Both default to plaintext, both have TLS variants. The operator-relevant work: cred-test against valid usernames, list/read mailboxes when you have creds, check for anonymous-binding misconfigs.
+
+```
+# 1. Service scan
+nmap -sV -sC -p110,143,993,995 <target>
+
+# 2. Plaintext IMAP login + folder list
+curl -k 'imap://<target>' --user 'user:password'
+
+# 3. TLS IMAP / POP3 interaction
+openssl s_client -connect <target>:imaps    # IMAP-over-TLS, port 993
+openssl s_client -connect <target>:pop3s    # POP3-over-TLS, port 995
+
+# 4. Manually fetch via IMAP
+> a1 LOGIN user password
+> a2 LIST "" *
+> a3 SELECT INBOX
+> a4 FETCH 1 BODY[TEXT]
+
+# 5. Manually fetch via POP3
+> USER user
+> PASS password
+> LIST
+> RETR 1
+```
+
+Success indicator: successful login (`LOGIN OK` for IMAP, `+OK` for POP3), folder listing returned, mail body content retrieved.
+
+## Protocol overview
+
+### POP3 (Post Office Protocol v3)
+
+| Aspect | Detail |
+| --- | --- |
+| Port | TCP 110 (plaintext), TCP 995 (TLS-wrapped) |
+| Model | Client downloads mail from server, optionally deletes after |
+| State | Stateless - no concept of folders, flags, or shared state across clients |
+| Use | Single-device personal mail (declining; mostly seen in legacy setups) |
+
+POP3 is intentionally minimal. The protocol has about a dozen commands and assumes one client owns the mailbox.
+
+### IMAP (Internet Message Access Protocol)
+
+| Aspect | Detail |
+| --- | --- |
+| Port | TCP 143 (plaintext), TCP 993 (TLS-wrapped) |
+| Model | Server holds mail; clients view/manipulate via server-side state |
+| State | Folders, message flags (read/unread/flagged), client-side cache invalidation, supports multiple concurrent sessions |
+| Use | Modern multi-device mail clients, webmail backends |
+
+IMAP commands are prefixed with a tag (a client-chosen string) so the client can match responses to commands in a pipelined session. By convention the tag is `a1`, `a2`, ... or `A001`, `A002`, ... - it doesn't matter what string you use, the server just echoes it back.
+
+### Encryption
+
+Both protocols can be wrapped in TLS:
+
+- **POP3S** on port 995 - TLS-from-start
+- **IMAPS** on port 993 - TLS-from-start
+- **STARTTLS** on the plaintext ports (110/143) - upgrade an existing connection
+
+Modern Dovecot and similar daemons commonly require STARTTLS before allowing `LOGIN` even on the plaintext port, to prevent credential exposure.
+
+## Default configuration - Dovecot
+
+[Dovecot](https://www.dovecot.org/) is the most common Linux IMAP/POP3 daemon. Configuration is sprawling - many files under `/etc/dovecot/conf.d/`. The full settings are documented in the [Dovecot core settings](https://doc.dovecot.org/settings/core/) and [service configuration](https://doc.dovecot.org/configuration_manual/service_configuration/) pages.
+
+Operator-relevant defaults:
+- Plaintext authentication usually disabled (must STARTTLS first)
+- Login on TLS ports always allowed
+- Authentication backed by `/etc/passwd` and PAM by default; LDAP/SQL/Kerberos optional
+- `mail_location` controls where mailboxes live on disk (Maildir under `/home/<user>/Maildir/` is the typical default)
+
+## Dangerous settings
+
+| Setting | What it enables |
+| --- | --- |
+| `auth_debug = yes` | Verbose auth logging - useful for the admin, useful for you if you can read logs |
+| `auth_debug_passwords = yes` | **Logs submitted passwords in plaintext** - if you can read logs (e.g. via LFI or RCE elsewhere), you harvest credentials |
+| `auth_verbose = yes` | Logs unsuccessful auth attempts with reason - distinguishes "user doesn't exist" from "bad password" |
+| `auth_verbose_passwords = yes` | Logs auth passwords (possibly truncated) |
+| `auth_anonymous_username = <user>` | Maps the SASL ANONYMOUS mechanism to a real user account - anonymous binding = login as that user |
+| Plaintext login allowed (no STARTTLS requirement) | Credentials cross the wire in plaintext, sniffable from anywhere on-path |
+| Self-signed cert + clients that don't validate | Trivially MITM-able |
+
+The two big findings are `auth_debug_passwords = yes` (creates a credential log you can harvest if you have file-read on the server) and `auth_anonymous_username` (turns SASL ANONYMOUS into login-as-something).
+
+## Footprinting commands
+
+### Service scan
+
+```shell
+sudo nmap 10.129.14.128 -sV -p110,143,993,995 -sC
+```
+
+```
+PORT    STATE SERVICE  VERSION
+110/tcp open  pop3     Dovecot pop3d
+|_pop3-capabilities: AUTH-RESP-CODE SASL STLS TOP UIDL RESP-CODES CAPA PIPELINING
+| ssl-cert: Subject: commonName=mail1.inlanefreight.htb/organizationName=Inlanefreight/
+                     stateOrProvinceName=California/countryName=US
+| Not valid before: 2021-09-19T19:44:58
+|_Not valid after:  2295-07-04T19:44:58
+143/tcp open  imap     Dovecot imapd
+|_imap-capabilities: more have post-login STARTTLS Pre-login LITERAL+ LOGIN-REFERRALS OK
+                     LOGINDISABLEDA0001 SASL-IR ENABLE listed IDLE ID IMAP4rev1
+993/tcp open  ssl/imap Dovecot imapd
+|_imap-capabilities: more have post-login OK LITERAL+ LOGIN-REFERRALS Pre-login
+                     AUTH=PLAINA0001 SASL-IR ENABLE listed IDLE ID IMAP4rev1
+995/tcp open  ssl/pop3 Dovecot pop3d
+```
+
+What's in the output:
+
+- **Dovecot** identified on all four ports - known daemon, look up version-specific CVEs
+- **`AUTH=PLAIN`** is in the IMAPS capabilities - plain-text auth is permitted on the TLS-wrapped channel (which is fine because TLS protects the wire)
+- **`LOGINDISABLED`** on plaintext IMAP - plain `LOGIN` is rejected on 143 until STARTTLS is performed
+- **`STLS`** (the POP3 equivalent of STARTTLS) is advertised on 110
+- **Cert subject** reveals `commonName=mail1.inlanefreight.htb` - the internal hostname
+
+### Credentialed login with curl
+
+```shell
+curl -k 'imaps://10.129.14.128' --user user:p4ssw0rd
+```
+
+`-k` accepts self-signed certs. If the creds work, you get a folder listing:
+
+```
+* LIST (\HasNoChildren) "." Important
+* LIST (\HasNoChildren) "." INBOX
+```
+
+`--verbose` shows the protocol exchange:
+
+```shell
+curl -k 'imaps://10.129.14.128' --user cry0l1t3:1234 -v
+```
+
+```
+*   Trying 10.129.14.128:993...
+* Connected to 10.129.14.128 (10.129.14.128) port 993 (#0)
+* TLSv1.3 (OUT), TLS handshake, Client hello (1):
+...
+* SSL connection using TLSv1.3 / TLS_AES_256_GCM_SHA384
+* Server certificate:
+*  subject: C=US; ST=California; L=Sacramento; O=Inlanefreight; OU=Customer Support;
+            CN=mail1.inlanefreight.htb; emailAddress=cry0l1t3@inlanefreight.htb
+< * OK [CAPABILITY IMAP4rev1 SASL-IR LOGIN-REFERRALS ID ENABLE IDLE LITERAL+ AUTH=PLAIN]
+      HTB-Academy IMAP4 v.0.21.4
+> A001 CAPABILITY
+< * CAPABILITY IMAP4rev1 SASL-IR LOGIN-REFERRALS ID ENABLE IDLE LITERAL+ AUTH=PLAIN
+< A001 OK Pre-login capabilities listed, post-login capabilities have more.
+> A002 AUTHENTICATE PLAIN AGNyeTBsMXQzADEyMzQ=
+< * CAPABILITY ... LITERAL+ NOTIFY SPECIAL-USE
+< A002 OK Logged in
+> A003 LIST "" *
+< * LIST (\HasNoChildren) "." Important
+< * LIST (\HasNoChildren) "." INBOX
+< A003 OK List completed (0.001 + 0.000 secs).
+```
+
+The verbose output gives you:
+- TLS version and cipher (useful intel for compliance reporting and downgrade attacks)
+- Pre-login capabilities (what's available without auth)
+- Post-login capabilities (often more features - SORT, THREAD, MOVE, BINARY, etc.)
+- The base64-encoded credential exchange (decode it to confirm credentials made it through unmodified)
+
+For POP3:
+
+```shell
+curl -k 'pop3s://10.129.14.128' --user 'user:p4ssw0rd'
+```
+
+Lists message IDs and sizes. To fetch a specific message:
+
+```shell
+curl -k 'pop3s://10.129.14.128/1' --user 'user:p4ssw0rd'    # message 1
+```
+
+To list folders / fetch via IMAP:
+
+```shell
+curl -k 'imaps://10.129.14.128/INBOX' --user 'user:p4ssw0rd'              # folder content
+curl -k 'imaps://10.129.14.128/INBOX;UID=5' --user 'user:p4ssw0rd'        # message UID 5
+curl -k 'imaps://10.129.14.128/INBOX;UID=5;SECTION=TEXT' --user '...'     # just the body
+```
+
+### Manual IMAP via openssl
+
+```shell
+openssl s_client -connect 10.129.14.128:imaps -quiet
+```
+
+```
+* OK [CAPABILITY IMAP4rev1 SASL-IR LOGIN-REFERRALS ID ENABLE IDLE LITERAL+ AUTH=PLAIN]
+   HTB-Academy IMAP4 v.0.21.4
+
+a1 LOGIN cry0l1t3 1234
+a1 OK Logged in
+
+a2 LIST "" *
+* LIST (\HasNoChildren) "." Important
+* LIST (\HasNoChildren) "." INBOX
+a2 OK List completed (0.001 + 0.000 secs).
+
+a3 SELECT INBOX
+* FLAGS (\Answered \Flagged \Deleted \Seen \Draft)
+* OK [PERMANENTFLAGS (\Answered \Flagged \Deleted \Seen \Draft \*)] Flags permitted.
+* 12 EXISTS
+* 0 RECENT
+* OK [UIDVALIDITY 1632081604] UIDs valid
+* OK [UIDNEXT 13] Predicted next UID
+a3 OK [READ-WRITE] Select completed (0.001 + 0.000 secs).
+
+a4 FETCH 1 BODY[HEADER.FIELDS (FROM TO SUBJECT DATE)]
+* 1 FETCH (BODY[HEADER.FIELDS (FROM TO SUBJECT DATE)] {142}
+From: <admin@inlanefreight.htb>
+To: <cry0l1t3@inlanefreight.htb>
+Subject: Welcome
+Date: Wed, 22 Sep 2021 12:00:00 +0200
+
+)
+a4 OK Fetch completed.
+
+a5 FETCH 1 BODY[TEXT]
+* 1 FETCH (BODY[TEXT] {198}
+Hi cry0l1t3,
+Welcome to the team. Your initial password is hunter2.
+Please change it on first login at https://portal.inlanefreight.htb/
+
+- Admin
+)
+a5 OK Fetch completed.
+
+a6 LOGOUT
+* BYE Logging out
+a6 OK Logout completed.
+```
+
+That last fetch - `hunter2` as an initial password - is the kind of mail-content finding that makes IMAP enumeration worthwhile. Welcome emails, password reset confirmations, internal portal links, vendor invoices with embedded contracts - once you have credentials, mailbox content is high-density intel.
+
+### IMAP command quick reference
+
+| Command | Purpose |
+| --- | --- |
+| `a1 LOGIN <user> <pass>` | Authenticate |
+| `a1 LIST "" *` | List all folders/mailboxes |
+| `a1 LSUB "" *` | List subscribed folders (a subset of LIST) |
+| `a1 SELECT INBOX` | Choose a folder for subsequent operations |
+| `a1 EXAMINE INBOX` | Read-only SELECT (won't mark anything as read) |
+| `a1 STATUS INBOX (MESSAGES UNSEEN)` | Folder stats without selecting |
+| `a1 SEARCH ALL` | Get all message numbers |
+| `a1 SEARCH FROM "boss@target.com"` | Search for messages matching criteria |
+| `a1 SEARCH SUBJECT "password"` | Subject-line search |
+| `a1 FETCH N ALL` | Get headers + flags for message N |
+| `a1 FETCH N BODY[]` | Full message |
+| `a1 FETCH N BODY[HEADER]` | Just headers |
+| `a1 FETCH N BODY[TEXT]` | Just body |
+| `a1 FETCH 1:* (FLAGS BODY[HEADER.FIELDS (SUBJECT FROM)])` | All messages, just subject/from |
+| `a1 STORE N +FLAGS \Seen` | Mark as read (and other flag manipulations) |
+| `a1 COPY N "Archive"` | Copy to another folder |
+| `a1 CLOSE` | Close current folder (expunges deleted) |
+| `a1 LOGOUT` | End session |
+
+### Manual POP3 via openssl
+
+```shell
+openssl s_client -connect 10.129.14.128:pop3s -quiet
+```
+
+```
++OK HTB-Academy POP3 Server
+
+USER cry0l1t3
++OK
+
+PASS hunter2
++OK Logged in.
+
+STAT
++OK 12 24576       # 12 messages, total 24576 bytes
+
+LIST
++OK 12 messages:
+1 2048
+2 4096
+3 2048
+...
+.
+
+RETR 1
++OK 2048 octets
+Return-Path: <admin@inlanefreight.htb>
+From: <admin@inlanefreight.htb>
+To: <cry0l1t3@inlanefreight.htb>
+Subject: Welcome
+...
+
+Hi cry0l1t3, your initial password is hunter2 ...
+.
+
+QUIT
++OK Logging out.
+```
+
+### POP3 command quick reference
+
+| Command | Purpose |
+| --- | --- |
+| `USER <name>` | Username |
+| `PASS <pass>` | Password |
+| `STAT` | Message count and total size |
+| `LIST` | List all messages with sizes |
+| `LIST N` | Size of message n |
+| `UIDL` | List with persistent unique IDs (instead of session-local sequence) |
+| `RETR N` | Retrieve message n |
+| `DELE N` | Mark message n for deletion (executed on QUIT) |
+| `RSET` | Cancel any DELEs in this session |
+| `TOP N COUNT` | Headers + first N lines of message n |
+| `CAPA` | List server capabilities |
+| `STLS` | Start TLS upgrade (on plaintext port 110) |
+| `QUIT` | End session, commit DELEs |
+
+### Brute-force / credential testing
+
+When you have a username list and want to try common passwords:
+
+```shell
+hydra -L users.txt -P passwords.txt imap://10.129.14.128
+hydra -L users.txt -P passwords.txt pop3://10.129.14.128
+
+# Or against TLS-wrapped variants
+hydra -L users.txt -P passwords.txt imaps://10.129.14.128
+hydra -L users.txt -P passwords.txt pop3s://10.129.14.128
+```
+
+Or with Metasploit:
+
+```shell
+msfconsole
+> use auxiliary/scanner/imap/imap_login
+> set RHOSTS 10.129.14.128
+> set USER_FILE users.txt
+> set PASS_FILE passwords.txt
+> set BLANK_PASSWORDS true
+> run
+```
+
+Be aware: many mail servers throttle aggressively on auth failures. Some integrate with fail2ban or similar. Track latency - sudden 5-10x slowdown often means you've been rate-limited.
+
+### Looking for AUTH ANONYMOUS
+
+```
+a1 AUTHENTICATE ANONYMOUS
++
+[base64-encoded empty or arbitrary string here]
+```
+
+If the server has SASL ANONYMOUS enabled with `auth_anonymous_username` mapped to a real account, you log in as that account without creds. Test by:
+
+```
+a1 CAPABILITY
+< * CAPABILITY ... AUTH=PLAIN AUTH=LOGIN AUTH=ANONYMOUS ...
+```
+
+If `AUTH=ANONYMOUS` appears in the capabilities list, give it a try.
+
+## Common chained workflows
+
+**SMTP user enum → IMAP cred-test:**
+1. Use SMTP VRFY/RCPT to enumerate valid usernames (see [SMTP](/codex/network/services/smtp/))
+2. Hydra password-spray those usernames against IMAP
+3. Successful login → read mailbox
+
+**Credentialed mailbox access → internal recon:**
+1. Login to user's mailbox
+2. Search for internal links, VPN setup emails, system credentials in old mail
+3. Use found intel to expand the engagement (new hosts, new creds, new apps)
+
+**Header analysis → infrastructure map:**
+1. Any mail you can read includes `Received:` chain
+2. Internal hostnames and IPs leak in those chains
+3. Add to target inventory
+
+**Mail-content credentials → privilege escalation:**
+1. Search inbox for "password", "credentials", "login"
+2. Initial-password emails from onboarding flows often contain reusable defaults
+3. Welcome emails from third-party SaaS reveal which platforms the user has accounts on
+
+## Quick reference
+
+| Task | Command |
+| --- | --- |
+| Service scan | `nmap -sV -sC -p110,143,993,995 <target>` |
+| Curl IMAPS login | `curl -k 'imaps://<target>' --user 'user:pass'` |
+| Curl POP3S login | `curl -k 'pop3s://<target>' --user 'user:pass'` |
+| Curl fetch folder | `curl -k 'imaps://<target>/INBOX' --user 'user:pass'` |
+| Curl fetch message | `curl -k 'imaps://<target>/INBOX;UID=5' --user 'user:pass'` |
+| Manual IMAPS | `openssl s_client -connect <target>:imaps` |
+| Manual POP3S | `openssl s_client -connect <target>:pop3s` |
+| IMAP login | `a1 LOGIN <user> <pass>` |
+| IMAP list folders | `a1 LIST "" *` |
+| IMAP select & fetch | `a1 SELECT INBOX` then `a1 FETCH 1 BODY[TEXT]` |
+| POP3 login | `USER <name>` + `PASS <pass>` |
+| POP3 retrieve | `RETR N` |
+| Hydra IMAP | `hydra -L users -P pass imap://<target>` |
+| Metasploit | `use auxiliary/scanner/imap/imap_login` |

@@ -1,0 +1,247 @@
+---
+title: Version Fingerprinting
+description: Identifying the exact WordPress core version through meta-generator, asset query strings, readme.html, REST API roots, and login-page tells - the first step before searching for version-specific CVEs.
+mitre: [T1190, T1083]
+d3fend: [D3-IDA]
+impact: []
+sidebar:
+  order: 3
+  label: Version Fingerprinting
+---
+
+## TL;DR
+
+Before searching CVE databases or picking exploits, identify the WordPress core version. Five sources, ordered by reliability and stealth:
+
+```
+# 1. The meta generator tag in HTML <head>
+curl -s http://target/ | grep -i 'meta name="generator"'
+
+# 2. Asset query strings - every loaded CSS/JS includes ?ver=<core-version>
+curl -s http://target/ | grep -oE 'ver=[0-9]+\.[0-9]+(\.[0-9]+)?' | sort -u
+
+# 3. The readme.html banner (older installs)
+curl -s http://target/readme.html | grep -i version
+
+# 4. The RSS feed generator tag
+curl -s http://target/feed/ | grep -i 'generator'
+
+# 5. The REST API root
+curl -s http://target/wp-json/ | jq '.namespaces, .authentication'
+```
+
+Success indicator: a confirmed version string like `5.3.2` that you can cross-reference against the [WordPress security archive](https://wordpress.org/news/category/security/) and CVE databases.
+
+## Why this matters
+
+WordPress core is patched aggressively. The current release line gets security fixes within days of a vulnerability being disclosed, and many hosts auto-update minor versions. Finding a target on `WordPress 5.3.2` in 2024 isn't just "it's slightly behind" - it's "it's behind by years and skipped a dozen security releases." Version-pinned CVE checks against current major versions usually return nothing; against versions more than two minor releases behind, the pickings are good.
+
+A precise version also lets you predict the behavior of specific features:
+- REST API `/wp-json/wp/v2/users` returned all users (not just published authors) in 4.7.0 and 4.7.1 - fixed in 4.7.2. If the target is exactly in that window, anonymous user enum is trivial.
+- Many plugins ship as "tested with WP X.Y" - the WP core version constrains which plugin versions could plausibly be installed.
+
+## Source 1 - meta generator
+
+WordPress writes a `<meta name="generator">` tag into every page's `<head>` by default:
+
+```html
+<head>
+  ...
+  <meta name="generator" content="WordPress 5.3.3" />
+  ...
+</head>
+```
+
+Curl + grep extracts it:
+
+```shell
+curl -s http://blog.inlanefreight.com/ | grep -i 'meta name="generator"'
+```
+
+```
+<meta name="generator" content="WordPress 5.3.3" />
+```
+
+Many security plugins (Wordfence, Hide My WP, Sucuri) remove this tag. When `meta generator` is absent, move to the next source - don't conclude the target isn't WordPress.
+
+## Source 2 - asset query strings
+
+This is the most reliable source because admins almost never remove it. Every CSS and JS file WordPress enqueues is loaded with a version query parameter:
+
+```html
+<link rel='stylesheet' id='wp-block-library-css'
+      href='http://target/wp-includes/css/dist/block-library/style.min.css?ver=5.3.3'
+      type='text/css' media='all' />
+<script src='http://target/wp-includes/js/wp-emoji-release.min.js?ver=5.3.3'></script>
+```
+
+The `?ver=` on assets loaded from `/wp-includes/` is the core version. Assets from `/wp-content/plugins/<plugin>/` use *that plugin's* version. So filter for the right path:
+
+```shell
+curl -s http://target/ \
+  | grep -oE 'wp-includes/[^"]+\?ver=[0-9.]+' \
+  | grep -oE 'ver=[0-9.]+' \
+  | sort -u
+```
+
+```
+ver=5.3.3
+```
+
+If you see multiple versions in `wp-includes` assets, the target is mid-upgrade or has a caching plugin generating stale URLs - take the highest version as the live core.
+
+This source is hard for security plugins to remove because the version query parameter has a real function: it's the cache-buster that tells browsers to refetch CSS/JS after an update. Removing it breaks updates. Some plugins replace it with a hash of the file content, which obscures the version but is itself a distinctive fingerprint of those plugins.
+
+## Source 3 - readme.html
+
+The default WordPress installation ships with `/readme.html` in the webroot:
+
+```shell
+curl -s http://target/readme.html | head -20
+```
+
+```html
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+<meta charset="UTF-8" />
+<title>WordPress &rsaquo; ReadMe</title>
+...
+<h1 id="logo">
+    <a href="https://wordpress.org/"><img alt="WordPress" src="wp-admin/images/wordpress-logo.png" width="250" height="68" /></a>
+    <br />
+    Version 5.3.3
+</h1>
+```
+
+The `Version X.Y.Z` line in the H1 is unambiguous.
+
+**Most hardening guides recommend deleting `readme.html`**, so on hardened installs you'll get a 404. Try also:
+
+```
+/readme.txt
+/license.txt          # less reliable but sometimes versioned
+/wp-admin/install.php # if WP isn't fully configured, this page shows version
+```
+
+## Source 4 - RSS feed
+
+WordPress generates an RSS feed at `/feed/`, which includes its own generator tag:
+
+```shell
+curl -s http://target/feed/ | grep -i 'generator'
+```
+
+```xml
+<generator>https://wordpress.org/?v=5.3.2</generator>
+```
+
+The `?v=` value is the WP version. Useful when:
+- `meta generator` has been stripped from HTML
+- `readme.html` is deleted
+- The site has a blog and at least one published post (without which `/feed/` may be empty)
+
+Also try:
+- `/feed/atom/` - same data, Atom format
+- `/wp-feed.php` - alternative endpoint, same data
+
+## Source 5 - REST API
+
+Every modern WordPress install exposes the REST API at `/wp-json/`. The root endpoint returns metadata:
+
+```shell
+curl -s http://target/wp-json/ | jq '.'
+```
+
+```json
+{
+  "name": "Inlanefreight Blog",
+  "description": "Just another WordPress site",
+  "url": "http://blog.inlanefreight.com",
+  "home": "http://blog.inlanefreight.com",
+  "gmt_offset": "0",
+  "timezone_string": "",
+  "namespaces": [
+    "oembed/1.0",
+    "wp/v2",
+    "wp-site-health/v1",
+    "wp-block-editor/v1"
+  ],
+  "authentication": [],
+  ...
+}
+```
+
+The `namespaces` list is a strong fingerprint:
+
+| Namespace | Introduced in |
+| --- | --- |
+| `oembed/1.0` | 4.4 |
+| `wp/v2` | 4.7 |
+| `wp-site-health/v1` | 5.2 |
+| `wp-block-editor/v1` | 5.5 |
+
+So a target showing `wp-block-editor/v1` but not (say) `wp-account/v1` (a hypothetical 6.x namespace) is somewhere in the 5.5–5.x range. The presence/absence of specific namespaces narrows version ranges when no explicit version is exposed.
+
+## Source 6 - login-page tells
+
+The login form itself can be version-fingerprinted:
+
+```shell
+curl -s http://target/wp-login.php | grep -E 'ver=|generator|wp-includes/css'
+```
+
+The login page loads CSS/JS just like the front-end, so the same `?ver=` cache-buster pattern applies. Login pages also include version-conditional features (e.g., the password-strength meter, language picker) whose presence/absence tells you a rough version range.
+
+## When all signals are stripped
+
+A site can be *very* well-hardened - `meta generator` stripped, `readme.html` deleted, `?ver=` overwritten with hashes, REST API namespaces filtered, login page customized. At that point, fingerprinting falls back to behavioral tests:
+
+- Send malformed login attempts and read the error response. Specific error strings change between versions.
+- Send REST API requests for endpoints that didn't exist in older versions; 404 vs 200 narrows the version.
+- Send XML-RPC `system.listMethods` and count the methods. The count changes slightly across versions because of internal plugins like `metaWeblog`.
+
+In practice, hardening this thorough is rare. Most engagements catch the version from source 1 or 2 immediately.
+
+## From version to vulnerability
+
+Once you have a version, the workflow:
+
+```
+1. WordPress core CVE lookup
+   https://wpscan.com/wordpresses
+   https://www.cvedetails.com/product/4096/Wordpress-Wordpress.html
+
+2. Specific feature CVEs by version range
+   E.g., "WordPress 4.7.0–4.7.1 unauthenticated REST API content modification"
+
+3. Cross-reference with installed plugin versions (see plugin-theme-enum/)
+   A vulnerable plugin × this core version × the CVE's preconditions = an exploit path
+
+4. WPScan with API token automates much of this
+   wpscan --url http://target --enumerate --api-token <token>
+```
+
+The WPScan API ([wpscan.com](https://wpscan.com)) maintains a vulnerability database for WordPress core, plugins, and themes. With an API token, WPScan checks each detected component's version against that database in one pass - the equivalent of doing the lookups manually but instant.
+
+## Defensive note
+
+A few patterns indicate the target has thought about WordPress security:
+
+- All five sources stripped/blocked
+- `wp-login.php` returns 404 (renamed via plugin like WPS Hide Login)
+- Aggressive rate limiting on `wp-login.php` and `xmlrpc.php`
+- `wp-admin/` accessible only from specific IPs
+
+When you see these together, expect Wordfence, iThemes Security, Sucuri, or similar - and expect that anything noisier than careful single requests will get your IP blocked.
+
+## Quick reference
+
+| Source | Stealth | Reliability | Strip-resistance |
+| --- | --- | --- | --- |
+| `meta generator` in HTML | High | Highest when present | Easy to strip |
+| Asset `?ver=` query strings | High | Very high | Hard to strip (breaks caching) |
+| `/readme.html` | High | High when present | Easy to delete |
+| RSS `/feed/` generator tag | High | High when site has posts | Possible but uncommon |
+| REST API `/wp-json/` namespaces | High | Medium (version range, not exact) | Possible to filter |
+| Login page asset versions | High | High | Same as front-end asset versions |

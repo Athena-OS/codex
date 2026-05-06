@@ -1,0 +1,229 @@
+---
+title: Security questions
+description: Bypassing reset flows that rely on knowledge-based authentication - mother's maiden name, city of birth, school name - through OSINT and rotating-question enumeration.
+mitre: [T1589, T1078]
+d3fend: [D3-MFA]
+impact: [AuthBypass]
+owasp: [A07]
+sidebar:
+  order: 7
+  label: Security questions
+---
+import { Aside } from '@astrojs/starlight/components';
+
+## TL;DR
+
+Security questions ("knowledge-based authentication") are a weak second factor that survives in account-recovery flows. Two attack paths:
+
+```
+# Path A - answer is OSINT-recoverable
+"What is your mother's maiden name?"     → LinkedIn family history, public records
+"What city were you born in?"            → Facebook About section, employee bio
+"What was the name of your first pet?"   → Instagram, family posts
+"What high school did you attend?"       → LinkedIn education
+"What is your favorite color?"           → ~12 candidates, brute-forceable
+
+# Path B - brute-force the answer space
+Color:  red, blue, green, yellow, ...    → ~30 attempts max
+Year:   1950-2010                        → ~60 attempts
+Sports team: top 50 in the country       → ~50 attempts
+```
+
+Success indicator: reset flow completes without legitimate identity verification - application accepts the OSINT-derived or brute-forced answer and lets the operator set a new password.
+
+## Why this still exists
+
+Security questions are popular with developers and product teams because they're cheap and avoid the complexity of email/SMS-based recovery. They survive in:
+
+- Self-service account recovery on consumer apps
+- Call-center identity verification (operator reads the question to the caller)
+- Pre-MFA enterprise apps that haven't been retrofitted
+- Banking applications, especially during account-opening recovery flows
+
+NIST 800-63B explicitly recommends against security questions as a factor. They show up in audit findings regularly but compliance pressure varies - many applications keep them as a fallback path even when their primary flow has been hardened.
+
+## Path A - OSINT-driven answers
+
+The question themes cluster heavily - and the themes happen to map to information people post publicly.
+
+| Question theme | Public sources |
+| --- | --- |
+| Mother's maiden name | Genealogy sites (FamilySearch, Ancestry leaks), Facebook family tags |
+| City of birth | LinkedIn About, Facebook About, employee bios on company sites |
+| High school | LinkedIn education, alumni groups |
+| College | LinkedIn education |
+| First pet | Instagram, Facebook (especially memorial posts) |
+| Father's name | Genealogy, obituaries, Facebook |
+| Spouse's name | Facebook relationship status, wedding announcements |
+| Childhood street | Public-records databases, voter rolls |
+| First car | Long-form interviews, blog posts |
+
+The attacker's job is to assemble this from existing public sources. A typical real engagement:
+
+1. LinkedIn for college, high school, current and previous employer locations
+2. Facebook for family relationships and birthplace
+3. Instagram for pet names (often in handle or bio)
+4. Local-newspaper archive search for obituaries (which list extended family - mother's maiden name in particular)
+
+When the answer is recoverable, the attack is one-shot - submit the answer, get the reset.
+
+## Path B - Brute-forcing low-entropy answers
+
+Some answers have small natural spaces:
+
+```
+# Favorite color
+red, orange, yellow, green, blue, purple, pink, black, white, gray, brown, ~10 more
+# Total: ~15-25 plausible answers
+
+# Year of birth (for adults)
+1940-2010 → 71 candidates
+
+# Favorite season
+spring, summer, autumn, fall, winter → 5
+
+# Favorite number
+1-100 covers most users → 100 candidates
+
+# Mother's first name (US English, common names)
+top-100 first names by decade of birth → ~200 candidates depending on target age
+
+# High school mascot
+top sports team names + state-specific patterns → ~500 candidates
+```
+
+When the application has no rate limit on security-question attempts, brute-forcing these spaces is fast.
+
+### Detecting whether brute-force is feasible
+
+```bash
+# Submit a few wrong answers in quick succession, observe response changes
+for guess in red blue green yellow purple; do
+  curl -s -X POST -d "answer=$guess" https://<TARGET>/recover/step2
+  echo "---"
+done
+```
+
+If responses are identical for 5 wrong guesses, the endpoint isn't rate-limiting. Run a real wordlist:
+
+```bash
+ffuf -w colors.txt:ANSWER \
+     -u https://<TARGET>/recover/step2 \
+     -X POST -d "answer=ANSWER" \
+     -fr "Incorrect"
+```
+
+## Rotating questions
+
+Better-designed applications present a different question on each failed attempt:
+
+```
+Attempt 1: What is your mother's maiden name? → wrong → "let's try another question"
+Attempt 2: What was the name of your first pet?
+Attempt 3: In what city were you born?
+```
+
+The intent: an attacker who knows the answer to one question doesn't get to keep trying it; they have to know multiple answers. In practice, the attacker collects the rotation, identifies the easiest brute-force target, then engineers attempts to land on that question.
+
+### Scraping the rotation
+
+```python
+import requests
+
+questions_seen = set()
+
+for attempt in range(20):
+    # Trigger a fresh reset (often requires re-submitting the username)
+    requests.post(url, data={"user": "victim"})
+    
+    # Get the recovery page, extract the question
+    page = requests.get(url + "/recover").text
+    
+    # Parse the question (selector depends on app - example below)
+    import re
+    match = re.search(r'<label class="question">([^<]+)</label>', page)
+    if match:
+        questions_seen.add(match.group(1))
+    
+    # Submit a deliberate wrong answer to rotate
+    requests.post(url + "/recover", data={"answer": "garbage"})
+
+print(f"Found {len(questions_seen)} unique questions:")
+for q in questions_seen:
+    print(f"  - {q}")
+```
+
+After 20-50 cycles you usually have the entire question pool. Pick the easiest target (lowest entropy, easiest OSINT) and re-cycle until that question appears.
+
+### Defeating the rotation
+
+The application has to track *which question* it asked between requests. The state lives in:
+
+- The session cookie (most common) - drop and re-acquire the cookie to reset
+- A hidden form field (sometimes) - submit only when the desired question is presented
+- Server-side per-IP state - header smuggling resets the state
+
+If the state is in a hidden form field, the attacker can fix it: submit only the answer-form variant that includes the desired question's identifier, forcing the validation to check the answer against that specific question.
+
+## Implementation bug - fixed first question
+
+A subtle but common bug: the application rotates the visible question on failed attempts, but always validates against the *first* question regardless. The attacker can:
+
+1. Trigger a reset, see the first question, fail it deliberately
+2. See the second question (rotation), submit the answer to the first question
+3. If validation accepts → the application is checking the answer against the first question, not the displayed one
+4. Cycle until the easiest-to-answer first question appears
+
+### Detection
+
+Trigger a reset on your own account. Note the first question. Submit the wrong answer. When the second question appears, submit the *first question's correct answer* - if the reset succeeds, the rotation is cosmetic.
+
+## Detection-only attempts
+
+Probing without committing to a real attempt:
+
+```bash
+# Identify whether the reset flow has security questions at all
+curl -s https://<TARGET>/forgot-password | grep -iE '(question|security|verify)'
+
+# See whether attempts are rate-limited
+for i in 1 2 3 4 5; do
+  curl -s -X POST -d "answer=test$i" https://<TARGET>/recover
+done
+```
+
+## OSINT workflow
+
+For target users you've identified, a quick OSINT pass:
+
+```bash
+# Search engine basics
+"<Full Name>" site:linkedin.com
+"<Full Name>" site:facebook.com
+"<Full Name>" site:instagram.com
+
+# Specific high-value searches
+"<Full Name>" "born in"
+"<Full Name>" mother
+"<Full Name>" obituary
+
+# Username-style searches if you only have a handle
+"<username>" mother OR father OR family
+
+# Email-derived
+# If you have an email, search for it on Have I Been Pwned-style services
+# and the leaked databases that often accompany pwned-account dumps
+```
+
+A practiced operator can usually answer 2-3 of the canonical questions for a given target in 15-30 minutes of OSINT.
+
+## Notes
+
+- **Some applications have moved to "give us a random fact about yourself."** Free-form security questions chosen by the user are theoretically stronger but practically weaker - users pick easily-guessable facts, and the attacker doesn't have to research what questions exist.
+- **Call-center attacks use the same answers.** When the application's documented security questions are weak, social engineering against the call center using the same answers is often easier than the web-form attack. Out of web-app scope but worth noting.
+- **MFA mostly kills this.** When a real second factor is required (TOTP, FIDO2), security questions either go away or become a non-blocking step. The attack surface here is concentrated in applications that haven't deployed MFA, or apps that allow security questions to *bypass* MFA in recovery scenarios - that last pattern is the worst and worth checking specifically.
+- **The application might disclose which questions are wrong vs. which questions are unknown.** "That's not the answer to your first question" is informational; "your answer is incorrect" is generic. Verbose responses tell you whether you're hitting valid questions.
+
+<Aside type="tip">
+The strongest practical defense against security-question attacks is to not use them at all. When you find a reset flow that depends on security questions, your finding is half "this question is brute-forceable" and half "this mechanism is fundamentally weaker than email-or-SMS verification" - write up both.
+</Aside>

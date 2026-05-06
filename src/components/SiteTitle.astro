@@ -1,0 +1,80 @@
+---
+// src/components/SiteTitle.astro
+//
+// Override of Starlight's default SiteTitle component. Renders the Codex
+// shield glyph alongside the "Codex" wordmark in the top-left of the header.
+//
+// The glyph (CodexLogo.astro) uses currentColor so it tracks the palette
+// tuner's hue rotation automatically. Wordmark uses the same monospace
+// font as the rest of the operator-reference body.
+//
+// Register in astro.config.mjs:
+//
+//   starlight({
+//     components: {
+//       SiteTitle: './src/components/SiteTitle.astro',
+//     },
+//   })
+
+import CodexLogo from './CodexLogo.astro';
+
+const { siteTitle, siteTitleHref } = Astro.locals.starlightRoute;
+---
+
+<a href={siteTitleHref} class="codex-site-title" translate="no">
+  <CodexLogo size={28} class="codex-site-title__glyph" />
+  <span class="codex-site-title__wordmark">{siteTitle}</span>
+</a>
+
+<style>
+  .codex-site-title {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.6rem;
+    color: var(--codex-text);
+    text-decoration: none;
+    /* No hover state on the link itself - the glyph handles its own visual feedback */
+    transition: color 0.15s ease;
+  }
+
+  /* The shield glyph uses the accent color, so it tracks the palette tuner */
+  .codex-site-title__glyph {
+    color: var(--codex-accent);
+    flex-shrink: 0;
+    /* Subtle visual lift so the glyph optically aligns with the wordmark cap height */
+    margin-top: -1px;
+  }
+
+  /* Mono wordmark, slightly tightened letter-spacing to feel like a logo */
+  .codex-site-title__wordmark {
+    font-family: var(--codex-font-mono);
+    font-size: 1.1rem;
+    font-weight: 500;
+    letter-spacing: -0.01em;
+    color: var(--codex-text);
+    line-height: 1;
+  }
+
+  /* On hover, brighten the wordmark slightly - the glyph stays accent-colored */
+  .codex-site-title:hover .codex-site-title__wordmark {
+    color: var(--codex-accent);
+  }
+
+  /* Focus state for keyboard navigation */
+  .codex-site-title:focus-visible {
+    outline: 2px solid var(--codex-accent);
+    outline-offset: 4px;
+    border-radius: 4px;
+  }
+
+  /* Narrower viewport - slightly smaller glyph + wordmark */
+  @media (max-width: 480px) {
+    .codex-site-title__glyph {
+      width: 22px;
+      height: 22px;
+    }
+    .codex-site-title__wordmark {
+      font-size: 1rem;
+    }
+  }
+</style>

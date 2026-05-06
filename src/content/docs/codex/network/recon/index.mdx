@@ -1,0 +1,82 @@
+---
+title: Reconnaissance
+description: Operator methodology for infrastructure-based reconnaissance - the systematic approach to mapping an organization's internet presence, network perimeter, and accessible services before active enumeration begins.
+mitre: [T1589, T1590, T1591, T1592, T1593, T1595, T1596]
+d3fend: [D3-NTA, D3-IDA]
+sidebar:
+  order: 1
+  label: Overview
+---
+
+## TL;DR
+
+Reconnaissance is the work that happens *before* you have a target list - or the work that fills out a target list when scope says "the company." The goal is to enumerate everything the organization exposes to the internet, identify which of those assets you're authorized to test, and build a mental model of the infrastructure deep enough to spot misconfigurations and unguarded edges.
+
+This is the **passive/external** half of the engagement. Active per-service enumeration (FTP, SMB, DNS as a target, etc.) lives in the [services cluster](/codex/network/services/) - different mindset, different tooling, different risk profile.
+
+Recon is invisible to the target when done correctly. Every tool here either queries third-party services (crt.sh, Shodan, GrayHatWarfare, Google), reads public records (DNS, WHOIS, SSL certs), or scrapes public profiles (LinkedIn, GitHub). Nothing touches the target's infrastructure directly - that's the entire point.
+
+## The three principles
+
+| # | Principle |
+| --- | --- |
+| 1 | There is more than meets the eye. Consider all points of view. |
+| 2 | Distinguish between what we see and what we do not see. |
+| 3 | There are always ways to gain more information. Understand the target. |
+
+These read like fortune cookies until you've worked an engagement where they bite. Concretely:
+
+- **Principle 1** is anti-tunnel-vision. You found `www.target.com`. So has every other tester for the last decade. The interesting attack surface is the SaaS that engineering forgot to inventory, the staging environment in a `.dev` subdomain, the legacy app on `:8443` that's behind no WAF.
+- **Principle 2** is about *inferring infrastructure from artifacts*. A `TXT` record naming `google-site-verification` tells you they use Google. A `MAIL FROM` header with `mailgun.org` tells you about their email pipeline. You don't see the AD domain controller, but you can see the SMB share that probably auths against it.
+- **Principle 3** is the antidote to "I've enumerated this target." You haven't. Someone who studies one company for a year will always know more than someone who tested it for a week. Methodology exists so the work you *do* finish is the right work.
+
+## The 6-layer model
+
+Visualize a target as nested obstacles. Each layer is a wall; reconnaissance is finding the gaps that let you reach the next layer.
+
+| Layer | What it covers | What you're collecting |
+| --- | --- | --- |
+| **1. Internet Presence** | External assets reachable from the public internet | Domains, subdomains, vHosts, ASN, netblocks, IPs, cloud instances |
+| **2. Gateway** | Perimeter security - what stands between the internet and the internal services | Firewalls, DMZ design, IPS/IDS, EDR, WAF, CDN, VPN |
+| **3. Accessible Services** | Services exposed on identified hosts | Service type, version, configuration, port |
+| **4. Processes** | What runs behind each service - process tree, data flows, source/destination relationships | PIDs, data processed, task dependencies |
+| **5. Privileges** | Account model on each service - who runs what, what they can do | Groups, users, permissions, environment |
+| **6. OS Setup** | The host operating system once internal access is achieved | OS, patch level, network config, sensitive files |
+
+**Reconnaissance covers layers 1 and 2.** Layer 3 starts the per-service work (see [services/](/codex/network/services/)). Layers 4-6 are post-exploitation and live in other modules.
+
+Note that layers 1 and 2 don't really apply to *internal* engagements - once you're inside (or assumed-inside as in an AD assessment), you skip directly to layer 3. The labyrinth metaphor only makes sense from the outside.
+
+## The labyrinth
+
+Penetration tests are time-boxed. Every engagement has dozens of potential gaps, only some of which lead anywhere useful, and a four-week assessment can never claim "no vulnerabilities remain" - someone studying the target for six months will know it better than someone testing it for four weeks. The [SolarWinds compromise](https://www.rpc.senate.gov/policy-papers/the-solarwinds-cyberattack) is the canonical reminder: methodology exists not to find *every* gap, but to find the right gaps in the time available.
+
+The practical implication: prioritize ruthlessly. A finding on a forgotten staging environment with no production data is less valuable than a finding on the customer-facing app, even if the staging finding is "cooler." Methodology keeps the work proportional to the goal.
+
+## What goes where in this cluster
+
+| Page | Stage | What you're doing |
+| --- | --- | --- |
+| [Domains & Subdomains](/codex/network/recon/domains-and-subdomains/) | Earliest | Resolve the scope from a company name to a list of internet-facing hosts |
+| [Shodan & OSINT](/codex/network/recon/shodan-and-osint/) | After hosts | Enrich each host with open ports, banners, geolocation - without touching it |
+| [Cloud Resources](/codex/network/recon/cloud-resources/) | Parallel | Find S3 buckets, Azure blobs, GCS storage that wasn't in the DNS zone |
+| [People & Tech Stack](/codex/network/recon/people/) | Anytime | LinkedIn, job posts, GitHub - what tech do the engineers actually work with |
+
+The order isn't strict. People-recon can happen first if you have a name and no IPs. Cloud and DNS reinforce each other. The point is the *coverage*, not the sequence.
+
+## When recon ends
+
+Recon ends when you have:
+
+1. A scope-validated list of hosts you can touch
+2. Per-host context - service banners, software versions, defensive products
+3. Enough organizational intel to recognize what's normal traffic and what isn't
+4. A working hypothesis about the most exposed attack surface
+
+At that point, switch to active enumeration. The [services cluster](/codex/network/services/) covers per-service work - that's where DNS becomes "AXFR this nameserver," SMB becomes "enumerate shares anonymously," and so on.
+
+## A note on scope
+
+Everything in this cluster *can* be done without authorization (it queries third-party data sources, not the target). That doesn't mean every *result* is in-scope to test. A subdomain might point to a SaaS the target uses but doesn't own - testing that SaaS would target a third party. An S3 bucket might belong to a contractor with a different scope of work. Recon expands the *visible* attack surface; the engagement contract narrows it back down to what you're allowed to act on.
+
+When in doubt, ask the client. Every result on this cluster should be cross-referenced against the rules of engagement before any traffic touches it.

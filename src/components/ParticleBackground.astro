@@ -1,0 +1,215 @@
+---
+// src/components/ParticleBackground.astro
+//
+// Subtle particle layer using @tsparticles/engine + @tsparticles/slim directly.
+//
+// Why not @tsparticles/astro? The official Astro wrapper is published only as
+// 4.0.0-beta.x and pins engine 4.x-beta, but @tsparticles/slim is stable at
+// 3.9.1 pinning engine 3.9.1. The two are incompatible at install time -
+// loadSlim throws "engine version different from plugin version" at runtime.
+// There's no stable 3.x release of the wrapper. So we use the underlying
+// packages directly, which is just a few lines anyway.
+//
+// Z-INDEX:
+//   tsparticles writes the canvas with an inline `z-index: <N> !important`
+//   that CSS cannot beat. We control it via `fullScreen.zIndex` in the
+//   options - the engine bakes that value into the inline style. -1 places
+//   the canvas behind content. With `interactivity.detectsOn: 'window'` the
+//   hover-repulse still works.
+
+const initialAccent = "rgb(180, 142, 173)";
+
+const options = {
+  fullScreen: { enable: true, zIndex: -1 },
+  background: { color: "transparent" },
+  fpsLimit: 60,
+  particles: {
+    number: {
+      value: 30,
+      density: { enable: true, width: 1200, height: 800 },
+    },
+    color: { value: initialAccent },
+    opacity: { value: 0.35 },
+    size: { value: { min: 1, max: 2.5 } },
+    links: {
+      enable: true,
+      distance: 140,
+      color: initialAccent,
+      opacity: 0.18,
+      width: 1,
+    },
+    move: {
+      enable: true,
+      speed: 0.6,
+      direction: "none",
+      random: true,
+      straight: false,
+      outModes: { default: "out" },
+    },
+  },
+  interactivity: {
+    detectsOn: "window",
+    events: {
+      onHover: { enable: true, mode: "repulse" },
+      onClick: { enable: false },
+      resize: { enable: true },
+    },
+    modes: {
+      repulse: {
+        distance: 90,
+        duration: 0.4,
+        easing: "ease-out-quad",
+      },
+    },
+  },
+  detectRetina: true,
+};
+
+// Serialize once on the server, pass to client via data attribute.
+const optionsJson = JSON.stringify(options);
+---
+
+<div id="codex-particles-mount" data-options={optionsJson}></div>
+
+<script>
+  import { tsParticles, rgbToHsl } from "@tsparticles/engine";
+  import { loadSlim } from "@tsparticles/slim";
+
+  // Top-level await - Astro/Vite supports it for module scripts.
+  await loadSlim(tsParticles);
+
+  const mount = document.getElementById("codex-particles-mount");
+  if (!mount) {
+    // Not on a page that includes this component; nothing to do.
+  } else {
+    // Reduced-motion: bail before doing any work.
+    const reduceMotion = window.matchMedia &&
+                         window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+    if (!reduceMotion) {
+      const options = JSON.parse(mount.dataset.options || "{}");
+
+      tsParticles.load({ id: "codex-particles", options })
+        .then((container) => {
+          if (!container) return;
+
+          // 1. Palette sync - tuner writes --codex-accent-rgb at runtime.
+          //
+          // Why not container.refresh()? Refresh destroys and rebuilds the
+          // entire particle pool - positions jump, links re-form. The user
+          // sees a visible reset every time they drag the slider.
+          //
+          // Instead we walk the live particle array and mutate each
+          // particle's HSL color in place. Positions, velocities, and link
+          // animations are untouched; particles just smoothly take on the
+          // new hue on the next frame. We also update the options so any
+          // particle spawned later (e.g. after resize-triggered density
+          // adjustments) starts with the right color. Links are drawn from
+          // options.particles.links.color each frame, so updating that
+          // option alone recolors all the link strokes immediately.
+
+          function readAccentRgb(): { r: number; g: number; b: number } | null {
+            const raw = getComputedStyle(document.documentElement)
+              .getPropertyValue('--codex-accent-rgb')
+              .trim();
+            if (!raw) return null;
+            const parts = raw.split(',').map((s) => parseInt(s.trim(), 10));
+            if (parts.length !== 3 || parts.some((n) => isNaN(n))) return null;
+            return { r: parts[0], g: parts[1], b: parts[2] };
+          }
+
+          // Track by RGB string so polling skips when nothing's changed.
+          function rgbKey(rgb: { r: number; g: number; b: number }): string {
+            return `${rgb.r},${rgb.g},${rgb.b}`;
+          }
+
+          let lastKey = rgbKey(readAccentRgb() || { r: 180, g: 142, b: 173 });
+
+          setInterval(() => {
+            const rgb = readAccentRgb();
+            if (!rgb) return;
+            const key = rgbKey(rgb);
+            if (key === lastKey) return;
+            lastKey = key;
+
+            try {
+              const hsl = rgbToHsl(rgb);
+              const rgbString = `rgb(${rgb.r}, ${rgb.g}, ${rgb.b})`;
+
+              // Update existing particles in place (no position reset).
+              // particles.filter(() => true) returns the live array.
+              const live = (container as any).particles?.filter?.(() => true) ?? [];
+              for (const p of live) {
+                if (p?.color?.h) {
+                  p.color.h.value = hsl.h;
+                  p.color.s.value = hsl.s;
+                  p.color.l.value = hsl.l;
+                }
+              }
+
+              // Update options so newly-spawned particles match, and so
+              // the link renderer (which re-reads links.color each frame)
+              // picks up the new color immediately.
+              const opts = (container as any).options;
+              if (opts?.particles?.color) {
+                opts.particles.color.value = rgbString;
+              }
+              if (opts?.particles?.links) {
+                opts.particles.links.color = rgbString;
+              }
+            } catch (e) { /* decorative - swallow */ }
+          }, 200);
+
+          // 2. Visibility pause
+          document.addEventListener('visibilitychange', () => {
+            try {
+              if (document.hidden) container.pause();
+              else container.play();
+            } catch (e) { /* noop */ }
+          });
+        })
+        .catch((e) => {
+          console.error('[codex-particles] load failed:', e);
+        });
+    }
+  }
+</script>
+
+<style is:global>
+  /*
+    Blur sync: the canvas picks up the --codex-blur value the palette tuner
+    sets on :root. We scale it down to ~50% - at full slider (30px) the bg
+    pattern blur is already deliberately strong, so matching that on the
+    particles would smear them into a wash. Half-strength keeps the
+    particles legible while still visibly softening with the tuner.
+
+    `filter` isn't touched by tsparticles' inline canvas style (the engine
+    only writes position/size/z-index inline), so a stylesheet rule wins
+    without needing !important. We keep `is:global` because the canvas has
+    no astro scoping class.
+
+    `transition` matches the bg layer's 0.3s ease so the two visual layers
+    blur together smoothly when the user drags the slider.
+  */
+  canvas[data-generated="true"] {
+    filter: blur(calc(var(--codex-blur, 0px) * 0.5));
+    transition: filter 0.3s ease;
+  }
+
+  /*
+    Reduced-motion / print: hide the canvas. `is:global` because the
+    canvas tsparticles creates has no astro scoping class. tsparticles
+    sets `data-generated="true"` on its own canvas.
+  */
+  @media (prefers-reduced-motion: reduce) {
+    canvas[data-generated="true"] {
+      display: none !important;
+    }
+  }
+
+  @media print {
+    canvas[data-generated="true"] {
+      display: none !important;
+    }
+  }
+</style>

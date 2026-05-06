@@ -1,0 +1,116 @@
+---
+title: Authentication & Sessions
+description: Operator reference for authentication and session-management attacks - credential bruteforce, username enumeration, weak reset tokens, session-cookie tampering, JWT abuse.
+mitre: [T1078, T1110, T1539]
+d3fend: [D3-MFA, D3-AH, D3-CH]
+impact: [AuthBypass, SessionTakeover, CredentialTheft]
+owasp: [A07]
+sidebar:
+  order: 1
+  label: Overview
+---
+import { Aside } from '@astrojs/starlight/components';
+
+## TL;DR
+
+Authentication is "prove you're someone." Sessions are "keep being them." Bugs in either category give the attacker either someone else's account or someone else's privileges - usually with a payload no bigger than one HTTP request.
+
+```
+# Username enumeration (different responses for valid vs. invalid users)
+POST /login   username=admin       password=wrong  → "Invalid password for admin"
+POST /login   username=nope        password=wrong  → "Unknown username"
+
+# Reset-token brute-force (short, time-based, or weak crypto)
+GET  /reset?user=admin&token=00000 … 99999          → eventually one returns success
+
+# Session cookie tampering (decode → modify → re-encode)
+Cookie: SESSIONID=757365723A6874623B726F6C653A75736572
+        ↓ hex decode
+        user:htb;role:user
+        ↓ change role
+        user:htb;role:admin
+        ↓ re-encode and send
+```
+
+Success indicator: access to an account or privileges you weren't issued.
+
+## Where to look
+
+Anywhere the application takes a credential, hands out a token, or trusts a token on subsequent requests:
+
+- **Login forms** - username/password, OTP step, "remember me" checkbox
+- **Registration forms** - username availability checks leak which users exist
+- **Password reset / forgot password** - generates a token, often weakly
+- **Profile and settings pages** - password change, MFA enrollment, security questions
+- **Session cookies** - `SESSIONID`, `auth`, `token`, `jwt`, framework-specific names (`PHPSESSID`, `JSESSIONID`, `ASP.NET_SessionId`)
+- **JWT in `Authorization: Bearer ...` headers** - signature scheme, expiry, claims
+- **Magic-link emails** - single-use authentication URLs
+- **Cookie-based auth on legacy admin panels** - older apps with custom session handling
+
+If the application has any concept of "who you are" between requests, this section applies.
+
+## Decision flow
+
+A typical engagement against a login surface walks these steps in order. Skip ahead where the bug pattern's already obvious.
+
+1. **Default or guessable credentials?** Vendor logins, demo accounts, common patterns (`admin:admin`, `tech:tech`) → [Default credentials](/codex/web/auth/default-credentials/)
+2. **Bruteforce protections in place?** CAPTCHA, rate limits, lockouts - assess whether they're tamperable → [Bruteforce protections](/codex/web/auth/bruteforce-protections/)
+3. **Can you tell valid usernames from invalid ones?** Error messages, response timing, password-reset replies, registration-form availability checks → [Username enumeration](/codex/web/auth/username-enumeration/)
+4. **What's the password policy?** Determines wordlist filtering and brute-force feasibility → [Password policy inference](/codex/web/auth/password-policy/)
+5. **Reset tokens predictable?** Time-based, short numeric codes, weak crypto, never-expiring → [Reset tokens](/codex/web/auth/reset-tokens/)
+6. **Security questions in the reset flow?** "Mother's maiden name" / "city of birth" - OSINT and rotating-question scraping → [Security questions](/codex/web/auth/security-questions/)
+7. **Reset form trusts user-supplied identity?** `userid` in `$_REQUEST` overriding the session - change someone else's password from your account → [Username injection](/codex/web/auth/username-injection/)
+8. **Session cookie contains identity or role?** Decode and tamper → [Cookie tampering](/codex/web/auth/cookie-tampering/)
+9. **Same session token persists across login states?** Pre-auth token reused post-auth → [Session fixation](/codex/web/auth/session-fixation/)
+10. **JWT in use?** Check `alg`, expiry, signature handling → [JWT](/codex/web/auth/jwt/)
+
+## Attack categories
+
+The bugs in this section break down by what the operator is attacking:
+
+| Category | What you're attacking | What you get |
+| --- | --- | --- |
+| Credential brute-force | Authentication endpoint | Access to one specific account |
+| Username enumeration | Error message / response semantics | List of valid users for further targeting |
+| Reset-token weaknesses | Forgot-password flow | Account takeover without knowing the password |
+| Identity injection | Reset / change-password flow | Account takeover by overriding the session's user |
+| Session cookie tampering | Cookie format / encoding | Privilege escalation within your own session |
+| Session fixation | Token issuance / invalidation logic | Hijack a session you can predict |
+| JWT abuse | Token signature, claims, expiry | Forged identity claims accepted by the server |
+
+The last column is the operationally important one. The brute-force and enumeration paths are stepping-stones; the tampering and injection paths are the win.
+
+## Authentication background
+
+Most of this section is about the **knows** domain - passwords, security answers, tokens that prove the user knows a secret. Two other authentication categories exist but are out of scope for a web reference:
+
+- **HAS domain** - physical tokens (hardware keys, badges, OTP devices). Attacks include cloning, OTP-algorithm breaks, theft. Not web-app exploitable.
+- **IS domain** - biometrics (fingerprint, face, retina). Attacks include lifted prints, deepfakes, leaked biometric databases. Also not web-app exploitable.
+
+The web layer can interact with HAS / IS authentication (e.g., FIDO2 / WebAuthn over HTTPS), but the attacks themselves happen at the device or hardware level.
+
+**MFA / 2FA** combines two of these categories. When MFA is in place, the bugs below are still useful - they just don't give a full account takeover until the second factor is also handled (separately, usually by phishing or social engineering for the OTP).
+
+## Authentication mechanisms in scope
+
+| Mechanism | Where it appears | What the bugs look like |
+| --- | --- | --- |
+| Form-based (FBA) | The dominant pattern - username/password POST, session cookie response | Everything in this section |
+| HTTP Basic / Digest / NTLM | Often internal apps, admin panels, legacy systems | Credentials sent every request → easier to capture; weak realm separation |
+| Token-based (JWT, opaque tokens) | APIs, SPAs, mobile backends | Signature attacks, claim tampering, replay → [JWT](/codex/web/auth/jwt/) |
+| Source-IP-based | Localhost-trust, "trusted network" admin panels | `X-Forwarded-For` spoofing → [Bruteforce protections](/codex/web/auth/bruteforce-protections/) |
+| SSO (SAML, OIDC) | Enterprise apps, federated logins | Separate attack class - assertion replay, signature bypass, issuer confusion |
+
+SSO attacks are their own discipline and have their own page family that will exist eventually - for now, the SSO sinks present in apps that also have form-based fallback often share enough surface with the bugs below.
+
+## Operating notes
+
+The single most useful habit: **register your own account first.** Knowing what a valid login response looks like, what cookies get set, what the success message reads as - that becomes the oracle for everything else. Every page in this section assumes you have a working comparison point.
+
+The second most useful habit: **read the source of the login response.** Hidden form fields, anti-CSRF tokens, response-time differences, framework names in error messages, the exact phrasing of "wrong username" vs. "wrong password" - all of it is information disclosure that the per-page techniques convert into access.
+
+<Aside type="caution">
+Authentication attacks are noisy by default. Brute-force generates obvious traffic patterns, account lockouts irritate real users, and a successful takeover leaves logs naming the compromised account. Coordinate with the blue team or limit to authorized testing windows. The "stealth" path here is account-takeover via reset-token weaknesses or cookie tampering - those produce a single anomalous successful login rather than a wall of failed attempts.
+</Aside>
+
+The detection-style pages (username enumeration, policy inference) are the right starting points on most engagements. The exploitation pages (cookie tampering, username injection, JWT) assume you've done enumeration first and know which user you're targeting.

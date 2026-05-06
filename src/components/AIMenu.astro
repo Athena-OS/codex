@@ -1,0 +1,466 @@
+---
+// src/components/AIMenu.astro
+//
+// "Copy" dropdown menu shown in the page header. Four options:
+//
+//   1. Copy page              - copies page as Markdown to clipboard
+//   2. View as Markdown        - opens raw .md version of page in new tab
+//   3. Open in ChatGPT         - deep-link to chatgpt.com with page as context
+//   4. Open in Claude          - deep-link to claude.ai with page as context
+//
+// All actions are link-based or clipboard-based - no backend, no API keys,
+// no server-side dependencies. The .md endpoint is served by
+// /src/pages/[...slug].md.ts (statically generated at build time).
+//
+// Usage in a Starlight PageTitle override or similar:
+//   import AIMenu from '@components/AIMenu.astro';
+//   <AIMenu />
+
+import { CODEX_META } from '@data/codex-meta';
+
+// Build URLs at render time - pageUrl is the canonical absolute URL of the
+// current page. The Markdown version is served by /src/pages/[...slug].md.ts.
+const pageUrl = new URL(Astro.url.pathname, CODEX_META.baseUrl).href;
+const markdownUrl = pageUrl.endsWith('/')
+  ? pageUrl.slice(0, -1) + '.md'
+  : pageUrl + '.md';
+
+const aiQuery = encodeURIComponent(CODEX_META.aiQueryTemplate(pageUrl));
+const chatgptUrl = `https://chat.openai.com/?q=${aiQuery}`;
+const claudeUrl = `https://claude.ai/new?q=${aiQuery}`;
+---
+
+<div class="codex-ai-menu" id="codex-ai-menu">
+  <button
+    type="button"
+    class="codex-ai-menu__toggle"
+    aria-label="AI tools and integrations"
+    aria-expanded="false"
+    aria-controls="codex-ai-menu-panel"
+  >
+    <svg
+      width="14"
+      height="14"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      stroke-width="2"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      aria-hidden="true"
+    >
+      <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+      <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+    </svg>
+    <span>Copy</span>
+    <svg
+      class="codex-ai-menu__chevron"
+      width="12"
+      height="12"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      stroke-width="2"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      aria-hidden="true"
+    >
+      <polyline points="6 9 12 15 18 9"></polyline>
+    </svg>
+  </button>
+
+  <div
+    class="codex-ai-menu__panel"
+    id="codex-ai-menu-panel"
+    role="menu"
+    aria-hidden="true"
+  >
+    <!-- 1. Copy page -->
+    <button
+      type="button"
+      class="codex-ai-menu__item"
+      role="menuitem"
+      data-action="copy-page"
+    >
+      <svg class="codex-ai-menu__icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+        <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+      </svg>
+      <span class="codex-ai-menu__text">
+        <span class="codex-ai-menu__title">Copy page</span>
+        <span class="codex-ai-menu__desc">Copy page as Markdown for LLMs</span>
+      </span>
+    </button>
+
+    <!-- 2. View as Markdown -->
+    <a
+      href={markdownUrl}
+      class="codex-ai-menu__item"
+      role="menuitem"
+      target="_blank"
+      rel="noopener noreferrer"
+    >
+      <svg class="codex-ai-menu__icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect x="3" y="5" width="18" height="14" rx="2"></rect>
+        <path d="M7 15V9l3 3 3-3v6"></path>
+        <path d="M16 9v6l-2-2"></path>
+        <path d="M16 15l2-2"></path>
+      </svg>
+      <span class="codex-ai-menu__text">
+        <span class="codex-ai-menu__title">
+          View as Markdown
+          <svg class="codex-ai-menu__external" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path>
+            <polyline points="15 3 21 3 21 9"></polyline>
+            <line x1="10" y1="14" x2="21" y2="3"></line>
+          </svg>
+        </span>
+        <span class="codex-ai-menu__desc">View this page as plain text</span>
+      </span>
+    </a>
+
+    <!-- 3. Open in ChatGPT -->
+    <a
+      href={chatgptUrl}
+      class="codex-ai-menu__item"
+      role="menuitem"
+      target="_blank"
+      rel="noopener noreferrer"
+    >
+      <svg class="codex-ai-menu__icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <circle cx="12" cy="12" r="9"></circle>
+        <path d="M8 12h8"></path>
+        <path d="M12 8v8"></path>
+        <path d="M9.5 9.5L14.5 14.5"></path>
+        <path d="M14.5 9.5L9.5 14.5"></path>
+      </svg>
+      <span class="codex-ai-menu__text">
+        <span class="codex-ai-menu__title">
+          Open in ChatGPT
+          <svg class="codex-ai-menu__external" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path>
+            <polyline points="15 3 21 3 21 9"></polyline>
+            <line x1="10" y1="14" x2="21" y2="3"></line>
+          </svg>
+        </span>
+        <span class="codex-ai-menu__desc">Ask ChatGPT about this page</span>
+      </span>
+    </a>
+
+    <!-- 4. Open in Claude -->
+    <a
+      href={claudeUrl}
+      class="codex-ai-menu__item"
+      role="menuitem"
+      target="_blank"
+      rel="noopener noreferrer"
+    >
+      <svg class="codex-ai-menu__icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M12 2L13.5 8.5L20 10L13.5 11.5L12 18L10.5 11.5L4 10L10.5 8.5L12 2Z"></path>
+      </svg>
+      <span class="codex-ai-menu__text">
+        <span class="codex-ai-menu__title">
+          Open in Claude
+          <svg class="codex-ai-menu__external" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path>
+            <polyline points="15 3 21 3 21 9"></polyline>
+            <line x1="10" y1="14" x2="21" y2="3"></line>
+          </svg>
+        </span>
+        <span class="codex-ai-menu__desc">Ask Claude about this page</span>
+      </span>
+    </a>
+  </div>
+
+  <!-- Toast for copy feedback -->
+  <div class="codex-ai-menu__toast" id="codex-ai-menu-toast" aria-live="polite"></div>
+</div>
+
+<script is:inline>
+  (function () {
+    'use strict';
+
+    function init() {
+      const menu = document.getElementById('codex-ai-menu');
+      if (!menu) return;
+
+      const toggle = menu.querySelector('.codex-ai-menu__toggle');
+      const panel = document.getElementById('codex-ai-menu-panel');
+      const toast = document.getElementById('codex-ai-menu-toast');
+      const copyButton = menu.querySelector('[data-action="copy-page"]');
+
+      let toastTimeout;
+
+      function setOpen(open) {
+        menu.classList.toggle('codex-ai-menu--open', open);
+        toggle.setAttribute('aria-expanded', String(open));
+        panel.setAttribute('aria-hidden', String(!open));
+      }
+
+      function showToast(message) {
+        toast.textContent = message;
+        toast.classList.add('codex-ai-menu__toast--visible');
+        clearTimeout(toastTimeout);
+        toastTimeout = setTimeout(() => {
+          toast.classList.remove('codex-ai-menu__toast--visible');
+        }, 2200);
+      }
+
+      // Toggle panel
+      toggle.addEventListener('click', function (e) {
+        e.stopPropagation();
+        const isOpen = menu.classList.contains('codex-ai-menu--open');
+        setOpen(!isOpen);
+      });
+
+      // Close on outside click
+      document.addEventListener('click', function (e) {
+        if (!menu.contains(e.target) && menu.classList.contains('codex-ai-menu--open')) {
+          setOpen(false);
+        }
+      });
+
+      // Close on ESC
+      document.addEventListener('keydown', function (e) {
+        if (e.key === 'Escape' && menu.classList.contains('codex-ai-menu--open')) {
+          setOpen(false);
+          toggle.focus();
+        }
+      });
+
+      // Copy-page handler
+      if (copyButton) {
+        copyButton.addEventListener('click', async function () {
+          try {
+            const url = window.location.pathname;
+            const mdUrl = url.endsWith('/') ? url.slice(0, -1) + '.md' : url + '.md';
+            const response = await fetch(mdUrl);
+            if (!response.ok) throw new Error('Failed to fetch markdown');
+            const text = await response.text();
+            await navigator.clipboard.writeText(text);
+            showToast('Page copied as Markdown');
+          } catch (err) {
+            showToast('Failed to copy - see console');
+            console.error('AIMenu: copy-page failed', err);
+          }
+          setOpen(false);
+        });
+      }
+    }
+
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', init);
+    } else {
+      init();
+    }
+  })();
+</script>
+
+<style>
+  .codex-ai-menu {
+    position: relative;
+    display: inline-block;
+    font-family: var(--codex-font-sans);
+  }
+
+  /* --- Toggle button --- */
+  /* Redesigned for visibility - the previous version had a faint border
+     that read as "dead". This version uses an accent-tinted border by
+     default, fills with accent-soft on hover, and inverts to accent on
+     panel-open. Pill-shaped to set it apart from in-content buttons. */
+  .codex-ai-menu__toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    background: transparent;
+    border: 1px solid var(--codex-accent-border);
+    color: var(--codex-text);
+    padding: 6px 12px 6px 11px;
+    border-radius: 999px;
+    font-family: var(--codex-font-mono);
+    font-size: 12.5px;
+    font-weight: 500;
+    letter-spacing: 0.01em;
+    cursor: pointer;
+    transition: background 0.15s ease, border-color 0.15s ease,
+                color 0.15s ease, transform 0.1s ease;
+  }
+
+  .codex-ai-menu__toggle:hover {
+    background: var(--codex-accent-soft);
+    border-color: var(--codex-accent);
+    color: var(--codex-accent);
+  }
+
+  .codex-ai-menu__toggle:active {
+    transform: scale(0.97);
+  }
+
+  .codex-ai-menu__toggle:focus-visible {
+    outline: 2px solid var(--codex-accent);
+    outline-offset: 2px;
+  }
+
+  /* Open state - inverted, accent fill, light text. Indicates the panel
+     is showing without needing to look down for the panel itself. */
+  .codex-ai-menu--open .codex-ai-menu__toggle {
+    background: var(--codex-accent);
+    border-color: var(--codex-accent);
+    color: var(--codex-bg);
+  }
+
+  .codex-ai-menu--open .codex-ai-menu__toggle:hover {
+    background: var(--codex-accent);
+    color: var(--codex-bg);
+  }
+
+  .codex-ai-menu__chevron {
+    opacity: 0.7;
+    transition: transform 0.15s ease;
+  }
+
+  .codex-ai-menu--open .codex-ai-menu__chevron {
+    transform: rotate(180deg);
+    opacity: 1;
+  }
+
+  /* --- Panel --- */
+  .codex-ai-menu__panel {
+    position: absolute;
+    top: calc(100% + 6px);
+    right: 0;
+    width: 320px;
+    background: var(--codex-bg-elevated);
+    border: 1px solid var(--codex-border);
+    border-radius: var(--codex-radius-md);
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
+    padding: 4px;
+    opacity: 0;
+    transform: translateY(-4px);
+    pointer-events: none;
+    transition: opacity 0.15s ease, transform 0.15s ease;
+    z-index: 100;
+  }
+
+  .codex-ai-menu--open .codex-ai-menu__panel {
+    opacity: 1;
+    transform: translateY(0);
+    pointer-events: auto;
+  }
+
+  /* --- Menu items --- */
+  .codex-ai-menu__item {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    width: 100%;
+    padding: 10px 12px;
+    background: none;
+    border: none;
+    border-radius: var(--codex-radius-sm);
+    text-decoration: none;
+    color: var(--codex-text);
+    font-family: var(--codex-font-sans);
+    text-align: left;
+    cursor: pointer;
+    transition: background 0.1s ease;
+  }
+
+  .codex-ai-menu__item:hover {
+    background: var(--codex-surface);
+  }
+
+  .codex-ai-menu__item:focus-visible {
+    outline: 2px solid var(--codex-accent);
+    outline-offset: -2px;
+  }
+
+  .codex-ai-menu__icon {
+    flex-shrink: 0;
+    color: var(--codex-text-muted);
+    margin-top: 2px;
+  }
+
+  .codex-ai-menu__item:hover .codex-ai-menu__icon {
+    color: var(--codex-accent);
+  }
+
+  .codex-ai-menu__text {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+
+  .codex-ai-menu__title {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--codex-text);
+    line-height: 1.3;
+  }
+
+  .codex-ai-menu__external {
+    color: var(--codex-text-dim);
+    margin-top: 1px;
+  }
+
+  .codex-ai-menu__desc {
+    font-size: 11.5px;
+    color: var(--codex-text-muted);
+    line-height: 1.35;
+  }
+
+  /* --- Toast feedback --- */
+  .codex-ai-menu__toast {
+    position: fixed;
+    bottom: 5rem;
+    right: 1.5rem;
+    background: var(--codex-bg-elevated);
+    border: 1px solid var(--codex-accent-border);
+    color: var(--codex-accent);
+    padding: 8px 14px;
+    border-radius: var(--codex-radius-sm);
+    font-family: var(--codex-font-mono);
+    font-size: 12px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+    opacity: 0;
+    transform: translateY(8px);
+    pointer-events: none;
+    transition: opacity 0.2s ease, transform 0.2s ease;
+    z-index: 10000;
+  }
+
+  .codex-ai-menu__toast--visible {
+    opacity: 1;
+    transform: translateY(0);
+  }
+
+  /* --- Mobile --- */
+  @media (max-width: 640px) {
+    .codex-ai-menu__panel {
+      width: calc(100vw - 2rem);
+      max-width: 320px;
+      right: -8px;
+    }
+
+    .codex-ai-menu__toast {
+      bottom: 5rem;
+      right: 1rem;
+      left: 1rem;
+      text-align: center;
+    }
+  }
+
+  /* --- Reduced motion --- */
+  @media (prefers-reduced-motion: reduce) {
+    .codex-ai-menu__panel,
+    .codex-ai-menu__toggle,
+    .codex-ai-menu__chevron,
+    .codex-ai-menu__toast {
+      transition: none;
+    }
+  }
+</style>

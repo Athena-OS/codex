@@ -1,0 +1,89 @@
+---
+title: SQL Injection
+description: Identifying and exploiting SQL injection across major database engines.
+mitre: [T1190]
+d3fend: [D3-MH, D3-MA, D3-NTA]
+impact: [DataExfil, AuthBypass, RCE]
+owasp: [A05]
+noise: moderate
+sidebar:
+  order: 1
+  label: Overview
+---
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+SQL injection occurs when user input is concatenated into a SQL query without proper parameterisation, allowing the attacker to alter the query's structure. Impact ranges from authentication bypass to full database extraction, file read/write on the database host, and remote code execution.
+
+This section is operational reference. Use the page that matches your situation:
+
+| You are... | Go to |
+|---|---|
+| Looking for the first injection in an unknown app | [Detection](./detection/) |
+| Trying to log in without credentials | [Authentication bypass](./auth-bypass/) |
+| Seeing query output reflected in the response | [UNION-based](./union-based/) |
+| Confirmed injection, need to dump the database | [Enumeration](./enumeration/) |
+| Output not visible, but page behaviour changes | [Boolean-based blind](./blind-boolean/) |
+| Output not visible, no behavioural difference | [Time-based blind](./blind-time/) |
+| No response feedback at all | [Out-of-band](./out-of-band/) |
+| User input appears in a query, but only after later use | [Second-order](./second-order/) |
+| Injecting against MongoDB / NoSQL | [NoSQL injection](./nosql/) |
+| Need to read or write files via the DB | [File operations](./file-operations/) |
+| Payload is being filtered or blocked | [Filter bypasses](./bypasses/) |
+| Need syntax for a specific DBMS | [DBMS cheatsheet](./dbms-cheatsheet/) |
+
+## Standard methodology
+
+<Steps>
+
+1. **Identify** every parameter that may influence a query - URL parameters, form fields, headers (`User-Agent`, `Cookie`, `X-Forwarded-For`), JSON body fields.
+2. **Detect** by injecting a syntax-breaking character (`'`, `"`, `)`, `--`) and observing for errors, behavioural change, or timing change.
+3. **Fingerprint** the DBMS using version-specific payloads (see [DBMS cheatsheet](./dbms-cheatsheet/)).
+4. **Determine the injection class** - in-band (UNION/error), inferential (boolean/time blind), or out-of-band.
+5. **Enumerate** schema → tables → columns → data.
+6. **Escalate** where possible: file read/write, command execution, lateral movement.
+
+</Steps>
+
+## Conventions used in this section
+
+Placeholders follow the same scheme everywhere:
+
+- `<TARGET>` - target host or URL
+- `<PARAM>` - vulnerable parameter name
+- `<TABLE>`, `<COL>`, `<DB>` - table, column, database name
+- `<USER>` - target username (e.g. `administrator`)
+- `<N>` - column count
+- `<ATTACKER>` - your listener / collaborator host
+
+When a page shows a payload, assume it is what gets injected into `<PARAM>` - URL-encoding, prefix, and suffix depend on context.
+
+## When to reach for `sqlmap`
+
+Manual exploitation is faster for simple cases and essential for understanding what's happening. `sqlmap` is the right tool when:
+
+- You need to enumerate a large schema quickly.
+- You're chasing blind SQLi with hundreds of characters to extract.
+- The target needs unusual handling (cookies, custom headers, JSON, multipart).
+
+Minimal invocation:
+
+```bash
+sqlmap -u "https://<TARGET>/path?<PARAM>=test" --batch --dbs
+```
+
+For complex requests, save the request from Burp to a file and use `-r request.txt`. See [DBMS cheatsheet](./dbms-cheatsheet/) for `--dbms`, `--technique`, and other flags worth knowing.
+
+<Aside type="caution">
+SQL injection on a system you don't own or have written authorisation to test is illegal in most jurisdictions. The techniques in this section are for authorised security testing, CTFs, and lab environments only.
+</Aside>
+
+## Next move
+
+- **Suspect SQLi on a login form** → [Auth bypass](/codex/web/sqli/auth-bypass/) (one-payload check before deep enumeration)
+- **Confirmed injection, results reflected in response** → [UNION-based extraction](/codex/web/sqli/union-based/) for fast data dump
+- **Confirmed injection, no reflected output** → [Boolean blind](/codex/web/sqli/blind-boolean/) (fast) or [Time-based blind](/codex/web/sqli/blind-time/) (slow but works through WAFs that strip booleans)
+- **DBMS is unknown** → use [detection probes](/codex/web/sqli/detection/) to fingerprint MySQL / PostgreSQL / MSSQL / Oracle before picking a payload syntax
+- **Stored XSS-style injection that fires later (admin panel)** → [Second-order](/codex/web/sqli/second-order/)
+- **Got admin via injection, want files / shell** → [File operations](/codex/web/sqli/file-operations/) for `LOAD_FILE` / `INTO OUTFILE`; on MSSQL pivot to [xp_cmdshell](/codex/network/services/mssql/)
+- **WAF blocking obvious payloads** → [Bypasses](/codex/web/sqli/bypasses/) (encoding, comments, case, whitespace variations)
+- **Need to automate after manual confirmation** → [sqlmap](/codex/web/sqli/sqlmap/) with `--dbms`, `--technique`, and `-r request.txt`

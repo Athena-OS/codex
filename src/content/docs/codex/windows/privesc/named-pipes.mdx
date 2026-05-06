@@ -1,0 +1,324 @@
+---
+title: Named Pipes
+description: Enumerating Windows named pipes - the IPC channels that processes use to communicate - and identifying writable pipes that lead to privilege escalation. The methodology covers pipe enumeration with PipeList and PowerShell, DACL inspection with accesschk, and the writable-pipe attack pattern that exploits services accepting connections from `Everyone` or `Authenticated Users` and trusting client-supplied data.
+mitre: [T1559.001, T1068]
+d3fend: [D3-SYSM]
+impact: [PrivEsc, SystemCompromise]
+owasp: []
+sidebar:
+  order: 4
+  label: Named pipes
+---
+
+## TL;DR
+
+Named pipes are Windows IPC endpoints. A privileged service exposing a pipe with permissive DACLs (`Everyone` or `Authenticated Users` granted write) and trusting the client side becomes a privilege escalation vector. Enumerate pipes, check their DACLs, identify writable ones owned by privileged processes, and exploit the trust the service places in its clients.
+
+```
+# Enumerate active pipes
+pipelist.exe /accepteula                   # Sysinternals
+gci \\.\pipe\                              # PowerShell equivalent
+
+# Check DACL on specific pipe
+accesschk.exe -accepteula -w \\.\Pipe\NAME -v
+
+# Find all writable pipes (operator-priority filter)
+accesschk.exe -accepteula -w \pipe\ -v | findstr /B "RW"
+
+# Inspect what owns the pipe
+Get-Process -Id <PID>                      # cross-reference pipe owner
+```
+
+Success indicator: a pipe is `RW` accessible to `Everyone` or `Authenticated Users`, owned by a SYSTEM-level process, and the service speaks a protocol that accepts attacker-controlled input.
+
+## Why named pipes matter
+
+Named pipes are how Windows processes talk to each other on the same machine (and across machines, though that's less common). Every named pipe has:
+
+- **A name** - `\\.\pipe\<name>` accessed via the special `\\.\` device path. Examples: `\\.\pipe\lsass`, `\\.\pipe\WindscribeService`.
+- **A server side** - The process that created the pipe and reads/writes from it.
+- **Zero or more client connections** - Each connection creates a new pipe instance sharing the name but with independent data buffers.
+- **A DACL** - Specifies which security principals can read, write, or modify the pipe.
+
+The privilege escalation angle: a pipe is a *programmable communication channel* between a high-privileged process and whatever clients its DACL permits. If a SYSTEM-level service creates a pipe writable by `Everyone`, every standard user can send messages to that service. If the service trusts the messages and acts on them with its SYSTEM token, attackers control SYSTEM behavior.
+
+This is fundamentally a **service-design vulnerability**, not a Windows vulnerability. The OS provides the IPC mechanism correctly; the service vendor chose the wrong DACL.
+
+## Enumerating pipes
+
+### PipeList (Sysinternals)
+
+```cmd
+C:\> pipelist.exe /accepteula
+
+PipeList v1.02 - Lists open named pipes
+Copyright (C) 2005-2016 Mark Russinovich
+Sysinternals - www.sysinternals.com
+
+Pipe Name                                    Instances       Max Instances
+---------                                    ---------       -------------
+InitShutdown                                      3               -1
+lsass                                             4               -1
+ntsvcs                                            3               -1
+scerpc                                            3               -1
+Winsock2\CatalogChangeListener-340-0              1                1
+epmapper                                          3               -1
+LSM_API_service                                   3               -1
+atsvc                                             3               -1
+eventlog                                          3               -1
+spoolss                                           3               -1
+wkssvc                                            4               -1
+trkwks                                            3               -1
+vmware-usbarbpipe                                 5               -1
+srvsvc                                            4               -1
+ROUTER                                            3               -1
+vmware-authdpipe                                  1                1
+```
+
+Output columns: pipe name, number of currently-connected client instances, and maximum allowed instances (`-1` means unlimited).
+
+The first dozen entries are Windows built-ins (`lsass`, `eventlog`, `spoolss`, `srvsvc`, etc.) - these have correct DACLs by design; don't waste time on them. The interesting entries are everything else - `vmware-usbarbpipe`, `vmware-authdpipe`, `WindscribeService`, and any other third-party pipes.
+
+### PowerShell
+
+Without Sysinternals, the same listing is available through PowerShell:
+
+```powershell
+PS> gci \\.\pipe\
+
+    Directory: \\.\pipe
+
+Mode                LastWriteTime         Length Name
+----                -------------         ------ ----
+------       12/31/1600   4:00 PM              3 InitShutdown
+------       12/31/1600   4:00 PM              4 lsass
+------       12/31/1600   4:00 PM              3 ntsvcs
+------       12/31/1600   4:00 PM              3 scerpc
+```
+
+The `Length` column shows the number of instances. The `LastWriteTime` is a Windows artifact (always 1600/12/31 - pipes don't track this meaningfully).
+
+For just the names without the noise:
+
+```powershell
+PS> [System.IO.Directory]::GetFiles("\\.\pipe\") | ForEach-Object { Split-Path $_ -Leaf }
+```
+
+### Identifying third-party pipes
+
+Filter for non-standard entries - anything not in the standard Windows set:
+
+```powershell
+PS> $standard = @('InitShutdown','lsass','ntsvcs','scerpc','epmapper','LSM_API_service','atsvc','eventlog','spoolss','wkssvc','trkwks','srvsvc','ROUTER','PIPE_EVENTROOT\CIMV2SCM EVENT PROVIDER','Winsock2','MsFteWds','SQLLocal')
+PS> [System.IO.Directory]::GetFiles("\\.\pipe\") | ForEach-Object {
+    $name = Split-Path $_ -Leaf
+    if ($standard -notcontains $name -and $name -notmatch '^Winsock2|^MsFte|^SQLLocal') {
+        $name
+    }
+}
+```
+
+This produces a smaller list of pipes worth investigating. The standard-pipe filter list isn't exhaustive - environments have different baselines - but the principle is to focus enumeration on non-Microsoft pipes first.
+
+## Reviewing DACLs
+
+A pipe's DACL determines who can read from it, write to it, and modify its security descriptor. The DACL is what makes a pipe an escalation vector or not.
+
+### accesschk on a specific pipe
+
+```cmd
+C:\> accesschk.exe /accepteula \\.\Pipe\lsass -v
+
+Accesschk v6.12 - Reports effective permissions for securable objects
+Copyright (C) 2006-2017 Mark Russinovich
+Sysinternals - www.sysinternals.com
+
+\\.\Pipe\lsass
+  Untrusted Mandatory Level [No-Write-Up]
+  RW Everyone
+        FILE_READ_ATTRIBUTES
+        FILE_READ_DATA
+        FILE_READ_EA
+        FILE_WRITE_ATTRIBUTES
+        FILE_WRITE_DATA
+        FILE_WRITE_EA
+        SYNCHRONIZE
+        READ_CONTROL
+  RW NT AUTHORITY\ANONYMOUS LOGON
+        FILE_READ_ATTRIBUTES
+        FILE_READ_DATA
+        ...
+  RW BUILTIN\Administrators
+        FILE_ALL_ACCESS
+```
+
+Output format:
+
+- **Pipe path** at top
+- **Mandatory integrity level** - `Untrusted Mandatory Level [No-Write-Up]` means even unauthenticated callers can connect, but they can't escalate their integrity through the pipe
+- **Each ACE** prefixed with `RW` (read+write), `R` (read-only), or `W` (write-only), followed by the principal and granted permissions
+
+For `lsass`, `Everyone` has `RW` but only with specific limited permissions - this is normal for the LSA RPC interface. The check is whether the *useful* permissions for sending commands (typically `FILE_WRITE_DATA` and `FILE_WRITE_EA`) are granted to non-privileged groups.
+
+### Bulk DACL review - find all writable pipes
+
+The operationally useful command - find every pipe writable by the current user:
+
+```cmd
+C:\> accesschk.exe -accepteula -w \pipe\ -v
+```
+
+Flags:
+
+- `-accepteula` - Skip the EULA prompt
+- `-w` - Show only objects the current user has *write* access to
+- `\pipe\` - Target all named pipes (note: leading backslash, not `\\.\pipe\`)
+- `-v` - Verbose, show specific permissions
+
+Output is large; filter for `RW` lines with non-Administrator principals:
+
+```cmd
+C:\> accesschk.exe -accepteula -w \pipe\ -v | findstr /B "RW" | findstr /V "Administrators SYSTEM TrustedInstaller"
+```
+
+This narrows to pipes writable by less-privileged principals. Each match needs investigation: what process owns the pipe, what protocol does it speak, what does it accept from clients.
+
+### Identifying pipe ownership
+
+A pipe's name doesn't always reveal who owns it. Cross-reference using Process Monitor or by inspecting handles:
+
+```cmd
+C:\> handle.exe -accepteula -a \pipe\WindscribeService
+
+Handle v5.0 - Handle viewer
+Copyright (C) 1997-2022 Mark Russinovich
+Sysinternals - www.sysinternals.com
+
+WindscribeService.exe pid: 2156 type: File         224: \Device\NamedPipe\WindscribeService
+```
+
+`handle.exe` (Sysinternals) shows that the pipe is owned by `WindscribeService.exe` (PID 2156). Then check what context that process runs as:
+
+```powershell
+PS> Get-Process -Id 2156 -IncludeUserName
+
+Handles  WS(K)   CPU(s)     Id UserName             ProcessName
+-------  -----   ------     -- --------             -----------
+    245   8456     1.23   2156 NT AUTHORITY\SYSTEM  WindscribeService
+```
+
+`NT AUTHORITY\SYSTEM` confirms this is a SYSTEM-level process - a writable pipe to it is the escalation vector.
+
+`Get-Process -IncludeUserName` requires elevation on most systems. From an unprivileged context, use `tasklist /v` instead:
+
+```cmd
+C:\> tasklist /fi "PID eq 2156" /v
+```
+
+The `User Name` column will appear in the output.
+
+## The writable-pipe attack pattern
+
+Once a pipe is identified as writable by a non-privileged principal and owned by a privileged process, the actual exploitation depends on what the service's protocol does. The pattern:
+
+1. **Identify the service** - vendor product, version, name of the binary. Critical for finding documented CVEs and protocol details.
+2. **Understand the protocol** - reverse-engineer or find published documentation of what messages the service accepts. This is the heavy lifting.
+3. **Find an actionable command** - does the protocol allow file writes, command execution, arbitrary registry changes, service install? If so, identify the format.
+4. **Send the message** - write the crafted message to the pipe via standard file I/O (named pipes are accessed like files).
+5. **The service acts on the message with its SYSTEM token** - and now your attacker-supplied data has run with SYSTEM privileges.
+
+### The Windscribe pattern (CVE-2018-11479)
+
+The canonical published example is the [Windscribe VPN](https://www.exploit-db.com/exploits/48021) named pipe vulnerability. Walking through it as a methodology illustration:
+
+**1. Enumerate pipes, find Windscribe in the list:**
+
+```cmd
+C:\> pipelist.exe /accepteula | findstr -i windscribe
+WindscribeService                                 1               -1
+```
+
+**2. Check the DACL:**
+
+```cmd
+C:\> accesschk.exe -accepteula -w \pipe\WindscribeService -v
+
+\\.\Pipe\WindscribeService
+  Medium Mandatory Level (Default) [No-Write-Up]
+  RW Everyone
+        FILE_ALL_ACCESS
+```
+
+`Everyone` has `FILE_ALL_ACCESS` - full read/write/modify. This is the indicator.
+
+**3. Identify ownership:**
+
+Handle.exe or Process Explorer shows `WindscribeService.exe` (PID varies) running as `NT AUTHORITY\SYSTEM`.
+
+**4. Understand the protocol:**
+
+The Windscribe service speaks a JSON-formatted protocol over the pipe to its UI client. One supported command is "execute helper" which lets the client run a program with arbitrary arguments. The service trusts the client because - by intent - the pipe is between the GUI and the service. But the DACL allows *anyone* to be that client.
+
+**5. Send a crafted message:**
+
+The PoC sends a JSON request asking the service to execute `cmd.exe` (or any binary) with attacker-chosen arguments. The service executes the command as SYSTEM. Net effect: arbitrary command execution as SYSTEM from a standard user context.
+
+The published PoC is in C# at the Exploit-DB link; running it on a vulnerable Windscribe install yields SYSTEM. The patch (in Windscribe 1.83+) fixes the DACL.
+
+### What to look for in any pipe-based service
+
+The Windscribe pattern generalizes. When you find a writable pipe owned by a privileged process:
+
+- **Is there a public CVE or write-up?** Search the service name + "named pipe" + "privilege escalation".
+- **What does the GUI client do?** If the product has a UI, the UI talks to the service over the pipe. Reverse engineering the UI's pipe usage reveals the protocol.
+- **What's the message format?** JSON, length-prefixed binary, line-oriented text, .NET BinaryFormatter, MSRPC, custom? Each has different attack patterns.
+- **What commands does the service support?** Look for command names containing `Execute`, `Run`, `Launch`, `Install`, `Update`, `Service`, `Process`, `Spawn`, `File`, `Write`, `Copy`.
+- **Are arguments sanitized?** Often: not really. Path-confusion attacks, argument injection, and "we trusted the GUI" assumptions are common.
+
+### Reverse-engineering the protocol
+
+When no CVE exists and you need to figure out the protocol yourself:
+
+- **Procmon + the GUI client** - Run the GUI, watch its pipe operations. Process Monitor's `Operation: WriteFile` events on the pipe show every message sent.
+- **Wireshark on `\Device\NPF_NamedPipe`** - Some Wireshark installations have a named-pipe capture plugin.
+- **Inject into the GUI process** - Hook `WriteFile` and `ReadFile` calls; log all data going through.
+- **Static analysis** - Decompile the service binary with [Ghidra](https://ghidra-sre.org/) or [IDA](https://hex-rays.com/ida-pro/), find the function reading from the pipe, trace what it does with the data.
+- **Strings on the binary** - Often command names appear as plaintext strings, giving hints about the protocol vocabulary.
+
+## Detection by defenders
+
+| Detection | What it sees |
+| --- | --- |
+| Sysmon event 17/18 (Pipe Created/Connected) | All pipe creates and connects, with PID and image |
+| Process Monitor filter on `Process Name: yourtool.exe` | Direct view of what your tool is doing |
+| EDR pipe heuristics (CrowdStrike, SentinelOne) | Known-bad pipe names; unusual cross-PID pipe traffic |
+| WMI permanent event subscriptions watching `Win32_NamedPipeFile` | Custom defender setup |
+
+For evasive operations, pipe-based exploitation is moderately noisy - Sysmon catches the pipe connect, and EDR may flag the data flowing across. For non-evasive engagements, the noise level is acceptable for the payoff.
+
+## Defender perspective - preventing this
+
+For completeness, the defender side of named-pipe abuse:
+
+- **Pipe DACLs should be principle-of-least-privilege** - the GUI client should authenticate to the service over the pipe (not just connect via DACL trust)
+- **Services should not trust pipe clients** - every message should be validated, authenticated, and parameter-checked
+- **Avoid impersonation traps** - `SeImpersonatePrivilege` interacts with pipe authentication; see [SeImpersonate](/codex/windows/privesc/seimpersonate/) for the related token-theft pattern
+
+## Quick reference
+
+| Task | Pattern |
+| --- | --- |
+| List all pipes (Sysinternals) | `pipelist.exe /accepteula` |
+| List all pipes (PowerShell) | `gci \\.\pipe\` |
+| Pipe names only | `[System.IO.Directory]::GetFiles("\\.\pipe\") \| ForEach-Object { Split-Path $_ -Leaf }` |
+| DACL of specific pipe | `accesschk.exe -accepteula -w \\.\Pipe\NAME -v` |
+| All writable pipes | `accesschk.exe -accepteula -w \pipe\ -v` |
+| Writable pipes (filtered) | `accesschk.exe -accepteula -w \pipe\ -v \| findstr /B "RW"` |
+| Find pipe owner | `handle.exe -accepteula -a \pipe\NAME` |
+| Process user context | `Get-Process -Id PID -IncludeUserName` or `tasklist /v /fi "PID eq PID"` |
+| Standard pipes to ignore | `lsass, ntsvcs, scerpc, epmapper, eventlog, spoolss, wkssvc, srvsvc, atsvc, etc.` |
+| Indicators of vulnerability | `RW Everyone` or `RW Authenticated Users` on a pipe owned by SYSTEM-context service |
+| Protocol RE tools | Procmon, Wireshark NPF, Ghidra, IDA Pro |
+| Canonical CVE example | CVE-2018-11479 (Windscribe), CVE-2020-7280 (McAfee), CVE-2020-26878 (Ansible) |
+
+For the token-impersonation angle that's adjacent to pipes (Potato-family attacks abuse named pipes plus `SeImpersonatePrivilege`), see [SeImpersonate](/codex/windows/privesc/seimpersonate/). For service-binary abuse where pipes aren't involved but the service is, see the OS attacks round (weak service ACLs).

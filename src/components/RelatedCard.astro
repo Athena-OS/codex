@@ -1,0 +1,143 @@
+---
+// src/components/RelatedCard.astro
+//
+// Single "Related" card shown at the bottom of pages, linking to an adjacent
+// Codex technique. Use inside a <RelatedGrid /> for proper layout.
+//
+// Usage:
+//   <RelatedCard href="/codex/web/ssrf/filter-bypass/" title="Filter bypass">
+//     When SSRF probes are blocked by the application
+//   </RelatedCard>
+
+interface Props {
+  /** Path or full URL to the related page */
+  href: string;
+  /** Card title (typically the related technique name) */
+  title: string;
+  /**
+   * Optional kicker label shown above the title in mono uppercase.
+   * If not provided, derived from the URL path (last meaningful segment).
+   */
+  kicker?: string;
+}
+
+const { href, title, kicker } = Astro.props;
+
+// If no kicker provided, derive one from the URL - e.g.
+//   /codex/web/ssrf/filter-bypass/   → SSRF / FILTER-BYPASS
+//   /codex/web/command-injection/    → COMMAND-INJECTION
+function deriveKicker(url: string): string {
+  const parts = url.split('/').filter((p) => p && p !== 'codex' && p !== 'web');
+  if (parts.length === 0) return '';
+  return parts.slice(-2).join(' / ').toUpperCase();
+}
+
+const displayKicker = kicker ?? deriveKicker(href);
+---
+
+<a href={href} class="codex-related-card">
+  <span class="codex-related-card__kicker">{displayKicker}</span>
+  <span class="codex-related-card__title">{title}</span>
+  <span class="codex-related-card__description">
+    <slot />
+  </span>
+  <svg
+    class="codex-related-card__arrow"
+    width="14"
+    height="14"
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="2"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    aria-hidden="true"
+  >
+    <line x1="5" y1="12" x2="19" y2="12"></line>
+    <polyline points="12 5 19 12 12 19"></polyline>
+  </svg>
+</a>
+
+<style>
+  .codex-related-card {
+    display: block;
+    background: var(--codex-surface);
+    border: 1px solid var(--codex-border);
+    padding: 14px 16px;
+    border-radius: var(--codex-radius-md);
+    text-decoration: none;
+    color: var(--codex-text);
+    transition: border-color 0.15s ease, transform 0.15s ease, background 0.15s ease;
+    position: relative;
+    overflow: hidden;
+  }
+
+  .codex-related-card:hover {
+    border-color: var(--codex-accent-border);
+    background: var(--codex-surface-hover);
+    transform: translateY(-1px);
+  }
+
+  .codex-related-card:focus-visible {
+    outline: 2px solid var(--codex-accent);
+    outline-offset: 2px;
+  }
+
+  /* Subtle accent bar that grows on hover */
+  .codex-related-card::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: 2px;
+    background: var(--codex-accent);
+    opacity: 0;
+    transition: opacity 0.15s ease;
+  }
+
+  .codex-related-card:hover::before {
+    opacity: 1;
+  }
+
+  .codex-related-card__kicker {
+    display: block;
+    color: var(--codex-accent);
+    font-size: 10px;
+    font-family: var(--codex-font-mono);
+    font-weight: 500;
+    letter-spacing: 0.08em;
+    margin-bottom: 6px;
+  }
+
+  .codex-related-card__title {
+    display: block;
+    font-family: var(--codex-font-mono);
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--codex-text);
+    margin-bottom: 4px;
+  }
+
+  .codex-related-card__description {
+    display: block;
+    color: var(--codex-text-muted);
+    font-size: 12.5px;
+    line-height: 1.45;
+  }
+
+  .codex-related-card__arrow {
+    position: absolute;
+    top: 14px;
+    right: 16px;
+    color: var(--codex-text-dim);
+    opacity: 0;
+    transition: opacity 0.15s ease, transform 0.15s ease;
+  }
+
+  .codex-related-card:hover .codex-related-card__arrow {
+    opacity: 1;
+    color: var(--codex-accent);
+    transform: translateX(2px);
+  }
+</style>

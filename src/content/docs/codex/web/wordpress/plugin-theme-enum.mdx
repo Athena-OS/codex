@@ -1,0 +1,312 @@
+---
+title: Plugin & Theme Enumeration
+description: Discovering installed plugins and themes through passive HTML scraping, active path probing with response-code differentials, README inspection for versions, and finding deactivated-but-still-vulnerable extensions left on disk.
+mitre: [T1083, T1190, T1505]
+d3fend: [D3-IDA]
+impact: [InternalAccess]
+sidebar:
+  order: 4
+  label: Plugin & Theme Enumeration
+---
+
+## TL;DR
+
+Plugins and themes are where most WordPress findings live. Two enumeration modes:
+
+```
+# 1. Passive - read what's loaded on the page
+curl -s http://target/ \
+  | grep -oE 'wp-content/(plugins|themes)/[^/]+' \
+  | sort -u
+
+# 2. Active - probe a known path with response code as oracle
+curl -sI http://target/wp-content/plugins/<plugin>/ \
+  | head -1
+# 200/301 = installed; 403 = installed (Apache forbids listing); 404 = absent
+
+# 3. Version from the plugin's own readme.txt
+curl -s http://target/wp-content/plugins/<plugin>/readme.txt \
+  | grep -iE 'stable tag|^version'
+```
+
+Success indicator: a list of `<plugin>:<version>` and `<theme>:<version>` pairs covering both currently-loaded extensions and deactivated-but-still-on-disk ones. Each pair is a candidate for the [vulnerable plugins page](/codex/web/wordpress/vulnerable-plugins/).
+
+## Two enumeration modes
+
+**Passive** catches everything currently active (i.e., loading CSS/JS or registered with WordPress to enqueue assets). It's stealthy - you just download the homepage and read the source - but it misses deactivated plugins and themes whose files remain on disk.
+
+**Active** confirms a plugin or theme exists on disk regardless of activation state. It's noisier - every probe is a request to a specific path - but it catches the deactivated-but-vulnerable case, which is a recurring real-world finding.
+
+Use both. Passive first to enumerate the obvious set; active to expand coverage and to find the long tail.
+
+## Passive enumeration from page source
+
+When WordPress loads a plugin or theme, it typically enqueues that extension's CSS or JS files, which appear as `<link>` or `<script>` tags in the HTML. Path: `/wp-content/plugins/<plugin>/...` or `/wp-content/themes/<theme>/...`.
+
+```shell
+curl -s http://blog.inlanefreight.com/ \
+  | grep -oE '/wp-content/(plugins|themes)/[^/"]+' \
+  | sort -u
+```
+
+```
+/wp-content/plugins/mail-masta
+/wp-content/plugins/wp-google-places-review-slider
+/wp-content/themes/ben_theme
+```
+
+Three extensions visible without an active probe.
+
+For more depth, look at the full asset URLs - they often include the plugin's own version in the `?ver=` query string (not the WP core version, but the plugin's):
+
+```shell
+curl -s http://blog.inlanefreight.com/ \
+  | grep -oE '/wp-content/(plugins|themes)/[^"]+?ver=[^"\&]+' \
+  | sort -u
+```
+
+```
+/wp-content/plugins/mail-masta/lib/subscriber.js?ver=5.3.3
+/wp-content/plugins/wp-google-places-review-slider/public/css/wprev-public_combine.css?ver=6.1
+/wp-content/themes/ben_theme/style.css?ver=5.3.3
+```
+
+For Mail Masta the `ver` matches the WP core version (`5.3.3`) - meaning the plugin doesn't override the cache-buster, so this isn't the plugin's own version. For `wp-google-places-review-slider`, `ver=6.1` looks like the plugin's actual version (it's not a WP core version that exists).
+
+This distinction matters: when the `?ver=` is the WP core version, you need a different source for the plugin version (the plugin's own `readme.txt`, covered below).
+
+### Source-line patterns
+
+Plugin and theme files leave fingerprints other than asset URLs:
+
+```shell
+# Plugin-registered shortcodes - sometimes printed in page output
+curl -s http://target/ | grep -oE '\[[a-z_-]+ [^]]*\]' | sort -u
+
+# Theme-specific class names - often "<theme>-..." in the body
+curl -s http://target/ | grep -oE 'class="[^"]*ben[^"]*"' | sort -u
+
+# Inline JS variables initialized by plugins
+curl -s http://target/ | grep -oE 'var [a-zA-Z_]+ = {' | sort -u
+```
+
+These signals catch plugins that don't enqueue obvious assets (e.g., a security plugin running silently). They're less reliable than asset paths but cheap.
+
+## Active enumeration via path probing
+
+When a plugin exists on disk, requesting its directory or a known file inside it returns a non-404 response - even if the plugin is deactivated.
+
+```shell
+curl -sI http://blog.inlanefreight.com/wp-content/plugins/mail-masta/ | head -1
+```
+
+Three meaningful response patterns:
+
+| Response | Meaning |
+| --- | --- |
+| **`HTTP/1.1 200 OK`** | Plugin exists; directory listing is enabled (or there's an `index.html`/`index.php` serving content) |
+| **`HTTP/1.1 301 Moved Permanently`** | Plugin exists; you forgot the trailing slash, server redirected to add one |
+| **`HTTP/1.1 403 Forbidden`** | Plugin exists; directory listing is disabled (Apache's `Options -Indexes` or per-directory `.htaccess`) |
+| **`HTTP/1.1 404 Not Found`** | Plugin not installed |
+
+Any non-404 is a confirmation. Some installs serve a blank `index.php` placeholder (WordPress includes one in `wp-content/plugins/` to thwart casual directory listing), which returns 200 but with no content - same conclusion: the *parent* directory exists, plugin's there.
+
+Compare:
+
+```shell
+# Installed plugin
+$ curl -sI http://target/wp-content/plugins/mail-masta/ | head -1
+HTTP/1.1 301 Moved Permanently
+
+# Non-existent plugin
+$ curl -sI http://target/wp-content/plugins/doesnotexist/ | head -1
+HTTP/1.1 404 Not Found
+```
+
+The response-code differential is the oracle. Build a wordlist of common plugin names and brute-force:
+
+```shell
+while read plugin; do
+  code=$(curl -s -o /dev/null -w "%{http_code}" \
+              "http://target/wp-content/plugins/$plugin/")
+  case $code in
+    200|301|403) echo "  → $plugin (code $code)";;
+  esac
+done < /usr/share/seclists/Discovery/Web-Content/CMS/wordpress-plugins.fuzz.txt
+```
+
+The SecLists `wordpress-plugins.fuzz.txt` and `wp-plugins.fuzz.txt` cover ~20k common plugin names.
+
+Same approach for themes:
+
+```shell
+while read theme; do
+  code=$(curl -s -o /dev/null -w "%{http_code}" \
+              "http://target/wp-content/themes/$theme/")
+  case $code in
+    200|301|403) echo "  → $theme (code $code)";;
+  esac
+done < wordpress-themes.fuzz.txt
+```
+
+## Plugin and theme versions
+
+The most reliable version source is the extension's own `readme.txt`. Every plugin in the WordPress.org plugin repository ships with one:
+
+```shell
+curl -s http://target/wp-content/plugins/mail-masta/readme.txt | head -20
+```
+
+```
+=== Mail Masta ===
+Contributors: ronmason
+Donate link: http://...
+Tags: email, newsletter, mailing-list
+Requires at least: 3.0.1
+Tested up to: 4.5.2
+Stable tag: 1.0
+License: GPLv2 or later
+
+== Description ==
+
+Mail Masta is an essential email subscription plugin for ...
+```
+
+Key fields:
+
+- `Stable tag` - the canonical version (1.0 here)
+- `Requires at least` - minimum WP core
+- `Tested up to` - last WP core the plugin author tested
+
+`Stable tag` is the field to read. If the plugin author bumped `Stable tag` for a security fix but the target still runs an older copy, this gets you the *running* version (because you're reading the file on the target, not from the plugin repo).
+
+For themes, the version lives in `style.css`'s header:
+
+```shell
+curl -s http://target/wp-content/themes/ben_theme/style.css | head -15
+```
+
+```css
+/*
+Theme Name: Ben Theme
+Theme URI:  https://example.com/ben_theme/
+Author:     ...
+Description: ...
+Version:    1.4.2
+License:    GNU General Public License v2 or later
+*/
+```
+
+`Version:` line in the CSS comment is the version.
+
+### When readme.txt is missing
+
+Some plugins don't ship a `readme.txt`. Fallbacks:
+
+- The main plugin PHP file's docblock contains `Version:` - same idea
+- A `package.json` or `composer.json` if the plugin uses build tooling
+- The plugin's directory layout itself - naming conventions like `assets/dist/<hash>/` betray Webpack-based plugins from a specific era
+
+```shell
+# Read the main plugin file's header
+curl -s http://target/wp-content/plugins/mail-masta/mail-masta.php | head -30
+```
+
+The main plugin file is typically named the same as the directory (`mail-masta/mail-masta.php`), or sometimes `<plugin>.php` or `plugin.php`.
+
+## Directory indexing - the bonus oracle
+
+A misconfigured Apache (`Options +Indexes` or absent `.htaccess`) returns full directory listings for any URL without an index file. WordPress includes a blank `index.php` in `wp-content/plugins/` to defeat this at the parent level - but plugin directories often *don't* include their own placeholder.
+
+```shell
+curl -s http://target/wp-content/plugins/mail-masta/ | html2text
+```
+
+```
+****** Index of /wp-content/plugins/mail-masta ******
+[ICO]       Name                 Last_modified    Size Description
+==============================================================
+[PARENTDIR] Parent_Directory                         -
+[DIR]       amazon_api/          2020-05-13 18:01    -
+[DIR]       inc/                 2020-05-13 18:01    -
+[DIR]       lib/                 2020-05-13 18:01    -
+[   ]       plugin-interface.php 2020-05-13 18:01  88K
+[TXT]       readme.txt           2020-05-13 18:01 2.2K
+```
+
+The listing reveals:
+
+- Every subdirectory (inputs for further enumeration - `inc/`, `lib/`, `amazon_api/`)
+- Every file (some of which are entry points you can hit directly - see [vulnerable plugins](/codex/web/wordpress/vulnerable-plugins/))
+- File modification times (suggests when the plugin was installed or last updated)
+
+For the Mail Masta LFI specifically, the path `inc/campaign/count_of_send.php?pl=/etc/passwd` is reached by navigating from the listing into `inc/` → `campaign/` → `count_of_send.php`. The directory index is what made this discoverable on real installs in 2016 when the CVE was disclosed.
+
+## The deactivation gap
+
+A frequent operator finding: a vulnerable plugin shows "Deactivated" in the admin dashboard, but its files remain on disk and remain accessible.
+
+```
+[admin dashboard]
+  Mail Masta - Deactivated
+
+[filesystem]
+  /var/www/html/wp-content/plugins/mail-masta/  ← still here
+
+[from the outside]
+  http://target/wp-content/plugins/mail-masta/inc/campaign/count_of_send.php?pl=...
+  ← still vulnerable, still callable
+```
+
+WordPress's plugin "activation" is purely a database flag (`wp_options.active_plugins`). It controls whether WordPress *loads* the plugin into the request lifecycle. It does not protect against direct HTTP requests to the plugin's PHP files. If a plugin's vulnerable script can be reached directly (which most can - the WordPress URL rewriter passes through requests for `.php` files in `wp-content/`), deactivation does nothing.
+
+This is why active path probing matters even after passive enumeration looks complete. You'll miss deactivated plugins from page source; you won't miss them from a wordlist sweep.
+
+The remediation, from the defender's perspective, is **delete unused plugins**, not just deactivate them. The operator-relevant insight: every plugin directory on disk is in-scope.
+
+## WPScan automation
+
+`wpscan` automates all of the above:
+
+```shell
+# Vulnerable plugins via passive detection
+wpscan --url http://target --enumerate vp
+
+# All plugins (passive + active wordlist brute)
+wpscan --url http://target --enumerate ap
+
+# All themes
+wpscan --url http://target --enumerate at
+
+# Combined: all plugins, all themes, users, config backups, db backups
+wpscan --url http://target --enumerate ap,at,u,cb,dbe
+```
+
+The `vp` mode misses deactivated plugins (since it only checks the homepage and a few well-known paths). The `ap` mode walks a built-in wordlist of ~28k plugins, catching the deactivated case. `ap` takes longer (minutes to an hour) and produces more requests, but is the thorough sweep.
+
+See [WPScan reference](/codex/web/wordpress/wpscan/) for the full option matrix.
+
+## Cross-references for what to do next
+
+| Once you have | Next page |
+| --- | --- |
+| Plugin list with versions | [Vulnerable plugins](/codex/web/wordpress/vulnerable-plugins/) - match versions to known CVEs |
+| Directory listing of a plugin | Browse for entry-point PHP files; many are unauthenticated handlers |
+| `readme.txt` showing very old plugin version | Search [WPScan database](https://wpscan.com/plugins) for that plugin |
+| Multiple plugins listed | Prioritize by attack surface - plugins handling file uploads, AJAX endpoints, and email subscriptions historically have the highest CVE density |
+| Theme name | Theme CVEs are rarer than plugin CVEs, but Theme Editor (post-auth) gives RCE on any theme - see [Admin to RCE](/codex/web/wordpress/admin-to-rce/) |
+
+## Quick reference
+
+| Task | Command |
+| --- | --- |
+| Passive: extract plugin/theme paths from HTML | `curl -s URL \| grep -oE '/wp-content/(plugins\|themes)/[^/"]+' \| sort -u` |
+| Passive: with version query strings | `curl -s URL \| grep -oE '/wp-content/[^"]+?ver=[^"&]+' \| sort -u` |
+| Active: probe a specific plugin | `curl -sI http://target/wp-content/plugins/PLUGIN/ \| head -1` |
+| Active: brute force from wordlist | bash loop above with `wordpress-plugins.fuzz.txt` |
+| Plugin version from readme | `curl -s http://target/wp-content/plugins/PLUGIN/readme.txt \| grep -iE 'stable tag\|^version'` |
+| Theme version from style.css | `curl -s http://target/wp-content/themes/THEME/style.css \| head -15` |
+| Directory listing test | `curl -s http://target/wp-content/plugins/PLUGIN/ \| html2text` |
+| WPScan - vulnerable plugins only | `wpscan --url URL --enumerate vp` |
+| WPScan - all plugins (deep) | `wpscan --url URL --enumerate ap` |
+| WPScan - everything | `wpscan --url URL --enumerate ap,at,u,cb,dbe` |

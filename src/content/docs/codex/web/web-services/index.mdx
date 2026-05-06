@@ -1,0 +1,151 @@
+---
+title: Web Services & APIs
+description: Operator reference for attacks against web services and APIs - the SOAP/WSDL discovery path that finds undocumented endpoints, SOAPAction spoofing as the canonical SOAP-specific bypass, and the meta-question of how every classical web vulnerability changes shape when delivered through a JSON/XML/SOAP API surface.
+mitre: [T1190, T1213]
+d3fend: [D3-IAA, D3-RAPA]
+impact: [DataExfil, AuthBypass, RCE]
+owasp: [A03, A05, A08]
+sidebar:
+  order: 1
+  label: Overview
+---
+
+## TL;DR
+
+Web services and APIs add a layer of indirection between attacker and application logic: the input format is structured (XML, JSON, gRPC), the discovery surface is different (WSDL files, OpenAPI specs, GraphQL introspection), and the trust assumptions sometimes invert (the server may trust an HTTP header more than the request body). The vulnerability classes are the same as classical web apps; the delivery quirks are new.
+
+```
+# 1. Discovery - what protocol is in play?
+curl -i http://target/                                         # check Content-Type, body shape
+curl -i -X OPTIONS http://target/api/                          # accepted methods
+dirb http://target:3002/                                       # /wsdl, /swagger, /openapi.json, /graphql
+ffuf -u http://target:3002/wsdl?FUZZ -fs 0                     # WSDL hidden behind a parameter
+
+# 2. WSDL → operation enumeration → manual SOAP requests
+curl http://target:3002/wsdl?wsdl       # the schema; lists every operation and its parameters
+
+# 3. SOAPAction spoofing (canonical SOAP-specific bypass)
+#    Body says "Login" (allowed); SOAPAction header says "ExecuteCommand" (privileged)
+curl -X POST http://target:3002/wsdl \
+     -H 'SOAPAction: "ExecuteCommand"' \
+     --data '<soap:Envelope>...<LoginRequest>...<cmd>whoami</cmd>...'
+
+# 4. Standard vulns through API channel
+#    SQLi inside <username>, XSS in REST URL path, LFI in API parameter,
+#    XXE in XML body, SSRF in fetcher-style API - see [API vuln context]
+```
+
+Success indicator: depends on the path - a SOAP operation runs that shouldn't (SOAPAction spoofing), a foreign data record returns (IDOR via API), arbitrary file content appears (LFI via API parameter), the attacker's listener receives a callback (SSRF/XXE via API).
+
+## Web service vs API - the terminology
+
+The terms get used interchangeably, but they're not equivalent:
+
+| Concept | Definition | Examples |
+| --- | --- | --- |
+| **API** (Application Programming Interface) | Any contract describing how two pieces of software exchange data or invoke functionality | REST endpoint, library function, OS syscall, gRPC service |
+| **Web service** | A specific kind of API delivered over a network with formalized message structure | SOAP service, XML-RPC server, JSON-RPC server |
+
+Practical translation:
+
+- "API" is the broader term. All web services are APIs; not all APIs are web services.
+- "Web service" usually implies SOAP, XML-RPC, or another formally-structured protocol with a published schema.
+- Modern REST/GraphQL APIs occupy a middle ground - they're APIs but rarely called "web services" outside enterprise contexts.
+
+For the operator, the distinction barely matters: it's all "structured HTTP traffic with a parseable body and a documented (or discoverable) schema."
+
+## The protocol landscape
+
+The Round 14 source material focuses on SOAP-style services. The broader landscape:
+
+| Protocol | Body format | Schema | Where you see it |
+| --- | --- | --- | --- |
+| **SOAP** | XML envelope with header/body/fault | WSDL | Enterprise, legacy, financial / government / healthcare integrations |
+| **XML-RPC** | XML with `<methodCall>` / `<methodResponse>` | None standard | WordPress `xmlrpc.php`, Trac, some legacy CMSes |
+| **JSON-RPC** | JSON with `method`/`params`/`id` | None standard | Ethereum nodes, Bitcoin RPC, some IPC interfaces |
+| **REST** | JSON (usually) or XML | OpenAPI / Swagger | Most modern web APIs |
+| **GraphQL** | JSON query body | Schema via introspection | Modern frontends, mobile apps |
+| **gRPC** | Protobuf (binary) over HTTP/2 | `.proto` files | Microservice-internal communication |
+| **WebSocket** | Application-defined frames | Custom | Real-time apps, trading platforms |
+
+Each has its own discovery story and quirks. This cluster focuses on the SOAP/WSDL path because it's the canonical "web service" topic, and on the meta-question of how *any* protocol's API delivery changes the vuln-class landscape.
+
+For XML-RPC against WordPress specifically, see [WordPress XML-RPC abuse](/codex/web/wordpress/xmlrpc-abuse/) - same protocol, different operational context.
+
+## SOAP in one minute
+
+A SOAP message is XML with a defined envelope structure:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Header>
+    <!-- optional metadata, auth tokens, routing -->
+  </soap:Header>
+  <soap:Body>
+    <!-- the actual request: operation name + parameters -->
+    <LoginRequest xmlns="http://tempuri.org/">
+      <username>admin</username>
+      <password>P@ssw0rd</password>
+    </LoginRequest>
+  </soap:Body>
+</soap:Envelope>
+```
+
+Four key elements:
+
+| Element | Required | Purpose |
+| --- | --- | --- |
+| `<soap:Envelope>` | Yes | Root; declares XML namespace |
+| `<soap:Header>` | No | Out-of-band metadata, auth, routing |
+| `<soap:Body>` | Yes | The operation and its parameters |
+| `<soap:Fault>` | No | Error responses; appears inside Body |
+
+Transport is usually HTTP, with an additional `SOAPAction:` HTTP header naming the operation:
+
+```http
+POST /wsdl HTTP/1.1
+Content-Type: text/xml; charset=utf-8
+SOAPAction: "ExecuteCommand"
+
+<?xml version="1.0"?>
+<soap:Envelope>...</soap:Envelope>
+```
+
+The duplication - operation named in both the body and the `SOAPAction` header - is the source of one of the canonical SOAP vulnerabilities (see [SOAPAction spoofing](/codex/web/web-services/soapaction-spoofing/)).
+
+## What this cluster covers
+
+| Page | Focus |
+| --- | --- |
+| [Discovery](/codex/web/web-services/discovery/) | Finding the API surface - WSDL location fuzzing (`?wsdl`, `/wsdl`, `?disco`), parameter-based WSDL exposure, OpenAPI/Swagger discovery, GraphQL introspection, anatomy of a WSDL file |
+| [SOAP basics](/codex/web/web-services/soap-basics/) | Crafting SOAP requests from a WSDL by hand - envelope construction, curl invocation, Python clients, the soapUI tool |
+| [SOAPAction spoofing](/codex/web/web-services/soapaction-spoofing/) | The canonical SOAP-specific bypass - body says one operation, header says another, server trusts the header and bypasses body-level auth |
+| [API vuln context](/codex/web/web-services/api-vuln-context/) | Meta-page: how SQLi, XSS, LFI, SSRF, XXE, IDOR, file upload, and command injection all manifest differently when delivered through an API surface - encoding quirks, body-vs-URL parameter delivery, cross-links to canonical clusters |
+| [ReDoS](/codex/web/web-services/redos/) | Regular Expression Denial of Service - vulnerable regex patterns, crafting evil inputs, detection methodology |
+| [Skill assessment chain](/codex/web/web-services/skill-assessment-chain/) | Capstone - SOAPAction spoofing + SQL injection chained against a SOAP login form, leading to admin password extraction |
+
+## Cross-cluster references
+
+API/web-service vulnerabilities overlap heavily with classical web vulns delivered through different transport. The canonical references:
+
+| Vuln class | Canonical cluster |
+| --- | --- |
+| SQL injection (also fires via SOAP parameters and JSON body fields) | [SQLi cluster](/codex/web/sqli/) |
+| XSS (also fires via REST URL path reflection) | [XSS to session](/codex/web/sessions/xss-to-session/) |
+| LFI (also fires via API filename parameters) | [LFI cluster](/codex/web/lfi/) |
+| SSRF (APIs that fetch remote resources are prime SSRF targets) | [SSRF cluster](/codex/web/server-side/ssrf/) |
+| XXE (XML-receiving APIs are the textbook XXE surface) | [XXE cluster](/codex/web/xxe/) |
+| IDOR (REST `/api/users/<id>` is the textbook IDOR surface) | [IDOR cluster](/codex/web/idor/) |
+| Arbitrary file upload via API | [Uploads cluster](/codex/web/uploads/) |
+| Command injection (API parameters reaching shell commands) | [Command injection cluster](/codex/web/command-injection/) |
+| WordPress XML-RPC specifically | [WordPress XML-RPC abuse](/codex/web/wordpress/xmlrpc-abuse/) |
+| Session-attack delivery patterns via API | [Sessions cluster](/codex/web/sessions/) |
+
+The pattern: this cluster covers the API-specific *context* (how to discover, how to talk to the API, the API-specific bypasses) and points to the canonical cluster for the vulnerability mechanics.
+
+## A note on scope
+
+The source-doc framing for Round 14 includes "any vuln class can fire through an API." That's true but doesn't scale to a per-class page - every cluster in the codex would need an "and here's the API variant" subpage. Instead, this cluster's [API vuln context](/codex/web/web-services/api-vuln-context/) page collects the API-specific deltas in one place, and individual vuln-class clusters cover the substance.
+
+When you find a finding that's primarily about API delivery (SOAPAction spoofing, WSDL exposure, ReDoS in a regex-validation API), report it from here. When the finding is primarily about a classical vuln that happens to be delivered through an API (SQL injection in a SOAP `<username>` parameter), report it from the canonical cluster with a cross-link to this one for context.

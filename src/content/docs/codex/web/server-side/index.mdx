@@ -1,0 +1,61 @@
+---
+title: Server-Side Attacks
+description: Operator reference for server-side attack classes - intermediary services, SSRF, SSI/ESI injection, SSTI, and XSLT injection.
+mitre: [T1190]
+d3fend: [D3-MH, D3-NI, D3-OTF]
+impact: [InternalAccess, RCE]
+sidebar:
+  order: 1
+  label: Overview
+---
+import { Aside } from '@astrojs/starlight/components';
+import Placeholder from '@components/Placeholder.astro';
+
+## TL;DR
+
+Five distinct vulnerability classes that share one property: they make the application server execute, fetch, render, or include something on the attacker's behalf. Different bugs, different payloads, different detection - group them by *what the application is being tricked into doing*.
+
+| Class | Server is tricked into… | Start here |
+| --- | --- | --- |
+| Intermediary service abuse | Routing through an unintended protocol/port (AJP, FastCGI) | [Intermediary](/codex/web/server-side/intermediary/) |
+| SSRF | Issuing HTTP/protocol requests to attacker-chosen targets | [SSRF](/codex/web/server-side/ssrf/) |
+| SSI / ESI injection | Parsing attacker-supplied include directives | [Server-Side Includes](/codex/web/server-side/includes/) |
+| SSTI | Evaluating attacker-supplied template expressions | [SSTI](/codex/web/server-side/ssti/) |
+| XSLT injection | Performing attacker-controlled XML transformations | [XSLT](/codex/web/server-side/xslt/) |
+
+## Decision flow
+
+1. **Open port that doesn't speak HTTP** (8009, 9000, 1099, 11211) → [Intermediary services](/codex/web/server-side/intermediary/)
+2. **Parameter that takes a URL or hostname** (avatar fetcher, webhook, "test connection," PDF-from-URL) → [SSRF](/codex/web/server-side/ssrf/)
+3. **`{{...}}` evaluates as math** (`{{7*7}}` returns 49) → [SSTI](/codex/web/server-side/ssti/)
+4. **`<!--#... -->` directives processed** by the page → [SSI](/codex/web/server-side/includes/ssi/)
+5. **`<esi:...>` tags fetched** by an upstream surrogate → [ESI](/codex/web/server-side/includes/esi/)
+6. **Application transforms XML you control** with a stylesheet → [XSLT](/codex/web/server-side/xslt/)
+7. **No idea where to start** → [SSRF](/codex/web/server-side/ssrf/) - most prevalent and highest-yield
+
+## Placeholder legend
+
+| Placeholder | Meaning |
+| --- | --- |
+| <Placeholder name="TARGET" /> | External target host or URL (the public-facing app) |
+| <Placeholder name="INTERNAL_HOST" hint="Internal target reachable only via SSRF" /> | Internal target reachable only via SSRF/proxy |
+| <Placeholder name="METADATA_IP" hint="Cloud metadata endpoint (169.254.169.254 for AWS/Azure/GCP)" /> | Cloud metadata endpoint (`169.254.169.254` for AWS/Azure/GCP/Alibaba; varies elsewhere) |
+| <Placeholder name="PARAM" /> | Vulnerable parameter name |
+| <Placeholder name="COLLAB" hint="OOB callback host (Burp Collaborator, interactsh, your own VPS)" /> | OOB callback host (Burp Collaborator, interactsh, your VPS) |
+| <Placeholder name="ATTACKER" /> | Your host for HTTP/DNS exfil and OOB callbacks |
+| <Placeholder name="LHOST" hint="Listener host - your reverse-shell IP" />, <Placeholder name="LPORT" hint="Listener port - your reverse-shell port" /> | Reverse shell listener |
+| <Placeholder name="TOKEN" />, <Placeholder name="HASH" /> | Captured credentials, session tokens |
+
+## Scope notes
+
+<Aside type="note">
+**XXE (XML External Entity) is not in this section.** XXE is server-side and frequently appears alongside the topics here, but its payload catalog (entity expansion, parameter entities, blind exfil via DTD, parser-quirk variants for libxml/Java/.NET) deserves dedicated treatment. It will get its own section. When you encounter XXE during an engagement that started here - typically via XSLT or SOAP endpoints - that's the cross-link.
+</Aside>
+
+<Aside type="caution">
+The attacks in this section reach internal infrastructure: cloud metadata, internal services, source code on disk, hash-stealing UNC paths. They escalate quickly - an SSRF on a public-facing app frequently turns into AWS credential theft and full account takeover within minutes. Confirm scope before exploiting; document the chain as you go because reproducing a multi-hop SSRF later is painful.
+</Aside>
+
+## Operating notes
+
+The bugs in this section often chain. SSRF reaches an internal service that is vulnerable to SSTI, which yields RCE. AJP exposes a Tomcat manager that accepts a war upload. SSI executes a command that triggers an outbound DNS request used as a confirmation channel. The decision flow above is a starting point - the *real* engagement is recognizing when one primitive sets up another.

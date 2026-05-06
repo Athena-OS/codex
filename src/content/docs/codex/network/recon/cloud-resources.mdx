@@ -1,0 +1,265 @@
+---
+title: Cloud Resources
+description: Discovering S3 buckets, Azure blobs, and GCS storage that the organization owns - through DNS records, Google dorks, source-code references, and third-party bucket indexes.
+mitre: [T1593, T1593.002, T1596, T1552, T1552.001]
+d3fend: [D3-NTA, D3-FA]
+impact: [DataExfil, CredentialTheft, FileRead]
+sidebar:
+  order: 4
+  label: Cloud Resources
+---
+
+## TL;DR
+
+Cloud storage misconfigurations are one of the easiest wins in modern engagements. Companies create S3 buckets / Azure blobs / GCS buckets for legitimate reasons, then mis-set the access policy and put production data in something the entire internet can read. The goal of this stage: find the buckets the organization owns, before touching them, so you can hand the customer a clean "your bucket X is publicly readable" finding.
+
+```
+# 1. DNS-resident clues - cloud storage hostnames in the organization's DNS
+grep -E '(amazonaws|blob.core.windows|storage.googleapis)' subdomains.txt
+
+# 2. Google dorks - find indexed bucket URLs
+"site:s3.amazonaws.com inlanefreight"
+"site:blob.core.windows.net inlanefreight"
+
+# 3. Source-code crawl - buckets referenced in JS/CSS/HTML of the main site
+curl -s https://target.com | grep -Eo 'https?://[^"]*\.(amazonaws\.com|blob\.core\.windows\.net|storage\.googleapis\.com)[^"]*'
+
+# 4. Third-party indexes - public buckets indexed by GrayHatWarfare and friends
+# https://buckets.grayhatwarfare.com/  (search by company name or abbreviation)
+```
+
+Success indicator: a list of bucket URLs owned by the target, classified by access level (public, partial, restricted) and content category (static assets, backups, customer data, credentials).
+
+## Why cloud storage matters
+
+Every major cloud provider exposes object storage that defaults to private but can be made public with a single config flag. The flag exists for a reason - static websites, public downloads, file sharing - but it gets set incorrectly all the time. A non-exhaustive list of what's been found in public buckets across real engagements:
+
+- Customer PII (names, emails, addresses, SSNs)
+- Backups of production databases
+- API keys and cloud credentials (which compound the breach)
+- Private SSH keys (immediate lateral movement onto everything those keys authorize)
+- Source code with hardcoded secrets
+- Internal documents, contracts, sales pipelines
+- CI/CD artifacts including private container images
+
+A single publicly readable backup bucket is often the entire engagement.
+
+## Identifying cloud storage from DNS
+
+Cloud storage gets named via DNS for the same reason any other service does - humans need to find it. Look at your subdomain list from [Domains & Subdomains](/codex/network/recon/domains-and-subdomains/) for cloud-provider hostnames:
+
+```shell
+# After resolving subdomains to IPs (or to CNAMEs):
+host -t cname assets.inlanefreight.com
+```
+
+```
+assets.inlanefreight.com is an alias for s3-website-us-west-2.amazonaws.com.
+```
+
+Or check the resolved IPs against known cloud ranges:
+
+```shell
+# AWS publishes its IP ranges as JSON
+curl -s https://ip-ranges.amazonaws.com/ip-ranges.json | jq .
+```
+
+When you find a `*.amazonaws.com` alias, the actual bucket name often follows a predictable pattern. `s3-website-us-west-2.amazonaws.com` is the regional endpoint; the bucket is usually accessed at one of:
+
+- `<bucket>.s3.amazonaws.com`
+- `<bucket>.s3-us-west-2.amazonaws.com`
+- `<bucket>.s3-website-us-west-2.amazonaws.com`
+
+If `assets.inlanefreight.com` aliases to the S3 website endpoint, the bucket is very likely named `assets.inlanefreight.com` (the alias works because the bucket name matches the host header).
+
+## Provider naming conventions
+
+| Provider | Storage type | Hostname pattern |
+| --- | --- | --- |
+| AWS | S3 | `<bucket>.s3.amazonaws.com`, `<bucket>.s3-<region>.amazonaws.com` |
+| AWS | S3 website | `<bucket>.s3-website-<region>.amazonaws.com` |
+| Azure | Blob storage | `<account>.blob.core.windows.net/<container>/` |
+| Azure | File storage | `<account>.file.core.windows.net/<share>/` |
+| GCP | Cloud Storage | `storage.googleapis.com/<bucket>/`, `<bucket>.storage.googleapis.com` |
+| DigitalOcean | Spaces | `<space>.<region>.digitaloceanspaces.com` |
+| Backblaze | B2 | `<bucket>.s3.<region>.backblazeb2.com` (S3-compatible) |
+| Linode | Object Storage | `<bucket>.<region>.linodeobjects.com` |
+
+Useful pattern: companies tend to name buckets after either the application, the environment, or the data. So you might see:
+
+```
+inlanefreight-assets
+inlanefreight-backups
+inlanefreight-prod
+inlanefreight-staging
+ilfreight-prod
+ilf-data
+```
+
+Wordlist bucket discovery is covered later in this page.
+
+## Google dorks
+
+Google has indexed massive amounts of bucket content. Cloud provider URLs follow recognizable patterns; you can search for them with `site:` operators and narrow by content keywords.
+
+### AWS S3
+
+```
+site:s3.amazonaws.com inlanefreight
+site:s3-us-west-2.amazonaws.com "inlanefreight" filetype:pdf
+inurl:s3.amazonaws.com "inlanefreight" intext:"confidential"
+```
+
+### Azure Blob
+
+```
+site:blob.core.windows.net "inlanefreight"
+inurl:blob.core.windows.net filetype:xlsx "inlanefreight"
+```
+
+### GCP
+
+```
+site:storage.googleapis.com "inlanefreight"
+inurl:storage.googleapis.com "inlanefreight" filetype:json
+```
+
+### General cloud bucket dorking
+
+```
+"AKIA" filetype:txt              # AWS access key prefix in text files
+"AccountKey=" filetype:config    # Azure storage account keys
+"google_application_credentials" filetype:json
+```
+
+Real engagements turn up PDFs (contracts, proposals), spreadsheets (customer lists, invoices), text dumps, JSON configs, presentations, and source code in indexed buckets. The PII surface is often immediate and severe.
+
+## Source-code references
+
+Cloud storage URLs appear in HTML, CSS, and JavaScript of the company's primary website. Images, fonts, scripts, and downloadable assets are loaded from buckets - that's *why* the bucket exists in the first place.
+
+```shell
+# Pull the main page and extract cloud storage references
+curl -sL https://target.com \
+  | grep -Eo 'https?://[^"]*\.(amazonaws\.com|blob\.core\.windows\.net|storage\.googleapis\.com|digitaloceanspaces\.com)[^"]*' \
+  | sort -u
+```
+
+```
+https://cdn-images.inlanefreight.com.s3.amazonaws.com/banner.png
+https://inlanefreight-static.s3-us-west-2.amazonaws.com/main.css
+https://inlanefreight-docs.blob.core.windows.net/public/whitepaper.pdf
+```
+
+Each unique hostname is a bucket worth investigating. The full URL is what's referenced; the bucket itself often has *additional* content beyond what's linked in HTML.
+
+For comprehensive crawling, use a tool like [`waybackurls`](https://github.com/tomnomnom/waybackurls) or [`gau`](https://github.com/lc/gau) to pull URLs the Wayback Machine has archived for the domain - historical references often include staging buckets that aren't linked anymore.
+
+```shell
+waybackurls inlanefreight.com | grep -E 'amazonaws|blob|googleapis' | sort -u
+```
+
+## GrayHatWarfare
+
+[GrayHatWarfare](https://buckets.grayhatwarfare.com/) maintains a continuously updated index of *public* S3, Azure Blob, and GCS buckets along with their file contents. Search by:
+
+- Bucket name (partial match)
+- Filename / extension
+- Content type
+
+This service has cataloged hundreds of thousands of misconfigured buckets. Search for the company name, then for common abbreviations (companies often abbreviate in internal naming - `InlaneFreight` → `ilf` → `if`). Search for likely file types:
+
+```
+inlanefreight        → matches bucket names
+ilf                  → matches abbreviations  
+inlanefreight .sql   → backup dumps
+inlanefreight .pem   → private keys
+inlanefreight id_rsa → SSH keys
+inlanefreight .env   → environment configs
+```
+
+Common high-value finds:
+
+| Search | Why |
+| --- | --- |
+| `.sql.gz` `.sql.bz2` `.dump` | Database backups |
+| `id_rsa` `*.pem` `*.ppk` | Private keys |
+| `.env` `config.json` `credentials.json` | App credentials |
+| `*.bak` `backup.tar.gz` | Generic backups |
+| `*.kdbx` `secrets.txt` | Password managers / secret stores |
+
+A single SSH key in a public bucket can mean instant root on production servers. Verify the bucket truly belongs to the target before reporting - bucket names sometimes collide.
+
+## Bucket-name brute-force
+
+Even when no DNS pointer or source-code link reveals a bucket, you can guess names by enumerating common patterns. Tools that automate this:
+
+- [s3scanner](https://github.com/sa7mon/S3Scanner) - checks bucket existence + access level for a wordlist of names
+- [cloud_enum](https://github.com/initstring/cloud_enum) - covers AWS, Azure, and GCP with one wordlist
+- [Bucket Stream](https://github.com/eth0izzle/bucket-stream) - passive discovery via certificate transparency monitoring
+
+```shell
+# cloud_enum example
+python cloud_enum.py -k inlanefreight -k ilfreight -k ilf -k if
+```
+
+The tool generates permutations: `inlanefreight-prod`, `prod-inlanefreight`, `inlanefreight-backup`, `inlanefreight.us-west-2`, etc. - and checks each against AWS, Azure, and GCP simultaneously.
+
+### Wordlist patterns that work
+
+```
+{company}-prod        {company}-staging      {company}-dev
+{company}-backup      {company}-backups      {company}-bak
+{company}-data        {company}-public       {company}-assets
+{company}-uploads     {company}-files        {company}-images
+{company}-logs        {company}-archive      {company}-temp
+{company}.{env}       {env}.{company}        {company}{env}
+```
+
+Append regions for AWS: `-us-east-1`, `-us-west-2`, `-eu-west-1`, etc.
+
+## domain.glass
+
+[domain.glass](https://domain.glass/) is a quick infrastructure aggregator. Useful for spotting cloud usage at a glance - it shows DNS, TLS, hosting, CDN classification, and a Cloudflare "Safe" / "Suspicious" rating in one view. The Cloudflare verdict is a good cue for layer-2 gateway notes: if Cloudflare protects the main site, you need to think about WAF bypass on later stages.
+
+## What to do with a bucket you find
+
+For each bucket you discover that belongs to the target:
+
+1. **List contents** - `aws s3 ls s3://bucket --no-sign-request` for AWS; `az storage blob list --account-name X --container-name Y --auth-mode login` for Azure (or browser navigation to the public URL).
+2. **Classify access** - public read, public read+write, requester-pays, fully private. The access policy is the finding.
+3. **Sample content** - what *type* of data is in there? Static website assets? Customer files? Backups?
+4. **Note credentials within content** - config files, `.env`, scripts often contain hardcoded keys.
+5. **Don't exfiltrate** - confirm the bucket is open, document the access level, take screenshots, don't pull gigabytes of customer data unless explicitly authorized.
+
+The finding writes itself: "Bucket `inlanefreight-backups` is publicly readable and contains [N] database backup files spanning [date range]. Recommended remediation: set bucket ACL to private, audit access logs."
+
+## SSH keys and credentials in cloud buckets
+
+A specific high-value finding worth calling out: SSH private keys in public buckets is a recurring pattern. Engineers under pressure store `id_rsa` somewhere "temporary" for a quick transfer; the bucket gets made public for a different file; the key sits there indefinitely.
+
+If you find an SSH private key in a bucket:
+
+1. Identify what host it authorizes - try `ssh -i found_key user@target_host`
+2. Document the public key fingerprint and which hosts accept it
+3. Report immediately - this is a high-severity finding regardless of what else you do
+
+Similarly for cloud credentials (`AKIA...` access keys, Azure storage account keys, GCP service account JSONs). Don't *use* the credentials - verify they're valid via `aws sts get-caller-identity` or equivalent, then report.
+
+## Putting it together
+
+A clean cloud-recon workflow:
+
+```
+1. Filter subdomain list   → identify cloud-hosted hostnames from DNS data
+2. Crawl primary site      → extract bucket URLs from HTML/JS/CSS
+3. Wayback archive         → historical bucket references
+4. Google dorks            → indexed bucket content
+5. GrayHatWarfare          → public bucket index, by company name + abbreviations
+6. cloud_enum brute        → wordlist-based bucket discovery
+7. Per bucket: access test → public/restricted classification
+8. Per bucket: content sample → categorize, identify high-value content
+9. Per bucket: secret scan → keys, credentials, PII within bucket contents
+```
+
+The output: a per-bucket inventory with access level, content category, and any embedded credentials. Buckets with credentials or PII become immediate findings; buckets that just host static assets get noted for completeness.

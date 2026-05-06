@@ -1,0 +1,56 @@
+---
+// src/components/CodexLogo.astro
+//
+// The Codex glyph - H.3 Roman scutum (shield) silhouette enclosing a shell
+// prompt chevron and a cursor caret. The shape echoes the sidebar's active
+// indicator (❯ name_) so the whole UI reads as one design language.
+//
+// Implementation notes:
+//   - Uses currentColor for stroke so it adopts whatever text color is in
+//     scope. This means the palette tuner's hue rotation automatically
+//     recolors the icon along with everything else accent-keyed.
+//   - viewBox 0 0 64 64 with stroke-based geometry - scales perfectly at
+//     any size without aliasing.
+//   - role="img" + <title> ensures screen readers announce it correctly.
+//
+// Props:
+//   size  - pixel dimensions of the rendered icon (default 24)
+//   class - extra class names to apply to the <svg> element
+//
+// Usage:
+//   <CodexLogo />              → 24px, currentColor
+//   <CodexLogo size={32} />     → 32px (header context)
+//   <CodexLogo size={18} />     → 18px (mobile / narrow viewport)
+
+interface Props {
+  size?: number;
+  class?: string;
+}
+
+const { size = 24, class: className = '' } = Astro.props;
+---
+
+<svg
+  width={size}
+  height={size}
+  viewBox="0 0 64 64"
+  fill="none"
+  stroke="currentColor"
+  stroke-width="3"
+  stroke-linecap="round"
+  stroke-linejoin="round"
+  role="img"
+  aria-labelledby="codex-logo-title"
+  class={className}
+>
+  <title id="codex-logo-title">Codex</title>
+
+  {/* Roman scutum silhouette - symmetric, peaked top and bottom, curved sides */}
+  <path d="M22 10 L 42 10 L 50 18 L 54 32 L 50 46 L 42 54 L 22 54 L 14 46 L 10 32 L 14 18 Z" />
+
+  {/* Inner ❯ prompt chevron */}
+  <path d="M24 22 L 32 28 L 24 34" stroke-width="3" />
+
+  {/* Inner _ caret underscore - the cursor */}
+  <line x1="36" y1="34" x2="44" y2="34" stroke-width="3" />
+</svg>

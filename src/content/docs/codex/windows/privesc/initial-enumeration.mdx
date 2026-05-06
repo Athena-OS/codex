@@ -1,0 +1,457 @@
+---
+title: Initial Enumeration
+description: Comprehensive first-pass enumeration of system identity, patch level, users, groups, processes, environment, and account policy on a Windows host. Each command in this set takes seconds and reveals data that maps directly to escalation primitives - patch level → kernel exploit candidacy, group membership → group-attack pages, whoami /priv → token-abuse pages, env vars → path-hijack opportunities. Run this before reaching for any tool.
+mitre: [T1082, T1033, T1087.001, T1069.001, T1057, T1518]
+d3fend: [D3-SYSM]
+impact: [Discovery, Reconnaissance]
+owasp: []
+noise: stealth
+sidebar:
+  order: 3
+  label: Initial enumeration
+---
+
+
+## TL;DR
+
+The minimum-viable enumeration suite for any Windows shell. Every command in this set produces high-signal information that maps directly to an escalation primitive: `whoami /priv` to token-abuse pages, `systeminfo` to kernel-exploit candidacy, `net localgroup` to group-attack pages. Run all of these before reaching for winPEAS or Seatbelt.
+
+```
+# Identity and privileges
+whoami                                # who am I
+whoami /priv                          # what tokens do I hold
+whoami /groups                        # what groups grant me what
+
+# System identity and patch level
+systeminfo                            # OS version, build, hotfixes
+wmic qfe                              # alternative hotfix view
+Get-HotFix                            # PowerShell hotfix view
+
+# Software footprint
+wmic product get name,version         # installed products (MSI)
+Get-WmiObject -Class Win32_Product | Select Name, Version
+tasklist /svc                         # running processes + services
+netstat -ano                          # open ports + PIDs
+
+# User and group inventory
+net user                              # local users
+net localgroup                        # local groups
+net localgroup administrators         # local admin members
+net accounts                          # local password policy
+query user                            # logged-in users
+
+# Environment
+set                                   # env vars (PATH, HOMEDRIVE, etc.)
+```
+
+Success indicator: you can describe the host's OS version, missing patches, your privileges, the local admin set, and which programs are installed in under five minutes.
+
+## Identity and privileges
+
+The three-line baseline. Always start here.
+
+### whoami - who am I
+
+```cmd
+C:\> whoami
+winlpe-srv01\htb-student
+```
+
+Reads as `MACHINENAME\username` (local account) or `DOMAIN\username` (domain account). The presence of a domain in the output indicates this host is domain-joined and the current session has domain context - important for credential reuse and lateral-movement planning.
+
+For SYSTEM, `whoami` returns `nt authority\system`. For local service accounts you might see `nt service\mssqlserver`, `nt service\<servicename>`, or similar.
+
+### whoami /priv - what tokens
+
+```cmd
+C:\> whoami /priv
+
+PRIVILEGES INFORMATION
+----------------------
+
+Privilege Name                Description                    State
+============================= ============================== ========
+SeChangeNotifyPrivilege       Bypass traverse checking       Enabled
+SeIncreaseWorkingSetPrivilege Increase a process working set Disabled
+```
+
+This is the most operationally important command in Windows privilege escalation. Each line is a privilege. The State field is either `Enabled` (privilege active right now) or `Disabled` (privilege held but not active - most can be enabled programmatically; see the individual privilege pages for the technique).
+
+**Privileges that directly enable escalation** - if any of these appear, regardless of State, jump to the linked page:
+
+| Privilege | What it enables | See |
+| --- | --- | --- |
+| `SeImpersonatePrivilege` | Impersonate authentication tokens | [SeImpersonate](/codex/windows/privesc/seimpersonate/) |
+| `SeAssignPrimaryTokenPrivilege` | Set primary token on processes | [SeImpersonate](/codex/windows/privesc/seimpersonate/) |
+| `SeDebugPrivilege` | Read/write any process memory | [SeDebugPrivilege](/codex/windows/privesc/sedebugprivilege/) |
+| `SeTakeOwnershipPrivilege` | Take ownership of any object | [SeTakeOwnership](/codex/windows/privesc/setakeownership/) |
+| `SeBackupPrivilege` | Read any file (backup semantics) | [Backup Operators](/codex/windows/privesc/backup-operators/) |
+| `SeRestorePrivilege` | Write any file (restore semantics) | [Backup Operators](/codex/windows/privesc/backup-operators/) |
+| `SeLoadDriverPrivilege` | Load kernel drivers | [Other privileged groups](/codex/windows/privesc/other-privileged-groups/) |
+
+A service account context with `SeImpersonatePrivilege` enabled - common after web shell upload to IIS or RCE through MSSQL - is the canonical "potato-family" win. Service-account-to-SYSTEM is sometimes a single command away.
+
+**Privileges that don't directly escalate but indicate elevated context** - `SeSecurityPrivilege`, `SeSystemEnvironmentPrivilege`, `SeIncreaseQuotaPrivilege` and others appear for local administrator contexts. If you see them while non-admin, something is misconfigured.
+
+If `whoami /priv` from a non-elevated cmd shows only the default two privileges (`SeChangeNotifyPrivilege`, `SeIncreaseWorkingSetPrivilege`), you're an unprivileged user with no obvious token-level wins. Proceed to group membership and software enumeration.
+
+### whoami /groups - what groups
+
+```cmd
+C:\> whoami /groups
+
+GROUP INFORMATION
+-----------------
+
+Group Name                             Type             SID          Attributes
+====================================== ================ ============ ==================================================
+Everyone                               Well-known group S-1-1-0      Mandatory group, Enabled by default, Enabled group
+BUILTIN\Remote Desktop Users           Alias            S-1-5-32-555 Mandatory group, Enabled by default, Enabled group
+BUILTIN\Users                          Alias            S-1-5-32-545 Mandatory group, Enabled by default, Enabled group
+NT AUTHORITY\Authenticated Users       Well-known group S-1-5-11     Mandatory group, Enabled by default, Enabled group
+Mandatory Label\Medium Mandatory Level Label            S-1-16-8192
+```
+
+Standard membership for a normal user: `Everyone`, `BUILTIN\Users`, `NT AUTHORITY\Authenticated Users`, plus mandatory integrity level.
+
+**Privileged group memberships that map to escalation paths** - these are the ones to look for:
+
+| Group | Attack page |
+| --- | --- |
+| `BUILTIN\Administrators` | Already local admin - focus on SYSTEM via UAC bypass or service abuse |
+| `BUILTIN\Backup Operators` | [Backup Operators](/codex/windows/privesc/backup-operators/) |
+| `BUILTIN\Event Log Readers` | [Other privileged groups](/codex/windows/privesc/other-privileged-groups/#event-log-readers) |
+| `BUILTIN\DnsAdmins` / `DOMAIN\DnsAdmins` | [DnsAdmins](/codex/windows/privesc/dnsadmins/) |
+| `BUILTIN\Hyper-V Administrators` | [Other privileged groups](/codex/windows/privesc/other-privileged-groups/#hyper-v-administrators) |
+| `BUILTIN\Print Operators` | [Other privileged groups](/codex/windows/privesc/other-privileged-groups/#print-operators) |
+| `BUILTIN\Server Operators` | [Other privileged groups](/codex/windows/privesc/other-privileged-groups/#server-operators) |
+| `BUILTIN\Account Operators` | Can modify most non-protected users/groups |
+| `BUILTIN\Schema Admins` (AD) | Can modify AD schema - broad lateral implications |
+| `BUILTIN\Group Policy Creator Owners` | Can create GPOs (needs link delegation to apply them) |
+
+**Mandatory Integrity Level** is shown at the bottom - `Low`, `Medium`, `Medium Plus`, `High`, `System`. A standard user runs at `Medium`. UAC-elevated processes run at `High`. SYSTEM processes run at `System`. Some operations require a minimum integrity level regardless of privileges.
+
+## System identity and patch level
+
+### systeminfo
+
+```cmd
+C:\> systeminfo
+```
+
+The output is verbose; the operationally important fields:
+
+- **OS Name** + **OS Version** + **OS Build Type** - Identifies the operating system. `Microsoft Windows Server 2016 Standard / 10.0.14393 N/A Build 14393` maps to a specific patch baseline. The build number is the precise identifier; cross-reference against [Windows release history](https://en.wikipedia.org/wiki/Windows_10_version_history).
+- **System Boot Time** - How long the host has been up. A boot time three weeks ago + no recent hotfixes = unpatched live system.
+- **Hotfix(s)** - KBs applied. *Critical for kernel-exploit candidacy*. Cross-reference the KB list against [WES-NG](https://github.com/bitsadmin/wesng) or [Watson](https://github.com/rasta-mouse/Watson) to find missing patches.
+- **Domain** - `WORKGROUP` means standalone; otherwise the AD domain name. Tells you whether AD-context attacks are in play.
+- **Logon Server** - The DC that authenticated this session.
+- **System Manufacturer** + **System Model** - `VMware, Inc.` or `Microsoft Corporation` (Hyper-V) confirms virtualization. Bare metal indicates a physical workstation/server.
+- **System Locale** + **Time Zone** - Useful context for where in the world this host lives, particularly for engagement timing.
+
+### Hotfix enumeration
+
+If `systeminfo` doesn't print hotfixes (some configurations hide them), query directly:
+
+```cmd
+C:\> wmic qfe
+
+Caption                                     CSName        Description      HotFixID   InstallDate  InstalledBy          InstalledOn
+http://support.microsoft.com/?kbid=3199986  WINLPE-SRV01  Update           KB3199986               NT AUTHORITY\SYSTEM  11/21/2016
+https://support.microsoft.com/help/5001078  WINLPE-SRV01  Security Update  KB5001078               NT AUTHORITY\SYSTEM  3/25/2021
+http://support.microsoft.com/?kbid=4103723  WINLPE-SRV01  Security Update  KB4103723               NT AUTHORITY\SYSTEM  3/25/2021
+```
+
+Or with PowerShell:
+
+```powershell
+PS> Get-HotFix | ft -AutoSize
+
+Source       Description     HotFixID  InstalledBy                InstalledOn
+------       -----------     --------  -----------                -----------
+WINLPE-SRV01 Update          KB3199986 NT AUTHORITY\SYSTEM        11/21/2016 12:00:00 AM
+WINLPE-SRV01 Update          KB4054590 WINLPE-SRV01\Administrator 3/30/2021 12:00:00 AM
+WINLPE-SRV01 Security Update KB5001078 NT AUTHORITY\SYSTEM        3/25/2021 12:00:00 AM
+```
+
+Save the `systeminfo` output to a file and feed it to [WES-NG](https://github.com/bitsadmin/wesng) on the attacker side:
+
+```shell
+$ python3 wes.py systeminfo.txt
+```
+
+This returns a list of likely-missing patches with associated CVEs and links to public exploits. The output volume can be large; filter for what's actually exploitable in your context (kernel privilege-escalation primarily - bypass denial-of-service and RCE entries for local-context escalation).
+
+### When patches are old - what to look for
+
+Patch dates more than 6-12 months stale are the strongest signal of kernel-exploit candidacy. Specific dates and what they imply:
+
+| Last hotfix before | Likely vulnerable to |
+| --- | --- |
+| March 2017 | EternalBlue (MS17-010) |
+| April 2018 | DoublePulsar, SambaCry |
+| Sept 2018 | ALPC Task Scheduler 0-day |
+| Sept 2019 | CVE-2019-1322 (UsoSvc weak ACL window - already patched) |
+| June 2021 | PrintNightmare (CVE-2021-1675 / CVE-2021-34527) |
+| July 2021 | HiveNightmare / SeriousSam (CVE-2021-36934) |
+
+Match the boot-time-versus-patch-date gap. A host last patched in 2019 booted yesterday is missing two years of fixes; expect kernel exploits to land.
+
+## Software footprint
+
+Knowing what's installed tells you both the legitimate attack surface (vulnerable third-party services) and the operator's available tooling (PowerShell version, .NET version, etc.).
+
+### Installed products
+
+```cmd
+C:\> wmic product get name,version
+
+Name                                                       Version
+Microsoft Visual C++ 2019 X64 Additional Runtime           14.24.28127
+Java 8 Update 231 (64-bit)                                 8.0.2310.11
+VMware Tools
+Microsoft Visual C++ 2019 X64 Minimum Runtime              14.24.28127
+SQL Server 2016 Database Engine Services                   13.2.5026.0
+```
+
+Or with PowerShell (which is slow on large software sets - `wmic` is faster for first-pass):
+
+```powershell
+PS> Get-WmiObject -Class Win32_Product | Select Name, Version
+```
+
+`wmic product` enumerates only MSI-installed software. Programs installed via other means (manual extracts to `Program Files`, portable apps in `AppData`, sideloaded DLLs) may not appear. For a more complete view, check the registry directly:
+
+```powershell
+PS> Get-ItemProperty 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*' | Select DisplayName, DisplayVersion
+PS> Get-ItemProperty 'HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' | Select DisplayName, DisplayVersion
+```
+
+The second path (`Wow6432Node`) catches 32-bit installations on 64-bit Windows.
+
+**What to look for in installed software:**
+
+- **Vulnerable third-party services** - search each product+version against known CVEs. Druva inSync, Splunk Universal Forwarder, various VPN clients (Windscribe, NordVPN), PCProtect, and dozens of other consumer/enterprise products have shipped weak service ACLs over the years.
+- **Password manager presence** - KeePass, 1Password, LastPass installations indicate password databases worth hunting later.
+- **Backup software** - Veeam, Acronis, Restic, etc. Backups often contain NTDS.dit, SAM/SYSTEM hives, or sensitive config files.
+- **Old runtime versions** - Java 8u231 indicates the host hasn't been updated; Java has dozens of known privilege-escalation vectors in versions of that era.
+- **Development tools** - Visual Studio, JDKs, Python, Node.js - useful for compiling exploits locally and indicate this is a developer workstation.
+
+### Running processes
+
+```cmd
+C:\> tasklist /svc
+```
+
+Output columns: Image Name, PID, Services. The "Services" column maps process PIDs to the Windows services they host, which is useful because `svchost.exe` hosts dozens of services - knowing *which* services are in *which* svchost lets you target service-specific abuse.
+
+Look for:
+
+- **Non-standard services** - Anything not in the Windows default set. Third-party services running as `LocalSystem` or service accounts are often abuse-worthy.
+- **Outdated services** - Old versions of FileZilla, FTP servers, web frameworks, message brokers, etc. Cross-reference versions against CVE databases.
+- **AV/EDR** - As covered in [Situational awareness](/codex/windows/privesc/situational-awareness/), processes like `MsMpEng.exe` (Defender), `CSFalconService.exe` (CrowdStrike), etc.
+
+Cross-reference with port listeners via `netstat -ano` - PIDs match between the two outputs.
+
+### Open ports
+
+```cmd
+C:\> netstat -ano | findstr LISTENING
+```
+
+The PID column ties listeners back to processes. Key things to look for:
+
+- **Localhost-only services** (`127.0.0.1:port`) - typically unauthenticated admin interfaces
+- **Non-standard ports** that don't correspond to obvious services
+- **Services bound to specific interfaces** rather than `0.0.0.0` - sometimes indicates intentional segmentation
+- **Established connections** - what this host is talking to
+
+The `netstat -ano` filter pattern `127.0.0.1:` or `[::1]:` quickly reveals localhost-only listeners:
+
+```powershell
+PS> netstat -ano | Select-String '127\.0\.0\.1:|\[::1\]:'
+```
+
+## User and group inventory
+
+### Local users
+
+```cmd
+C:\> net user
+
+User accounts for \\WINLPE-SRV01
+
+-------------------------------------------------------------------------------
+Administrator            DefaultAccount           Guest
+helpdesk                 htb-student              jordan
+sarah                    secsvc
+```
+
+Reads for:
+
+- **Non-default accounts** - Anything besides Administrator, DefaultAccount, Guest, and WDAGUtilityAccount. The presence of `helpdesk`, `jordan`, `sarah`, `secsvc` suggests this is a real workstation with a history of users.
+- **Service-account-style names** - `secsvc`, `backupsvc`, `sql_svc`, `iis_svc`. These often have elevated rights and may be reused across systems (the "common service account password" pattern).
+- **Admin-style names** - Names with `_adm`, `adm_`, `admin_` suggixes/prefixes are operator-assigned admin alter-egos.
+
+Get details for a specific account:
+
+```cmd
+C:\> net user secsvc
+
+User name                    secsvc
+Full Name
+Comment                      Network scanner - do not change password
+                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                             High-signal - comment field sometimes leaks info
+Account active               Yes
+Account expires              Never
+Password last set            ...
+```
+
+The **Comment** field is sometimes used by admins to document service account purpose; in low-discipline environments it occasionally contains the password itself. Worth checking on every account.
+
+### Local groups
+
+```cmd
+C:\> net localgroup
+```
+
+Output enumerates all local groups. The groups that matter from an escalation perspective are the ones listed in `whoami /groups` - but it's worth knowing *all* groups exist on the host because some may be domain-pushed and indicate the host's purpose.
+
+Get group membership:
+
+```cmd
+C:\> net localgroup administrators
+
+Alias name     administrators
+Comment        Administrators have complete and unrestricted access to the computer/domain
+
+Members
+
+-------------------------------------------------------------------------------
+Administrator
+helpdesk
+sarah
+secsvc
+```
+
+The members of `administrators` are your immediate-promotion targets if you can capture their credentials. Domain accounts here (e.g., `INLANEFREIGHT\jordan_adm`) indicate a domain user with local admin rights - useful for lateral movement to other domain hosts.
+
+Repeat for any operationally interesting group (`net localgroup "Backup Operators"`, `net localgroup "Server Operators"`, etc.).
+
+### Password policy
+
+```cmd
+C:\> net accounts
+
+Force user logoff how long after time expires?:       Never
+Minimum password age (days):                          0
+Maximum password age (days):                          42
+Minimum password length:                              0
+Length of password history maintained:                None
+Lockout threshold:                                    Never
+Lockout duration (minutes):                           30
+Lockout observation window (minutes):                 30
+Computer role:                                        SERVER
+```
+
+Read for:
+
+- **Lockout threshold** - `Never` means no lockout. Password spraying is unconstrained. Any positive integer caps spraying attempts before account lockout (typically 3, 5, or 10).
+- **Minimum password length** - Low values indicate weak password constraints exist.
+- **Password complexity** - Not shown in `net accounts`; check `secpol.msc` if GUI access exists, or query Group Policy.
+
+### Logged-in users
+
+```cmd
+C:\> query user
+
+ USERNAME              SESSIONNAME        ID  STATE   IDLE TIME  LOGON TIME
+>administrator         rdp-tcp#2           1  Active          .  3/25/2021 9:27 AM
+```
+
+`>` marks the current session. Other sessions belong to other logged-in users.
+
+Why this matters:
+
+- **Concurrent admin sessions** - If a domain admin is logged in alongside you, their tokens are in process memory. Privilege escalation to SYSTEM lets you steal their token (token impersonation) or extract their credentials from LSASS.
+- **Avoiding detection** - If a user is actively logged in, loud actions (creating users, defacing things, popping consoles) are more likely to be noticed. Plan accordingly.
+
+## Environment
+
+```cmd
+C:\> set
+```
+
+This dumps all environment variables. Read for:
+
+- **PATH** - Order matters. Windows searches the current working directory first, then each PATH directory left-to-right. A writable directory early in the PATH (especially anything left of `C:\Windows\System32`) is a DLL-injection or binary-substitution opportunity. The `WindowsApps` entry inside the user profile is a textbook example.
+- **PATHEXT** - Which extensions Windows treats as executable. Standard is `.COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC`. Additions like `.PY` or `.PL` indicate scripting languages with shebang-style execution.
+- **PSModulePath** - Where PowerShell looks for modules. A writable directory here lets you ship malicious modules to autoload.
+- **TEMP** / **TMP** - Per-user temp directory. Writable, often missed by file monitors.
+- **HOMEDRIVE** / **HOMEPATH** - Sometimes maps to a network share. The presence of `H:` mapped to `\\server\users$\username` indicates roaming profiles; navigating to that share may reveal other users' folders if ACLs are loose.
+- **LOGONSERVER** - Same data as in `systeminfo`, confirms which DC handled auth.
+- **USERDNSDOMAIN** / **USERDOMAIN** - Confirms domain context.
+- **USERPROFILE** - Your home directory. Always check `Desktop`, `Documents`, `Downloads`, `AppData\Local`, and `AppData\Roaming` for credential files (covered in later rounds).
+
+A common operator-targeted thing: any non-standard entries in PATH. If you see `C:\CustomApps\bin\` left of `C:\Windows\System32`, the `CustomApps\bin\` directory is high-priority - if writable, you can shadow standard Windows binaries by dropping a same-named binary there.
+
+## Putting it together
+
+A typical first-five-minutes session on a new shell:
+
+```cmd
+whoami && whoami /priv && whoami /groups
+systeminfo
+net user && net localgroup administrators && net accounts
+tasklist /svc
+netstat -ano | findstr LISTENING
+set
+query user
+```
+
+Save the output to a file (`> enum.txt`) for offline review. Feed `systeminfo` output to WES-NG on the attacker side. Cross-reference `tasklist /svc` against AV/EDR indicator lists.
+
+From the data this produces, the decision tree is:
+
+1. Did `whoami /priv` show a token privilege from the escalation list? → Jump to that privilege's page.
+2. Did `whoami /groups` show a privileged group from the escalation list? → Jump to that group's page.
+3. Are missing patches old enough to suggest kernel-exploit candidacy? → Run WES-NG, pick the best match.
+4. Is there interesting installed software with known vulnerabilities? → Search for that product+version.
+5. None of the above? → Run [winPEAS](https://github.com/peass-ng/PEASS-ng/tree/master/winPEAS) or [Seatbelt](https://github.com/GhostPack/Seatbelt) for misconfiguration sweep, then proceed to credential hunting.
+
+## Quick reference
+
+| Task | Command |
+| --- | --- |
+| Current user | `whoami` |
+| Current user privileges | `whoami /priv` |
+| Current user group membership | `whoami /groups` |
+| OS version + hotfixes (verbose) | `systeminfo` |
+| Hotfix list (compact) | `wmic qfe` / `Get-HotFix` |
+| Installed MSI products | `wmic product get name,version` |
+| Installed apps via registry | `Get-ItemProperty HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\* \| Select DisplayName,DisplayVersion` |
+| Process + service mapping | `tasklist /svc` |
+| Listening ports + PIDs | `netstat -ano \| findstr LISTENING` |
+| Local users | `net user` |
+| Specific user details | `net user USERNAME` |
+| Local groups | `net localgroup` |
+| Local admin members | `net localgroup administrators` |
+| Password policy | `net accounts` |
+| Currently logged-in users | `query user` |
+| Environment variables | `set` |
+| Saved hotfix → exploit match | `wes.py systeminfo.txt` (on attacker host) |
+| Local exploit suggester (Meterpreter) | `post/multi/recon/local_exploit_suggester` |
+
+Once enumeration data is captured, follow the decision tree above. Token-privilege wins are usually the fastest; see [SeImpersonate](/codex/windows/privesc/seimpersonate/), [SeDebugPrivilege](/codex/windows/privesc/sedebugprivilege/), [SeTakeOwnership](/codex/windows/privesc/setakeownership/), [Backup Operators](/codex/windows/privesc/backup-operators/). For group-membership wins, see [DnsAdmins](/codex/windows/privesc/dnsadmins/) and [Other privileged groups](/codex/windows/privesc/other-privileged-groups/).  The IPC-channel angle is covered in [Named pipes](/codex/windows/privesc/named-pipes/).
+
+## Next move
+
+- **`whoami /priv` shows SeImpersonate / SeAssignPrimaryToken** → [SeImpersonate → SYSTEM via potato](/codex/windows/privesc/seimpersonate/) (fastest win on service-account contexts)
+- **`whoami /priv` shows SeDebugPrivilege** → [SeDebugPrivilege → LSASS dump](/codex/windows/privesc/sedebugprivilege/) for domain hashes
+- **`whoami /priv` shows SeBackupPrivilege or SeRestorePrivilege** → [Backup Operators flow](/codex/windows/privesc/backup-operators/) - even off a DC, you can read protected files
+- **`whoami /priv` shows SeTakeOwnership** → [SeTakeOwnership](/codex/windows/privesc/setakeownership/) for service-binary overwrite
+- **In Backup Operators / DnsAdmins / Server Operators / Print Operators / Hyper-V Admins / Event Log Readers** → [Other privileged groups](/codex/windows/privesc/other-privileged-groups/)
+- **`systeminfo` shows old patch level (no 2020+ hotfixes)** → kernel exploit candidate; check Watson / Sherlock / WindowsExploitSuggester output against the patch list
+- **Service running as SYSTEM with writable named pipe** → [Named pipes](/codex/windows/privesc/named-pipes/) for impersonation
+- **Nothing privileged found** → look for misconfigured services (`accesschk -wuvqc *`), credential files (unattend.xml, GPP cpassword, web.config), AlwaysInstallElevated, or scheduled tasks running as SYSTEM

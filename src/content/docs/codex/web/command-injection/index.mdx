@@ -1,0 +1,56 @@
+---
+title: Command Injection
+description: Operator reference for OS command injection - detection, execution, blind techniques, filter bypass, argument injection, and shells.
+mitre: [T1190, T1059]
+d3fend: [D3-MH, D3-PSA, D3-EI]
+impact: [RCE]
+owasp: [A05]
+sidebar:
+  order: 1
+  label: Overview
+---
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+import Placeholder from '@components/Placeholder.astro';
+
+## TL;DR
+
+Command injection is when user input lands in a function that spawns a shell or process, letting you append your own commands. You confirm it with a separator (`;`, `\n`, `&`, `|`, `&&`, `||`, `` ` ``, `$()`), then escalate to enumeration, blind exfiltration, or a reverse shell.
+
+Three vulnerability classes get confused - they need different exploitation:
+
+- **Command injection** - input concatenated into a shell invocation. You inject *commands*. Sinks: PHP `system`/`exec`/`passthru`/`shell_exec`/`popen`, Node `child_process.exec`/`spawn` (with shell), Python `os.system`/`subprocess.run(..., shell=True)`, Ruby `` ` ` ``/`Kernel#system`, Java `Runtime.exec(String)` with shell wrapper.
+- **Argument injection** - input concatenated into a *fixed* binary's argv. The binary is locked, but flags and arguments are yours. See [Argument injection](/codex/web/command-injection/argument-injection/).
+- **Code injection** - input passed to a language `eval`/`exec` (PHP `eval`, Python `exec`, Node `Function()`). You inject *code in the host language*, not shell. Out of scope for this section.
+
+## Decision flow
+
+1. **Suspect a sink?** Any feature that pings, converts, archives, resolves DNS, generates PDFs, processes images, runs `git`, or invokes external tools is a candidate. → [Detection](/codex/web/command-injection/detection/)
+2. **Output reflected?** Use a separator and read the result. → [Execution](/codex/web/command-injection/execution/)
+3. **No output?** Confirm blind via timing or out-of-band callback. → [Blind & OOB](/codex/web/command-injection/blind/)
+4. **Filters in the way?** Spaces, slashes, command names, or operators blocked. → [Filter bypass](/codex/web/command-injection/filter-bypass/)
+5. **Binary fixed but args controlled?** Different bug class, same root cause. → [Argument injection](/codex/web/command-injection/argument-injection/)
+6. **Confirmed RCE, want a shell?** → [Reverse shells](/codex/web/command-injection/shells/)
+7. **In an exam, need a single page?** → [Cheatsheet](/codex/web/command-injection/cheatsheet/)
+
+## Placeholder legend
+
+Used throughout this section.
+
+| Placeholder | Meaning |
+| --- | --- |
+| <Placeholder name="TARGET" /> | Target host or URL |
+| <Placeholder name="PARAM" /> | Vulnerable parameter name |
+| <Placeholder name="ATTACKER" /> | Your host for HTTP/DNS exfil and OOB callbacks (no port - protocol-default) |
+| <Placeholder name="LHOST" hint="Listener host - your reverse-shell IP" /> | Your listener host for reverse shells |
+| <Placeholder name="LPORT" hint="Listener port - your reverse-shell port" /> | Your listener port for reverse shells |
+| <Placeholder name="CMD" /> | Arbitrary command being injected |
+
+## Operating notes
+
+<Aside type="caution">
+Command injection executes on production infrastructure. Destructive payloads (`rm`, `shutdown`, `Format-Volume`) and noisy ones (`find /` on a large filesystem, unbounded `ping`) cause real outages and trigger alerts. Test with `id`, `whoami`, `hostname` first; only escalate after confirming the injection works.
+</Aside>
+
+<Aside type="note">
+Defenders block this with input validation (allowlist regex on the back-end, not just front-end), avoiding shell-spawning APIs in favor of language-native equivalents (`fsockopen` instead of `system("ping")`), and runtime restrictions (`disable_functions`, `open_basedir`, low-privilege service accounts, WAFs). Knowing the defenses tells you what your payload has to slip past.
+</Aside>

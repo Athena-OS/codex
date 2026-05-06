@@ -1,0 +1,100 @@
+---
+// src/components/PageTitle.astro
+//
+// Override of Starlight's default PageTitle. Renders the page title,
+// AI/Copy menu, and a row of offensive-taxonomy pills directly under it.
+//
+// Pill types rendered (each only if the frontmatter has the relevant field):
+//   - MitreTag      ← from mitre: [T1190, ...]      (attack technique)
+//   - OwaspTag      ← from owasp: [A03, ...]        (OWASP Top 10)
+//   - CveTag        ← from cve: [CVE-2020-1938, ...] (CVE references)
+//   - ImpactPill    ← from impact: [RCE, AuthBypass, ...] (what's achieved)
+//
+// D3FEND tags do NOT render here - they live in the page footer instead,
+// keeping a conceptual split: top = offensive, bottom = defensive.
+
+import MitreTag from './MitreTag.astro';
+import OwaspTag from './OwaspTag.astro';
+import CveTag from './CveTag.astro';
+import ImpactPill from './ImpactPill.astro';
+import NoiseBadge from './NoiseBadge.astro';
+import AIMenu from './AIMenu.astro';
+
+const { entry } = Astro.locals.starlightRoute;
+const title = entry.data.title;
+const mitreIds: string[] = (entry.data as any).mitre ?? [];
+const owaspIds: string[] = (entry.data as any).owasp ?? [];
+const cveIds: string[] = (entry.data as any).cve ?? [];
+const impactIds: string[] = (entry.data as any).impact ?? [];
+const noise: 'stealth' | 'moderate' | 'loud' | undefined = (entry.data as any).noise;
+
+const hasAnyTags =
+  mitreIds.length > 0 ||
+  owaspIds.length > 0 ||
+  cveIds.length > 0 ||
+  impactIds.length > 0 ||
+  !!noise;
+---
+
+<div class="codex-page-header">
+  <div class="codex-page-header__top">
+    <h1 id="_top" class="codex-page-title">{title}</h1>
+    <AIMenu />
+  </div>
+
+  {hasAnyTags && (
+    <div class="codex-page-tags-row">
+      {/* Order: NOISE → MITRE → OWASP → CVE → Impact.
+          Noise comes first because it's the operational gate - operators
+          decide whether to read further based on whether they can use
+          the technique under their current rules of engagement. */}
+      {noise && <NoiseBadge level={noise} />}
+      {mitreIds.map((id) => <MitreTag id={id} />)}
+      {owaspIds.map((id) => <OwaspTag id={id} />)}
+      {cveIds.map((id) => <CveTag id={id} />)}
+      {impactIds.map((id) => <ImpactPill id={id} />)}
+    </div>
+  )}
+</div>
+
+<style>
+  .codex-page-header {
+    margin-bottom: 0.5rem;
+  }
+
+  .codex-page-header__top {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 1rem;
+    flex-wrap: wrap;
+  }
+
+  .codex-page-title {
+    font-family: var(--codex-font-mono);
+    font-size: 1.75rem;
+    font-weight: 500;
+    letter-spacing: -0.01em;
+    margin: 0;
+    color: var(--codex-text);
+    flex: 1;
+    min-width: 0;
+  }
+
+  /* Single flex-wrap row holding all four pill types. The pills themselves
+     have margin-right/bottom built in so they wrap onto multiple lines
+     cleanly on narrow viewports. */
+  .codex-page-tags-row {
+    margin-top: 0.6rem;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+
+  @media (max-width: 640px) {
+    .codex-page-header__top {
+      flex-direction: column;
+      align-items: stretch;
+    }
+  }
+</style>

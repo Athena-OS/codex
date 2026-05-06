@@ -1,0 +1,54 @@
+---
+// src/components/Placeholder.astro
+//
+// Renders a styled placeholder token like <TARGET> or <USER> that the
+// reader is expected to replace with their own value during use.
+//
+// Usage in .mdx:
+//   import Placeholder from '@components/Placeholder.astro';
+//   Inject into the <Placeholder name="PARAM" /> field of <Placeholder name="TARGET" />.
+//
+// Tooltip via the optional `hint` prop:
+//   <Placeholder name="DC_IP" hint="IP address of the domain controller" />
+
+interface Props {
+  name: string;
+  hint?: string;
+}
+
+const { name, hint } = Astro.props;
+---
+
+<code
+  class="codex-placeholder"
+  data-placeholder={name}
+  title={hint ?? `Replace with your ${name.toLowerCase()} value`}
+>&lt;{name}&gt;</code>
+
+<style>
+  .codex-placeholder {
+    color: var(--sl-color-accent-high, #b48ead);
+    background-color: var(--sl-color-accent-low, rgba(180, 142, 173, 0.1));
+    border: 1px dashed var(--sl-color-accent, #b48ead);
+    border-radius: 0.25rem;
+    padding: 0 0.25rem;
+    font-size: 0.9em;
+    font-weight: 600;
+    cursor: help;
+    white-space: nowrap;
+  }
+
+  /* Subtle hover for interactivity affordance */
+  .codex-placeholder:hover {
+    background-color: var(--sl-color-accent, rgba(180, 142, 173, 0.2));
+    color: var(--sl-color-white, #fff);
+  }
+
+  /* Reduce visual weight when nested inside <code> blocks already */
+  :global(pre) .codex-placeholder,
+  :global(code) .codex-placeholder {
+    border: none;
+    background: transparent;
+    padding: 0;
+  }
+</style>

@@ -1,0 +1,63 @@
+---
+// src/components/Head.astro
+//
+// Custom <head> override for Starlight.
+//   - Loads JetBrains Mono + Inter webfonts
+//   - Forces dark theme (codex is dark-only)
+//
+// THE DARK-ONLY LOCK (don't simplify):
+//
+// Starlight injects its own StarlightThemeProvider script that reads
+// localStorage.getItem('starlight-theme') OR prefers-color-scheme and writes
+// data-theme onto <html>. If the OS reports prefers-color-scheme: light,
+// Starlight flips data-theme=light and the page renders with Starlight's
+// light tokens - which makes the search bar white, etc.
+//
+// Setting data-theme=dark ourselves isn't enough because Starlight's script
+// runs after ours and overwrites it. The fix is to write
+// localStorage['starlight-theme'] = 'dark' BEFORE Starlight's script runs;
+// Starlight checks localStorage first, finds 'dark', and uses that -
+// regardless of the OS preference.
+//
+// We also set data-theme directly (belt + braces in case localStorage is
+// unavailable, e.g. private mode, third-party cookie blocks).
+
+import Default from '@astrojs/starlight/components/Head.astro';
+---
+
+<!--
+  Theme lock - must come BEFORE <Default /> so this script executes before
+  Starlight's own theme-detection script in Head.astro's slot.
+-->
+<script is:inline>
+  (function () {
+    try {
+      // Force Starlight to see 'dark' in localStorage on every load.
+      // This pins the theme even if a previous version of the site (or
+      // any future code) wrote a different value.
+      localStorage.setItem('starlight-theme', 'dark');
+    } catch (e) {
+      // localStorage disabled (private mode, etc.) - fall through to the
+      // direct data-theme write below.
+    }
+    document.documentElement.dataset.theme = 'dark';
+  })();
+</script>
+
+<Default><slot /></Default>
+
+<!--
+  Second pass - re-assert data-theme AFTER <Default /> in case Starlight's
+  script (or any other in the head) tried to change it. Cheap & idempotent.
+-->
+<script is:inline>
+  document.documentElement.dataset.theme = 'dark';
+</script>
+
+<!-- JetBrains Mono + Inter webfonts -->
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link
+  rel="stylesheet"
+  href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@400;500;600&display=swap"
+/>

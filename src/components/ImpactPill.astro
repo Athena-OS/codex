@@ -1,0 +1,79 @@
+---
+// src/components/ImpactPill.astro
+//
+// Renders a small descriptive pill for an impact label (RCE, AuthBypass,
+// DataExfil, etc.). Unlike MitreTag/OwaspTag/CveTag, this is NOT a link -
+// it's purely descriptive, telling the reader what the technique can
+// achieve.
+//
+// Usage in .mdx frontmatter:
+//
+//   ---
+//   impact: [RCE]                          # SQLi → file ops
+//   impact: [AuthBypass]                   # SQLi → auth bypass
+//   impact: [DataExfil, CredentialTheft]   # SQLi → enumeration
+//   ---
+//
+// The component looks up the canonical label and tooltip from
+// src/data/impact.ts. Free-form strings (not in the lookup) are rendered
+// verbatim with no tooltip.
+
+import { impactLabel, impactDescription } from '@data/impact';
+
+interface Props {
+  /** Impact ID, e.g. "RCE", "AuthBypass" */
+  id: string;
+}
+
+const { id } = Astro.props;
+const label = impactLabel(id);
+const tooltip = impactDescription(id);
+---
+
+<span class="codex-impact-pill" title={tooltip || undefined}>
+  {/* Lightning bolt icon - represents "impact" / "what this achieves" */}
+  <svg
+    class="codex-impact-pill__icon"
+    width="11"
+    height="11"
+    viewBox="0 0 24 24"
+    fill="currentColor"
+    stroke="currentColor"
+    stroke-width="0"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    aria-hidden="true"
+  >
+    <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
+  </svg>
+  <span class="codex-impact-pill__label">{label}</span>
+</span>
+
+<style>
+  .codex-impact-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    background: var(--codex-accent-soft);
+    color: var(--codex-accent);
+    padding: 4px 10px;
+    border-radius: var(--codex-radius-sm);
+    font-size: 11px;
+    font-family: var(--codex-font-mono);
+    border: 1px solid var(--codex-accent-border);
+    line-height: 1.3;
+    margin-right: 6px;
+    margin-bottom: 6px;
+    vertical-align: middle;
+    cursor: help; /* Indicates the tooltip is available */
+  }
+
+  .codex-impact-pill__icon {
+    flex-shrink: 0;
+    opacity: 0.85;
+  }
+
+  .codex-impact-pill__label {
+    font-weight: 500;
+  }
+</style>

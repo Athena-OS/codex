@@ -1,0 +1,282 @@
+---
+title: Situational Awareness
+description: First-fifteen-minutes enumeration of a Windows host - network configuration (ipconfig, arp, route), defensive products in play (Defender status, EDR processes), and application-whitelisting policies (AppLocker, WDAC, Constrained Language Mode) that will dictate which escalation paths are viable. The point is to orient before acting, so subsequent tool drops and exploit attempts land in the right context instead of tripping alerts.
+mitre: [T1016, T1518.001, T1082]
+d3fend: [D3-SYSM]
+impact: [Discovery, Reconnaissance]
+owasp: []
+sidebar:
+  order: 2
+  label: Situational awareness
+---
+
+## TL;DR
+
+Before running any tool or attempting any escalation primitive, know what's between you and the goal. Three categories: network position (where this host sits, what it can reach), defensive products (what's watching, what blocks), and policy posture (what's allowed to run, in what language mode). Skip this step and the first noisy tool drop burns the engagement.
+
+```
+# Network position
+ipconfig /all                              # interfaces, DNS, domain suffix
+arp -a                                     # recently contacted hosts
+route print                                # routing - dual-homed?
+netstat -ano                               # local listening + established
+
+# Defensive products
+Get-MpComputerStatus                       # Windows Defender state
+Get-Process | ? { $_.Company -match 'Crowd|Cylance|Carbon|Sentinel|McAfee|Symantec' }
+sc query                                   # all services - look for AV/EDR
+Get-Service | ? { $_.Status -eq 'Running' } | Select Name,DisplayName
+
+# Policy posture
+Get-AppLockerPolicy -Effective             # what's allowed to run
+$ExecutionContext.SessionState.LanguageMode  # PowerShell language mode
+reg query HKLM\Software\Policies\Microsoft\Windows\DeviceGuard  # WDAC
+```
+
+Success indicator: you can answer three questions before doing anything else - "what network is this on", "what AV/EDR is watching", "what application policy is in effect".
+
+## Network position
+
+Knowing the host's network position determines whether escalation is even the right move. A dual-homed host with an interface on a management VLAN may be more valuable for *lateral movement* than for local privilege escalation. A standalone host with one interface and no domain join is a fundamentally different operational target than a domain-joined workstation on the user VLAN.
+
+### Interfaces and addresses
+
+```cmd
+C:\> ipconfig /all
+```
+
+Read for:
+
+- **Number of interfaces** - Multiple Ethernet adapters mean the host bridges networks. Note each interface's IP, mask, gateway.
+- **DNS Suffix Search List** - Tells you the AD domain(s) this host knows about. `.htb` or `corp.example.com` in the search list points at the AD environment.
+- **Primary DNS Suffix** - The host's own domain membership. Empty = workgroup machine; populated = domain-joined.
+- **DNS Servers** - Often Domain Controllers in AD environments. The DCs are obvious targets once you have credentials.
+- **Connection-specific DNS Suffix per adapter** - Each interface may be in a different DNS zone, confirming dual-homed hosts.
+
+A dual-homed Server 2016 with one NIC on `192.168.20.0/24` and another on `10.129.0.0/16` is bridging environments - possibly a management network, a backup network, or a different security zone. Document it and note for pivot planning.
+
+### ARP cache - who has this host been talking to
+
+```cmd
+C:\> arp -a
+```
+
+The ARP table reveals hosts that have recently exchanged traffic with this one. Hosts in the cache are either gateways/services *or* hosts that admins regularly RDP/WinRM into from here. The latter set is high-signal for credential-hunting later: if `10.129.43.12` and `10.129.43.13` are in the ARP table of a sysadmin workstation, those are likely admin-accessed servers.
+
+### Routing - second-order networks
+
+```cmd
+C:\> route print
+```
+
+The routing table tells you what *other* networks this host can reach. Look at the IPv4 Route Table for:
+
+- **Multiple default routes** (`0.0.0.0`) - Almost always indicates a dual-homed host with both interfaces having gateways. The metric values control which interface traffic prefers.
+- **Persistent routes** - Static routes configured by admins. If `192.168.20.0/24 → 10.129.0.5` is persistent, somebody set it deliberately; that network is reachable via that gateway.
+- **Non-obvious networks** - Routes to `172.16.0.0/12` or `10.0.0.0/8` blocks when the host's IP is in `192.168.x.x` suggest VPN connections or site-to-site links.
+
+The combination of interfaces, ARP cache, and routing tells you the host's *reachable surface*. If the engagement requires lateral movement, this is the first place to look.
+
+### Open ports - what's listening here
+
+```cmd
+C:\> netstat -ano
+```
+
+Read for:
+
+- **Localhost-only listeners** (`127.0.0.1:port`) - Services accessible only from this host. These are often unauthenticated because "they aren't accessible from the network." Common targets: SQL Server admin interfaces, message brokers (RabbitMQ on `25672`, Erlang nodes), FileZilla admin (`14147`), local web admin panels.
+- **Established connections to external IPs** - Tells you what the host normally connects to. C2 beacons stand out against this baseline.
+- **Listening processes** - `netstat -ano` shows the PID; cross-reference with `tasklist /svc` or `Get-Process` to find the binary.
+
+For the FileZilla example, `127.0.0.1:14147` is the FileZilla Server administrative interface. If accessible (and credentials are guessable or default), it can be used to create FTP shares at `C:\` running as the FileZilla service account - often Administrator.
+
+The Splunk Universal Forwarder pattern is similar: default management port `8089` running as SYSTEM, no authentication in older default configs, allows arbitrary script deployment via the forwarder agent. Worth checking even on modern hosts.
+
+## Defensive products
+
+Knowing what's watching changes what's safe to do.
+
+### Windows Defender
+
+```powershell
+PS> Get-MpComputerStatus
+```
+
+Important fields:
+
+- `RealTimeProtectionEnabled` - `True` means files written to disk get scanned immediately. Tools dropped to `C:\Windows\Temp\winPEAS.exe` get caught before they run.
+- `AntivirusEnabled` / `AMServiceEnabled` - Defender service active.
+- `BehaviorMonitorEnabled` - Behavioral detection beyond signatures. Catches living-off-the-land patterns even when binaries aren't signatured.
+- `IoavProtectionEnabled` - Office macro and downloaded-attachment scanning.
+- `OnAccessProtectionEnabled` - Files scanned when accessed (read or write).
+- `NISEnabled` - Network Inspection System; scans network traffic for known exploits.
+- `AntivirusSignatureLastUpdated` - How current the signatures are. Stale signatures (months old) mean tools likely won't trigger.
+- `LastFullScanSource` / `QuickScanAge` - When the last scan ran. A host that's been on for months with no scans behaves differently than a freshly imaged one.
+
+Defender disabled entirely shows as `AMServiceEnabled : False`. In hardened environments this is unusual; in lab/test environments it's common.
+
+### Third-party AV / EDR
+
+Default Defender is the lowest-friction case. Real engagements often have layered detection:
+
+```powershell
+# Process-based detection
+PS> Get-Process | Where-Object { $_.Company -match 'CrowdStrike|Cylance|Carbon|SentinelOne|McAfee|Symantec|Trend|Sophos|FireEye|Tanium|VMware' } | Select Name,Company
+
+# Service-based detection
+PS> Get-Service | Where-Object { $_.DisplayName -match 'CrowdStrike|Cylance|Carbon|SentinelOne|McAfee|Symantec|Trend|Sophos|FireEye|Tanium' } | Select Name,DisplayName,Status
+
+# Driver-based detection (kernel drivers tied to EDR)
+PS> Get-CimInstance Win32_SystemDriver | Where-Object { $_.DisplayName -match 'CrowdStrike|Cylance|Carbon|SentinelOne|FireEye' } | Select Name,DisplayName,State
+```
+
+Indicator processes by vendor:
+
+| Vendor | Process / Driver |
+| --- | --- |
+| CrowdStrike Falcon | `CSFalconService.exe`, `CSAgent.sys` |
+| Cylance | `CylanceSvc.exe`, `CyOptics.exe` |
+| Carbon Black | `cb.exe`, `CarbonBlack.exe`, `carbonblackk.sys` |
+| SentinelOne | `SentinelAgent.exe`, `SentinelHelperService.exe` |
+| McAfee MVISION | `mcshield.exe`, `masvc.exe` |
+| Symantec / Norton | `ccSvcHst.exe`, `smc.exe` |
+| Microsoft Defender for Endpoint | `MsSense.exe`, `SenseIR.exe` (in addition to `MsMpEng.exe`) |
+| Tanium | `TaniumClient.exe` |
+| VMware Carbon Black Cloud | `RepMgr.exe`, `RepUtils.exe` |
+
+The presence of these doesn't mean every tool will be caught - it means you should *expect* baseline detections on known-malicious binaries (mimikatz, procdump, Rubeus) and plan accordingly: rename, recompile, or use built-in commands where possible.
+
+`MsSense.exe` and `SenseIR.exe` specifically indicate **Microsoft Defender for Endpoint** - the cloud-based EDR Microsoft layers on top of regular Defender. Behavioral detection here is sharper than baseline Defender by a wide margin.
+
+### Sysmon
+
+Sysmon is a free Sysinternals tool that adds rich logging (process creation with command lines, file writes, network connections, DLL loads, named pipe creation). If it's deployed, your enumeration commands are being logged with high fidelity.
+
+```powershell
+PS> Get-Service | Where-Object { $_.Name -eq 'Sysmon' -or $_.Name -eq 'Sysmon64' }
+PS> Get-CimInstance Win32_SystemDriver | Where-Object { $_.Name -match 'SysmonDrv' }
+```
+
+If Sysmon is running, assume command-line logging is on (event 4688 + Sysmon event 1) and adjust accordingly - fewer enumeration commands, more reliance on what's already in your context.
+
+## Policy posture
+
+The "what can I actually run" question.
+
+### AppLocker
+
+AppLocker enforces application whitelisting by path, publisher, or hash. Common configuration: allow everything in `C:\Program Files\` and `C:\Windows\` for everyone, allow everything for `BUILTIN\Administrators`, deny everything else.
+
+```powershell
+PS> Get-AppLockerPolicy -Effective | Select -ExpandProperty RuleCollections
+```
+
+The output shows multiple rule collections (Exe, Msi, Script, Dll, Appx) each containing rules. Read for:
+
+- **Default rules** - `(Default Rule) All files located in the Program Files folder`, `(Default Rule) All files located in the Windows folder`, and `(Default Rule) All files` (admins-only) are the textbook permissive default set. Most environments keep these.
+- **Custom rules** - Anything else is a deliberate restriction. Particularly interesting: rules denying specific paths (suggests admins know about a previously-abused location) or hash-based rules (specific binaries blocked).
+- **Allowed exceptions** - Some environments allow specific signed publishers. If a tool can be signed by a trusted publisher, it's allowed.
+
+To test whether a specific binary would run before trying:
+
+```powershell
+PS> Get-AppLockerPolicy -Local | Test-AppLockerPolicy -Path C:\Windows\System32\cmd.exe -User Everyone
+
+FilePath                    PolicyDecision MatchingRule
+--------                    -------------- ------------
+C:\Windows\System32\cmd.exe         Denied c:\windows\system32\cmd.exe
+```
+
+The `PolicyDecision` field tells you exactly what happens at execution time. `Denied` means the binary won't run for that user; `Allowed` means it will. Test before running tool drops.
+
+Common AppLocker bypass classes - pick based on what's blocked:
+
+- **Microsoft-signed LOLBins** (`rundll32`, `regsvr32`, `mshta`, `installutil`) often allowed via default rules even when arbitrary `.exe` is denied
+- **Writable subdirectories within allowed paths** - sometimes `C:\Windows\Tasks\` or `C:\Windows\Temp\` is writable by users and within an allowed path
+- **DLL hijacking** - if `.dll` rules don't enforce path the same way as `.exe`, drop a DLL into an allowed path and load via `rundll32`
+
+### WDAC / Device Guard
+
+Windows Defender Application Control is the stronger successor to AppLocker. It enforces at the kernel level and is harder to bypass.
+
+```cmd
+C:\> reg query HKLM\Software\Policies\Microsoft\Windows\DeviceGuard
+```
+
+Or with PowerShell:
+
+```powershell
+PS> Get-CimInstance -ClassName Win32_DeviceGuard -Namespace root\Microsoft\Windows\DeviceGuard
+```
+
+Look at `SecurityServicesConfigured` and `SecurityServicesRunning` - these are arrays. Values include `0` (none), `1` (Credential Guard), `2` (HVCI - Hypervisor-protected Code Integrity), `3` (System Guard), `4` (Application Control / WDAC). A `4` in `SecurityServicesRunning` means WDAC is enforcing.
+
+WDAC's kernel-mode enforcement breaks most "drop a binary, execute it" patterns. Operational reality: in WDAC environments, lean heavily on built-in commands, PowerShell (if not in Constrained Language Mode - see below), and living-off-the-land techniques.
+
+### PowerShell Language Mode
+
+PowerShell has multiple language modes. **Constrained Language Mode (CLM)** is a security feature that restricts PowerShell to a safe subset of operations - no .NET method invocations, no COM objects, no Add-Type, no use of types beyond a whitelist. Most offensive PowerShell scripts (PowerView, PowerUp, Mimikatz invocations) fail in CLM.
+
+```powershell
+PS> $ExecutionContext.SessionState.LanguageMode
+FullLanguage
+```
+
+Values:
+
+- `FullLanguage` - Everything works. Normal PowerShell.
+- `ConstrainedLanguage` - Restricted. Offensive tooling broken.
+- `RestrictedLanguage` - Even more restricted. Rare.
+- `NoLanguage` - Used internally.
+
+If you see `ConstrainedLanguage`, expect most PowerShell-based tooling to fail. Workarounds include:
+
+- Use PowerShell v2 (`powershell -version 2`) - older versions don't enforce CLM (often disabled in hardened environments, but worth checking)
+- Use built-in cmdlets and basic constructs that survive CLM (file enumeration, process listing, registry queries)
+- Drop to `cmd.exe` and use Windows binaries directly
+- Use C# tooling (compiled binaries) - CLM only affects PowerShell
+
+### AMSI
+
+The Anti-Malware Scan Interface inspects script content (PowerShell, VBA, JScript, .NET) before execution. AMSI bypass is its own deep topic - for situational awareness, just know that if Defender or another AMSI-integrated AV is active, scripts get inspected.
+
+Quick check that AMSI is loaded into the current PowerShell session:
+
+```powershell
+PS> [Ref].Assembly.GetType('System.Management.Automation.AmsiUtils')
+```
+
+If this returns a `Type` object, AMSI is present. (The return value isn't itself useful; the presence of the type is the signal.) AMSI bypasses are a long-running cat-and-mouse - public ones get signatured quickly. For situational awareness purposes, *expect* AMSI inspection on any modern Windows 10+ host with Defender active.
+
+## Operational sequence
+
+The recommended order for the first 5-10 minutes on a new shell:
+
+1. `whoami` and `whoami /priv` - your identity and what privileges you already hold (see [Initial enumeration](/codex/windows/privesc/initial-enumeration/))
+2. `ipconfig /all`, `arp -a`, `route print` - network position
+3. `tasklist /svc` filtered for AV/EDR processes - what's watching
+4. `Get-AppLockerPolicy -Effective | Select -ExpandProperty RuleCollections` - what's allowed
+5. `$ExecutionContext.SessionState.LanguageMode` - PowerShell mode
+
+Five commands, one minute, complete operational picture. Skip these and the first tool drop tells you the answers the loud way.
+
+## Quick reference
+
+| Task | Command |
+| --- | --- |
+| Network interfaces + DNS | `ipconfig /all` |
+| Recent ARP entries | `arp -a` |
+| Routing table | `route print` |
+| Open ports / processes | `netstat -ano` |
+| Defender status | `Get-MpComputerStatus` |
+| AV/EDR process check | `Get-Process \| ? Company -match 'CrowdStrike\|Cylance\|Carbon\|Sentinel'` |
+| Service-based EDR check | `Get-Service \| ? DisplayName -match 'CrowdStrike\|Cylance\|Carbon\|Sentinel'` |
+| Sysmon presence | `Get-Service Sysmon, Sysmon64` |
+| AppLocker effective policy | `Get-AppLockerPolicy -Effective \| Select -ExpandProperty RuleCollections` |
+| Test if binary allowed | `Get-AppLockerPolicy -Local \| Test-AppLockerPolicy -Path PATH -User Everyone` |
+| WDAC / Device Guard status | `Get-CimInstance -CN Win32_DeviceGuard -NS root\Microsoft\Windows\DeviceGuard` |
+| PowerShell language mode | `$ExecutionContext.SessionState.LanguageMode` |
+| AMSI presence | `[Ref].Assembly.GetType('System.Management.Automation.AmsiUtils')` |
+
+Once oriented, proceed to [Initial enumeration](/codex/windows/privesc/initial-enumeration/) for system, user, and patch-level data.

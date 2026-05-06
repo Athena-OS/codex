@@ -1,0 +1,126 @@
+---
+title: IDOR
+description: Operator reference for Insecure Direct Object Reference attacks - when the app exposes a controllable handle to a resource (file ID, user ID, document hash) and lacks server-side access control to verify that the caller is permitted to use that handle.
+mitre: [T1190, T1213]
+d3fend: [D3-IAA]
+impact: [DataExfil, AuthBypass, AccountTakeover]
+owasp: [A01]
+sidebar:
+  order: 1
+  label: Overview
+---
+
+## TL;DR
+
+IDOR is one bug masquerading as two: **the app exposes a direct handle to a resource** (`?file_id=123`, `/api/profile/74`, `?contract=<md5>`), and **the back-end doesn't check whether the caller is authorized to use that handle.** Substitute someone else's identifier and you get their data - or perform actions in their name.
+
+```
+# Identify a direct reference in a URL, body, or header
+?file_id=123     /api/profile/74    Cookie: uid=1     contract=cdd9...
+
+# Substitute and observe
+curl 'http://target/download.php?file_id=124'    # someone else's file?
+curl 'http://target/api/profile/75'              # someone else's profile?
+
+# Mass-enumerate when the pattern is sequential
+for i in $(seq 1 1000); do
+    curl -s "http://target/api/profile/$i" >> all-profiles.json
+done
+
+# When the handle is hashed or encoded, find the algorithm
+echo -n '1' | base64 | md5sum    # often the answer is in the front-end JS
+```
+
+Success indicator: a resource (file, record, action result) you should not have access to comes back as if it were yours.
+
+## What IDOR actually is
+
+Two ingredients, both required:
+
+1. **Direct object reference** - a handle in a request that names a specific resource (file, record, account, action). The handle is in client-controlled space: URL parameter, path segment, header, cookie, body field.
+2. **Missing access control** - the server treats the handle as authoritative, looking up the resource without first checking "is the *caller* allowed to touch this resource?"
+
+The "Insecure" in IDOR modifies the access control, not the reference. Direct object references are normal and necessary - the bug is the missing authorization layer. A perfectly secure app can use sequential integer IDs in its URLs, provided every request hits an access-control check that compares the caller's identity to the resource's ACL.
+
+Apps fail this in three common ways:
+
+| Failure | Example |
+| --- | --- |
+| No access control at all | `/api/profile/74` returns user 74's data to *anyone* who asks |
+| Access control only in the UI | The UI hides the "edit other users" button; the back-end happily processes the request if you send it |
+| Access control only on some verbs | GET `/api/profile/74` checks; PUT `/api/profile/74` doesn't - see [Verb tampering](/codex/web/auth/verb-tampering/) |
+
+## Two flavors of IDOR
+
+The operator should distinguish these because the impact and the exploitation workflow are different:
+
+| Flavor | What it does | Operator workflow |
+| --- | --- | --- |
+| **Information disclosure** | Read resources you shouldn't see - files, records, profile fields, internal state | Substitute the reference, dump the response, iterate to enumerate everything |
+| **Insecure function call** | Perform actions you shouldn't be able to - change someone else's password, delete records, escalate role | Substitute the reference *and* construct a request to the action endpoint; chain with disclosure to learn required parameters (other user's uuid, role names, etc.) |
+
+The two often chain: disclosure leaks the values you need (the victim's uuid, the admin role name, the file hash format) to invoke the function call.
+
+## Where the reference lives
+
+Look in this order - the first three account for most findings:
+
+| Location | Example | Notes |
+| --- | --- | --- |
+| **URL query** | `?uid=1`, `?file_id=123` | Most common; visible in browser; easiest to fuzz |
+| **URL path** | `/users/74`, `/files/abc123.pdf` | REST APIs favor this; same risk |
+| **Request body** | `{"uid": 74, "uuid": "40f5..."}` | API mutations; check both the JSON keys *and* hidden form fields |
+| **Header** | `Cookie: uid=1`, `X-User-Id: 1`, `Authorization: Bearer ...` | Sometimes the only auth signal; the bearer token, if not bound to the resource, lets any logged-in user read anyone's data |
+| **AJAX call in JS** | `fetch('/api/admin/users')` triggered only when role=admin | Read the front-end JS - find function-call references the server might accept from any session |
+
+The front-end JS angle deserves emphasis. Many SPAs put the *whole* function catalog in JS and gate each call by role on the client. Read the JS, find the admin-only function:
+
+```javascript
+function changeUserPassword() {
+    $.ajax({
+        url: "change_password.php",
+        type: "post",
+        data: {uid: user.uid, password: user.password, is_admin: is_admin},
+        ...
+    });
+}
+```
+
+The JS only invokes this when the user is admin. But the back-end endpoint accepts requests from anyone - that's the IDOR. The discovery method is reading the bundle, not poking the UI.
+
+## Why IDOR is so common
+
+Building an access-control system is a separate cross-cutting concern that has to be designed in from the start. RBAC (role-based access control), ABAC (attribute-based), or per-row ACLs are non-trivial to retrofit. Apps that grow organically tend to accumulate authentication (knowing who you are) without authorization (knowing what you're allowed to do at the resource level).
+
+The result: IDOR is one of the most common findings in modern web apps, including [Facebook](https://infosecwriteups.com/disclose-private-attachments-in-facebook-messenger-infrastructure-15-000-ae13602aa486), [Instagram](https://infosecwriteups.com/add-description-to-instagram-posts-on-behalf-of-other-users-6500-7d55b4a24c5a), and [Twitter](https://medium.com/@kedrisec/publish-tweets-by-any-other-user-6c9d892708e3).
+
+## Impact spectrum
+
+| Severity | Example |
+| --- | --- |
+| Low | Disclosure of public-ish data (other users' display names, profile pictures already shared elsewhere) |
+| Medium | Disclosure of internal data (other users' email addresses, internal IDs, account creation dates) |
+| High | Disclosure of sensitive personal data (credit cards, SSNs, addresses, private messages, uploaded documents) |
+| Critical | Account takeover (change another user's password, email, recovery token); privilege escalation (set your own role to admin); mass data manipulation |
+
+The "Critical" tier is where chained IDORs land. Information-disclosure IDOR + function-call IDOR + role-name leak together = unauthenticated admin compromise.
+
+## What this cluster covers
+
+| Page | Focus |
+| --- | --- |
+| [Identifying](/codex/web/idor/identifying/) | Where to find direct object references, AJAX-call discovery, hash/encoding inspection, comparing roles across test accounts |
+| [Mass enumeration](/codex/web/idor/mass-enumeration/) | Burp Intruder / ffuf / scripted bulk pulls; reversing MD5-of-base64-style "hashed" references |
+| [Insecure APIs](/codex/web/idor/insecure-apis/) | REST verb-by-verb attack surface (PUT/POST/DELETE on user objects), uid-mismatch / uuid-mismatch defense bypass, role-field manipulation |
+| [Chaining](/codex/web/idor/chaining/) | End-to-end: GET disclosure → uuid harvest → PUT modification → role escalation → admin function calls |
+
+## Cross-cluster references
+
+| Topic | Page |
+| --- | --- |
+| Verb-tampering bypasses (auth scoped to GET/POST only) | [Verb tampering](/codex/web/auth/verb-tampering/) |
+| Session attacks that often follow IDOR disclosure | [Sessions cluster](/codex/web/sessions/) |
+| When a leaked file URL points to disk content | [LFI cluster](/codex/web/lfi/) |
+| XSS payloads delivered via IDOR-modified profile fields | [XSS to session](/codex/web/sessions/xss-to-session/) |
+| Password reset flow chained with IDOR-modified email | [Reset tokens](/codex/web/auth/reset-tokens/) |
+| XXE for back-end file disclosure after IDOR foothold | [XXE cluster](/codex/web/xxe/) |

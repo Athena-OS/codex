@@ -1,0 +1,140 @@
+---
+// src/components/D3fendTag.astro
+//
+// Renders a badge linking to the official MITRE D3FEND page for a
+// defensive technique. Used in the page FOOTER (not the header) to
+// pair offensive techniques with their canonical defensive countermeasures.
+//
+// Conceptual split:
+//   - Top of page: offensive context (MITRE ATT&CK, OWASP, CVE, Impact)
+//   - Bottom of page: defensive context (MITRE D3FEND)
+//
+// Usage in .mdx frontmatter:
+//
+//   ---
+//   d3fend: [D3-MH, D3-MA, D3-NTA]
+//   ---
+//
+// The component looks up the canonical name and URL from src/data/d3fend.ts.
+//
+// Visual treatment is more muted than the header pills - defensive content
+// is reference material, not the main story of the page. Less border,
+// slightly dimmer color.
+
+import { d3fendName, d3fendUrl } from '@data/d3fend';
+
+interface Props {
+  /** D3FEND ID, e.g. "D3-AH" (Application Hardening) */
+  id: string;
+}
+
+const { id } = Astro.props;
+const name = d3fendName(id);
+const url = d3fendUrl(id);
+const tooltip = name
+  ? `View ${id} (${name}) on MITRE D3FEND`
+  : `View ${id} on MITRE D3FEND`;
+---
+
+<a
+  href={url}
+  class="codex-d3fend-tag"
+  target="_blank"
+  rel="noopener noreferrer"
+  title={tooltip}
+>
+  {/* Shield-half icon - visually pairs with the MITRE shield but suggests "defense" */}
+  <svg
+    class="codex-d3fend-tag__icon"
+    width="11"
+    height="11"
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="2"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    aria-hidden="true"
+  >
+    <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
+    <path d="M12 2v20"></path>
+  </svg>
+  <span class="codex-d3fend-tag__id">{id}</span>
+  {name && <span class="codex-d3fend-tag__name">{name}</span>}
+  <svg
+    class="codex-d3fend-tag__external"
+    width="10"
+    height="10"
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="2"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    aria-hidden="true"
+  >
+    <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path>
+    <polyline points="15 3 21 3 21 9"></polyline>
+    <line x1="10" y1="14" x2="21" y2="3"></line>
+  </svg>
+</a>
+
+<style>
+  /* Defensive pill - more muted than the header pills (offensive content).
+     Uses surface/border instead of accent-soft, so the eye distinguishes
+     it from the ATT&CK/OWASP/CVE pills above. */
+  .codex-d3fend-tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: transparent;
+    color: var(--codex-text-muted);
+    padding: 3px 9px;
+    border-radius: var(--codex-radius-sm);
+    font-size: 11px;
+    font-family: var(--codex-font-mono);
+    text-decoration: none;
+    border: 1px solid var(--codex-border);
+    line-height: 1.3;
+    transition: all 0.15s ease;
+    margin-right: 6px;
+    margin-bottom: 6px;
+    vertical-align: middle;
+  }
+
+  .codex-d3fend-tag:hover {
+    background: var(--codex-surface);
+    border-color: var(--codex-border-strong);
+    color: var(--codex-text);
+  }
+
+  .codex-d3fend-tag:focus-visible {
+    outline: 2px solid var(--codex-accent);
+    outline-offset: 2px;
+  }
+
+  .codex-d3fend-tag__icon {
+    flex-shrink: 0;
+    opacity: 0.7;
+  }
+
+  .codex-d3fend-tag__id {
+    font-weight: 500;
+  }
+
+  .codex-d3fend-tag__name {
+    color: var(--codex-text-dim);
+    font-weight: 400;
+  }
+
+  .codex-d3fend-tag__external {
+    opacity: 0.5;
+    flex-shrink: 0;
+  }
+
+  @media (max-width: 640px) {
+    .codex-d3fend-tag__name {
+      display: none;
+    }
+  }
+</style>

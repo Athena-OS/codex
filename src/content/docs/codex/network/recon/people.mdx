@@ -1,0 +1,243 @@
+---
+title: People & Tech Stack
+description: Open-source intelligence on employees and job posts to infer the organization's internal technology stack, software preferences, security tooling, and weak points - without touching the target.
+mitre: [T1589, T1589.002, T1589.003, T1591, T1593, T1593.002]
+d3fend: []
+impact: [CredentialTheft, InternalAccess]
+sidebar:
+  order: 5
+  label: People & Tech Stack
+---
+
+## TL;DR
+
+The infrastructure you can scan only tells you what's externally visible. Job postings and employee profiles tell you what's *internally* used - programming languages, frameworks, databases, security tools, and the gaps in coverage. A 30-minute LinkedIn read on the engineering team's skills can reveal more about the internal stack than a week of port scanning.
+
+```
+1. LinkedIn search    → employees by role, location, company
+2. Job posts          → required & desired skills = internal tech stack
+3. GitHub             → org repos + employee personal repos → leaked secrets
+4. Conference talks   → senior engineers describe internal architecture
+5. Stack Overflow     → engineers post code snippets revealing internal patterns
+```
+
+Success indicator: an inferred internal tech-stack profile (languages, frameworks, databases, CI/CD, monitoring, security tooling) and a list of employees with verified GitHub accounts or personal projects worth auditing.
+
+## Why this matters
+
+Three reasons to invest time in people-recon:
+
+1. **Tech inference** - every external service tells you what's exposed. Every job post tells you what's deployed *internally*. The two together give a much fuller picture than either alone.
+2. **Targeted social engineering pretexts** - knowing the IT team uses Atlassian gives you a Jira-themed phishing template. Knowing the security team works in Splunk tells you not to bother trying to exfiltrate via DNS.
+3. **Credential leak discovery** - engineers post code, slides, and snippets publicly. A surprising amount of it contains hardcoded credentials, internal URLs, or sensitive paths.
+
+This work is invisible to the target. It's also the work that turns into the most reliable findings - credentials in a GitHub repo don't require any further exploitation step.
+
+## LinkedIn
+
+LinkedIn is the primary OSINT source for most engagements. The platform's search supports filtering by current/past company, role, location, school, language, and skills.
+
+### Search patterns that pay off
+
+Search for employees by:
+
+- **Company + IT/Security roles** - `"InlaneFreight" "DevOps"`, `"InlaneFreight" "SRE"`, `"InlaneFreight" "Security Engineer"`. These people configure the systems you'll attack.
+- **Specific technology** - `"InlaneFreight" "Kubernetes"`, `"InlaneFreight" "AWS"`, `"InlaneFreight" "Active Directory"`. Confirms what's in use.
+- **Recent joiners** - new hires often blog about their first month, name internal tools, mention specific projects.
+- **Recent leavers** - they may have updated their LinkedIn with very specific descriptions of what they built/owned ("led migration to Kubernetes 1.28").
+
+### What an employee profile reveals
+
+A senior backend engineer's profile might list:
+
+```
+Senior Backend Engineer at InlaneFreight (2019 - present)
+
+Skills: Python, Django, PostgreSQL, Redis, Docker, AWS,
+        Kafka, Elasticsearch, OAuth2, JWT, REST APIs
+
+Projects:
+- Migrated monolith to microservices on AWS EKS
+- Implemented OAuth2 / JWT-based auth across services
+- Built event-driven pipeline with Kafka + ksqlDB
+- Led PostgreSQL → Aurora migration
+
+Certifications: AWS Solutions Architect Associate
+```
+
+From this single profile:
+
+- **Framework**: Django (Python). Look for Django-typical paths - `/admin/`, `/api/v1/`, `static/admin/`. Default Django security misconfigurations are a known class.
+- **Database**: PostgreSQL on Aurora. Aurora exposure on the public internet (often via misconfigured RDS security groups) is a finding pattern worth checking.
+- **Auth**: OAuth2 + JWT. JWT misconfigurations (none/RS256 confusion, weak secrets, kid header injection) become priority test cases.
+- **Infrastructure**: AWS EKS (Kubernetes) - investigate exposed Kubernetes APIs, dashboards, kubelet ports on related IPs.
+- **Messaging**: Kafka - likely exposed on internal network; if external broker IPs leak, unauthenticated Kafka access is brutal.
+
+### Targeted vs. broad search
+
+For a black-box engagement (you only know the company name), spend an hour on broad search - get a sense of headcount, team structure, geographic distribution.
+
+For a focused engagement (specific application, specific team), narrow to engineers who own the system you're testing. A "Lead Frontend Engineer on Checkout" profile tells you exactly which Frontend Lead's GitHub to audit and what frontend framework checkout uses.
+
+## Job postings
+
+Job posts are the most explicit possible tech inventory the organization will ever publish.
+
+### Anatomy of a high-signal job post
+
+A real-world sample (paraphrased from HTB's example):
+
+```
+Required Skills:
+- 3-10+ years of software development experience
+- Object-oriented languages: Java, C#, C++
+- Scripting: Python, Ruby, PHP, Perl
+- SQL databases: PostgreSQL, MySQL, SQL Server, Oracle
+- ORM frameworks: SQLAlchemy, Hibernate, Entity Framework
+- Web frameworks: Flask, Django, Spring, ASP.NET MVC
+- Unit testing: pytest, JUnit, NUnit, xUnit
+- Service-Oriented Architecture / RESTful APIs
+- Version control: Git, SVN, Mercurial, Perforce
+
+Desired Skills:
+- CompTIA Security+ certification
+- Atlassian suite: Confluence, Jira, Bitbucket
+- Algorithm development (image processing)
+- Containerization: Docker, Kubernetes
+- Redis, NumPy
+```
+
+Inferences from this one post:
+
+- **Polyglot environment** - Java, C#, C++, Python, Ruby, PHP, Perl. Multiple language ecosystems = larger attack surface, more chance of forgotten legacy services in older languages.
+- **Multiple databases** - PostgreSQL, MySQL, SQL Server, Oracle. Each has its own default-credential patterns and version-specific CVEs.
+- **Multiple web frameworks** - Flask, Django (Python); Spring (Java); ASP.NET MVC (.NET). Frame-specific path discovery and misconfig checks for each.
+- **Atlassian suite confirmed** - Jira, Confluence, Bitbucket. Check for unauthenticated access to pages, ticket information disclosure, and known Atlassian CVEs.
+- **Version control diversity** - Git (most common), SVN (legacy), Mercurial (rare), Perforce (very specific - usually finance or game dev). Perforce specifically is worth flagging - its server has had several auth-related issues.
+- **No mention of Go, Rust, Node, or modern frontend frameworks** - backend-heavy team, traditional stack, likely a more mature/legacy codebase.
+
+### Where to find job posts
+
+- Company careers page (direct, current, comprehensive)
+- LinkedIn Jobs (same content, different formatting, often more historical posts visible)
+- Indeed, Glassdoor (sometimes catches reposts with different details)
+- Specialized boards: Stack Overflow Jobs, GitHub Jobs (defunct but archived), AngelList for startups
+- [archive.org Wayback Machine](https://web.archive.org/) - pulls historical job posts that may include technologies they've since migrated away from but still have in legacy infrastructure
+
+## GitHub
+
+Public GitHub repositories are an underrated source. The org's main GitHub account is the obvious target, but the real value is in *employees' personal accounts* - engineers often experiment with company technologies in their personal repos, sometimes accidentally including credentials.
+
+### Organization-level recon
+
+```shell
+# Browse the org's public repos
+https://github.com/<org-name>
+
+# Search the org for sensitive patterns
+"org:inlanefreight password"
+"org:inlanefreight token"
+"org:inlanefreight aws_secret_access_key"
+```
+
+GitHub's search API supports `org:`, `user:`, `path:`, `extension:`, and content searches. Combine for narrow queries:
+
+```
+org:inlanefreight extension:env
+org:inlanefreight filename:.env
+org:inlanefreight filename:config.json password
+org:inlanefreight filename:terraform.tfvars
+```
+
+### Employee-level recon
+
+For each engineer identified on LinkedIn, look up their GitHub. Personal repos sometimes include:
+
+- Side projects using company-developed internal libraries (revealed by import paths)
+- Code samples from interviews that match the company's coding standards (revealed by patterns)
+- "Learning" repos where they experimented with company-relevant technologies, sometimes with real internal hostnames or test credentials still in commit history
+- Dotfiles repos containing SSH config snippets with company hostnames
+
+A typical pattern that leaks information:
+
+```python
+# in a personal "data-pipeline-tutorial" repo
+DB_HOST = "prod-postgres-1.internal.inlanefreight.local"
+DB_USER = "data_pipeline"
+DB_PASSWORD = "<some_real_password>"
+```
+
+The engineer was building a quick tutorial. They used real values from work for "realism." They committed once, realized, force-pushed - but the commit hash is still in GitHub's archived event stream. [Tools like TruffleHog](https://github.com/trufflesecurity/trufflehog) and [Gitleaks](https://github.com/gitleaks/gitleaks) scan repositories for committed secrets including in historical commits.
+
+### Public Gists
+
+GitHub Gists are an even bigger leak surface than full repos because they feel "throwaway." Search:
+
+```
+"inlanefreight" site:gist.github.com
+```
+
+Or via the GitHub search API with `user:<engineer>` for each identified employee.
+
+## Conference talks, slides, blog posts
+
+Senior engineers publish. Their content often describes internal architecture in detail.
+
+- **Conference talks** - search YouTube for `"$COMPANY" "$CONFERENCE_NAME"`. KubeCon, DockerCon, AWS re:Invent, Black Hat talks by employees frequently include architecture diagrams.
+- **Company blog** - the engineering blog usually has multiple posts describing the production stack. Often includes data flow diagrams, technology choices, and lessons-learned posts that explicitly describe what *didn't* work (and is therefore the legacy infrastructure still in place).
+- **Personal blogs** - engineers write about their work. "How we scaled X" posts describe internal architecture in concrete detail.
+- **Slide decks on SlideShare, Speaker Deck** - often searchable by company name. Diagrams are gold.
+
+## Stack Overflow
+
+Engineers post questions on Stack Overflow. A question titled "Django 4.2 query optimization with our 300M row table" tells you the framework version, the rough data scale, and an architectural pain point. The answer (which they may have accepted) tells you what they implemented.
+
+For employees you've identified, check their Stack Overflow profiles. Many engineers maintain a profile from their work address (giving you their corporate email) and answer questions in their work domain (giving you the technologies they own).
+
+## Email format enumeration
+
+For employee names found on LinkedIn, the email format is usually:
+
+```
+firstname.lastname@inlanefreight.com
+flastname@inlanefreight.com
+firstinitiallast@inlanefreight.com
+```
+
+Verify a format works via:
+
+- **SMTP `VRFY` / `RCPT TO`** if the mail server allows it (see [SMTP](/codex/network/services/smtp/))
+- **Password reset flows** - many apps return different responses for known vs. unknown emails
+- **[Hunter.io](https://hunter.io/)** - already-known email format and verified addresses
+- **Email-format-guesser tools** - [theHarvester](https://github.com/laramies/theHarvester) automates this
+
+Once you know the format and have a list of employee names from LinkedIn, you have a list of valid email addresses. That list is the input to password-spray attacks against exposed Office 365 / Google Workspace logins, VPN portals, or any internal app that uses corporate email.
+
+## Putting it together
+
+A clean people-recon workflow:
+
+```
+1. LinkedIn - broad search        → headcount, geo, team structure
+2. LinkedIn - IT/Security/SRE     → tech ownership map
+3. Job posts                      → required + desired skills = internal stack
+4. GitHub org                     → public repos + secret scan
+5. GitHub employees               → personal repos with company tech
+6. Gists                          → throwaway code with real credentials
+7. Conference talks / slides      → architecture detail
+8. Blog posts                     → tech choices + lessons-learned
+9. Email format derivation        → list of valid addresses from employee names
+```
+
+The deliverable: a one-page profile of the organization's engineering culture, primary tech stack, security tooling investment, and a list of named employees with their GitHub handles and verified email addresses. From here, social engineering pretexts and credential-spray targeting both have firm foundations.
+
+## A note on operational security
+
+People-recon leaves footprints on the OSINT platforms themselves. Viewing a LinkedIn profile while logged in tells the profile owner you looked. Use:
+
+- An OSINT-dedicated LinkedIn account (separate from your real profile)
+- Private/incognito browsing for non-authenticated lookups
+- Search engine cache views or Wayback for profiles that have been deleted/locked
+- LinkedIn's "anonymous profile" setting if your account is the only viable option
+
+Same for GitHub - starring repos, forking, or watching an engineer's account creates a notification trail. Read; don't interact.

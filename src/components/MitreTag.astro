@@ -1,0 +1,141 @@
+---
+// src/components/MitreTag.astro
+//
+// Renders a small badge linking to the official MITRE ATT&CK page for a
+// technique. Used at the top of every Codex page that maps to one or more
+// MITRE techniques.
+//
+// Usage in .mdx:
+//   import MitreTag from '@components/MitreTag.astro';
+//   <MitreTag id="T1190" />
+//   <MitreTag id="T1059.004" />
+//
+// The component looks up the canonical name from src/data/mitre.ts. If the
+// ID isn't in the lookup table, it falls back to showing just the ID with a
+// generic "View on MITRE" tooltip.
+//
+// For multiple techniques on one page, render multiple <MitreTag /> in a row:
+//   <div class="mitre-tags">
+//     <MitreTag id="T1190" />
+//     <MitreTag id="T1199" />
+//   </div>
+// Or use the convenience wrapper <MitreTags /> which accepts an array.
+
+import { mitreUrl, mitreName } from '@data/mitre';
+
+interface Props {
+  /** MITRE technique ID, e.g. "T1190" or "T1059.001" */
+  id: string;
+  /**
+   * Optional override for the displayed name.
+   * If not provided, looked up from src/data/mitre.ts.
+   */
+  name?: string;
+}
+
+const { id, name: nameOverride } = Astro.props;
+const name = nameOverride ?? mitreName(id);
+const url = mitreUrl(id);
+const tooltip = name
+  ? `View ${id} (${name}) on MITRE ATT&CK`
+  : `View ${id} on MITRE ATT&CK`;
+---
+
+<a
+  href={url}
+  class="codex-mitre-tag"
+  target="_blank"
+  rel="noopener noreferrer"
+  title={tooltip}
+>
+  <svg
+    class="codex-mitre-tag__icon"
+    width="11"
+    height="11"
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="2"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    aria-hidden="true"
+  >
+    <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
+  </svg>
+  <span class="codex-mitre-tag__id">{id}</span>
+  {name && <span class="codex-mitre-tag__name">{name}</span>}
+  <svg
+    class="codex-mitre-tag__external"
+    width="10"
+    height="10"
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="2"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    aria-hidden="true"
+  >
+    <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path>
+    <polyline points="15 3 21 3 21 9"></polyline>
+    <line x1="10" y1="14" x2="21" y2="3"></line>
+  </svg>
+</a>
+
+<style>
+  .codex-mitre-tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: var(--codex-accent-soft);
+    color: var(--codex-accent);
+    padding: 4px 10px;
+    border-radius: var(--codex-radius-sm);
+    font-size: 11px;
+    font-family: var(--codex-font-mono);
+    text-decoration: none;
+    border: 1px solid var(--codex-accent-border);
+    line-height: 1.3;
+    transition: all 0.15s ease;
+    margin-right: 6px;
+    margin-bottom: 6px;
+    vertical-align: middle;
+  }
+
+  .codex-mitre-tag:hover {
+    background: var(--codex-accent-softer);
+    border-color: var(--codex-accent-border-strong);
+    transform: translateY(-1px);
+  }
+
+  .codex-mitre-tag:focus-visible {
+    outline: 2px solid var(--codex-accent);
+    outline-offset: 2px;
+  }
+
+  .codex-mitre-tag__icon {
+    flex-shrink: 0;
+    opacity: 0.85;
+  }
+
+  .codex-mitre-tag__id {
+    font-weight: 500;
+  }
+
+  .codex-mitre-tag__name {
+    color: var(--codex-text-muted);
+    font-weight: 400;
+  }
+
+  .codex-mitre-tag__external {
+    opacity: 0.5;
+    flex-shrink: 0;
+  }
+
+  /* On narrow viewports, hide the technique name to keep the badge compact */
+  @media (max-width: 640px) {
+    .codex-mitre-tag__name {
+      display: none;
+    }
+  }
+</style>

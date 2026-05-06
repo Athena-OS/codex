@@ -1,0 +1,126 @@
+---
+title: SSTI
+description: Server-Side Template Injection - making an application evaluate template expressions you control. Engine fingerprinting, payload catalogs per template engine, sandbox escape, and filter bypass.
+mitre: [T1190, T1059]
+d3fend: [D3-EAL, D3-NTA]
+impact: [ServerSideEval, RCE]
+noise: moderate
+sidebar:
+  order: 1
+  label: Overview
+---
+import { Aside } from '@astrojs/starlight/components';
+
+## TL;DR
+
+The application takes input that gets rendered as part of a template, not just substituted as a string. Anything the template engine can express - arithmetic, attribute access, method calls, imports - you can do. In most engines, that path leads to RCE within three or four payloads.
+
+```
+# Probe
+{{7*7}}                        # Jinja2/Twig/Nunjucks: returns 49
+${7*7}                         # Freemarker/Velocity: returns 49
+<%= 7*7 %>                     # ERB: returns 49
+#{7*7}                         # Pug/Ruby/Slim: returns 49
+@(7*7)                         # Razor: returns 49
+
+# Confirm it's the template, not a coincidence
+{{7*'7'}}                      # Jinja2: '7777777'  Twig: 49
+{{config}}                     # Jinja2/Nunjucks: dumps config object
+```
+
+Success indicator: `7*7` reflects as `49` (not as the literal string). Different syntax dialects tell you which engine.
+
+## Where to look
+
+Any reflection point where input shows up in HTML, email bodies, error messages, or PDFs - and the reflection is *not* HTML-escaped the way XSS sinks are. SSTI sinks tend to be in templated output features:
+
+- **Email templates** - "send invitation" / "password reset" - the customer-name field is usually templated
+- **Error pages** - applications that render a user-supplied error message
+- **Report generators** - PDF/HTML report builders that accept template fragments
+- **CMS pages** - any "page builder" or "snippet" feature that lets non-developers write template syntax
+- **Profile / display-name fields** - rendered later in admin dashboards or notification emails
+- **URL slugs that become page titles** - `/<SLUG>` where `<SLUG>` is echoed into a templated `<title>`
+- **Configuration values** - dashboards where admins can set "welcome message" or "site name"
+- **Webhook payload templates** - integrations that let users format the outgoing payload
+
+If you can describe the feature as "the application takes my input and uses it to build something else for someone else to see," it's an SSTI candidate.
+
+## Decision flow
+
+1. **Confirm template evaluation** - does `{{7*7}}` / `${7*7}` / `<%= 7*7 %>` return `49`? → [Detection](/codex/web/server-side/ssti/detection/)
+2. **Identify the engine** - syntax dialect + behavior of polyglot probes narrows it down → [Detection](/codex/web/server-side/ssti/detection/)
+3. **Engine = Jinja2 / Flask / Django / Ansible** → [Jinja2](/codex/web/server-side/ssti/jinja2/)
+4. **Engine = Twig / Symfony / Craft / Drupal 8+** → [Twig](/codex/web/server-side/ssti/twig/)
+5. **Engine = Freemarker / Confluence / Spring** → [Freemarker](/codex/web/server-side/ssti/freemarker/)
+6. **Engine = Velocity / Liferay / legacy Spring** → [Velocity](/codex/web/server-side/ssti/velocity/)
+7. **Engine = ERB / Rails / Puppet** → [ERB](/codex/web/server-side/ssti/erb/)
+8. **Engine = Handlebars / Express / Ghost** → [Handlebars](/codex/web/server-side/ssti/handlebars/)
+9. **Engine = Razor / ASP.NET** → [Razor](/codex/web/server-side/ssti/razor/)
+10. **Inside a sandboxed environment** - payload evaluates but `os`/`subprocess`/`Runtime` unreachable → [Sandbox escape](/codex/web/server-side/ssti/sandbox-escape/)
+11. **Payload rejected / filtered** - keywords like `system`, `__class__`, `Runtime` stripped → [Filter bypass](/codex/web/server-side/ssti/filter-bypass/)
+
+## Engine fingerprint table
+
+The probes below differ between engines. Run them in order; the first one that produces a useful divergence identifies the engine.
+
+| Probe | Jinja2 | Twig | Freemarker | Velocity | ERB | Handlebars | Razor |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `{{7*7}}` | `49` | `49` | error | error | unchanged | `49` | unchanged |
+| `${7*7}` | unchanged | unchanged | `49` | `49` | unchanged | unchanged | unchanged |
+| `<%= 7*7 %>` | unchanged | unchanged | unchanged | unchanged | `49` | unchanged | unchanged |
+| `@(7*7)` | unchanged | unchanged | unchanged | unchanged | unchanged | unchanged | `49` |
+| `{{7*'7'}}` | `7777777` | `49` | n/a | n/a | n/a | error | n/a |
+| `{{config}}` | dumps config | dumps config | n/a | n/a | n/a | empty | n/a |
+| `{{self}}` | object repr | object repr | n/a | n/a | n/a | unchanged | n/a |
+
+"unchanged" means the literal string `{{7*7}}` appears in the response - the engine doesn't recognize the syntax, so it's not that engine.
+
+The single most diagnostic probe is `{{7*'7'}}`: Jinja2 does string repetition (`'7777777'`), Twig does numeric coercion (`49`). Same input, different behavior, immediate disambiguation.
+
+## Impact ladder
+
+| Tier | What you get | How |
+| --- | --- | --- |
+| 1 | Confirmed arithmetic eval | `{{7*7}}` returns `49` |
+| 2 | Object/attribute access | `{{config}}` dumps secrets, dump session tokens, exfil environment vars |
+| 3 | Function calls in sandbox | Use built-in filters/functions to read files or trigger SSRF |
+| 4 | Sandbox escape | Walk the object graph to reach `os`/`subprocess`/`Runtime` |
+| 5 | RCE | Direct command execution as the application user |
+
+Tiers 1-2 are nearly free on most engines. Tier 3 depends on filters available. Tiers 4-5 are the engine-specific escape sequences documented per page.
+
+## Why SSTI is high-impact
+
+The bug is misclassified by developers and frameworks alike. Most teams think "we escape HTML, so this can't be XSS" and stop there - but SSTI evaluates *before* the HTML escaping step. The template engine has already constructed a Python/Ruby/Java object graph by the time HTML escaping runs.
+
+This means:
+
+- The same input that gets escaped on the way to the browser already gave you RCE on the server.
+- Tools designed to catch XSS (`<script>` blocklists, CSP headers, sanitizers) miss SSTI entirely.
+- Bug bounty triage frequently downgrades SSTI to XSS until you demo `cat /etc/passwd`.
+
+The detection page covers polyglot probes that survive most filters; the per-engine pages document the path from arithmetic eval to RCE for each common engine.
+
+## Operating notes
+
+The single most useful habit: **probe with `{{7*7}}` first, always**. It works on six of the seven engines listed and produces an immediate, unambiguous signal. Save the dialect-specific probes (`${...}`, `<%= ... %>`, `@(...)`) for when `{{...}}` returns unchanged.
+
+The second most useful habit: **try probing in fields you wouldn't expect to be templated**. Display names, profile bios, location strings, "company name" in invoice generators. The high-yield SSTI bugs are in fields whose template-ness is non-obvious. Anything reflected to another user (an admin, the recipient of an email) is worth probing.
+
+<Aside type="caution">
+SSTI demos that execute commands change the engagement scope quickly. `{{ ''.__class__.__mro__[1].__subclasses__() }}` is a safe demonstration that prints class names. `os.system('id')` is not. Confirm scope before escalating past tier 3.
+</Aside>
+
+The detection page is the right starting point unless you already know the engine. The per-engine pages assume you know what you're working with and want the shortest path to RCE.
+
+## Next move
+
+- **`{{7*7}}` returns `49`** → Jinja2 or Twig or similar - run [detection](/codex/web/server-side/ssti/detection/) probes to disambiguate engine
+- **`${7*7}` returns `49`** → Freemarker, Velocity, or Spring EL - narrow with engine-specific probes
+- **`<%= 7*7 %>` returns `49`** → ERB (Ruby) or ASP.NET Razor - see [erb](/codex/web/server-side/ssti/erb/) or [razor](/codex/web/server-side/ssti/razor/)
+- **`{{= 7*7}}` returns `49`** → underscore.js / EJS - server-side JavaScript template
+- **Engine confirmed → ready to RCE** → jump straight to the per-engine page ([jinja2](/codex/web/server-side/ssti/jinja2/), [freemarker](/codex/web/server-side/ssti/freemarker/), [twig](/codex/web/server-side/ssti/twig/), [velocity](/codex/web/server-side/ssti/velocity/), [handlebars](/codex/web/server-side/ssti/handlebars/), [erb](/codex/web/server-side/ssti/erb/), [razor](/codex/web/server-side/ssti/razor/))
+- **Evaluation works but RCE payload is filtered** → [sandbox-escape](/codex/web/server-side/ssti/sandbox-escape/) (engine sandboxes vary widely - Jinja2 has well-known escapes, Twig sandbox is harder)
+- **Specific tokens (`__class__`, `os`, `exec`) blocked** → [filter-bypass](/codex/web/server-side/ssti/filter-bypass/) (string concatenation, alternate object traversal, encoded payloads)
+- **Got RCE inside the template** → confirm the user context (`whoami`/`id`), check if app runs in container (no `/etc/shadow`, restricted commands), pivot to credential hunting if rooted
+- **No mathematical evaluation but other behavior changes** → blind SSTI; use OOB callback (similar to blind SSRF) to confirm execution

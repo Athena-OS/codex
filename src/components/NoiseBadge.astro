@@ -1,0 +1,113 @@
+---
+// src/components/NoiseBadge.astro
+//
+// Renders a small badge indicating how loud/visible a technique is from
+// a defender's perspective. Single-glance metadata for operators planning
+// engagements under rules-of-engagement constraints.
+//
+// Three levels (and their canonical examples):
+//   - stealth  : a single probe is indistinguishable from normal traffic
+//                (one boolean SQLi check, one SSRF to internal IP, etc.)
+//   - moderate : detectable if logged but not screaming
+//                (UNION-based SQLi, error-based extraction)
+//   - loud     : pattern-matches against any reasonable SIEM/IDS rule
+//                (time-based blind, sqlmap full-auto, mass enumeration)
+//
+// Usage in .mdx frontmatter:
+//   ---
+//   title: Time-based Blind SQLi
+//   noise: loud
+//   ---
+//
+// Then PageTitle.astro renders this automatically. No import needed in
+// the .mdx itself.
+//
+// Why a single value, not a multi-dim score? Operators need to glance,
+// not compute. Stealth/moderate/loud maps to the actual conversation:
+// "can I run this during business hours" / "do I need to coordinate
+// with blue team" / "this will absolutely trigger an alert".
+
+interface Props {
+  /** Noise level - one of: 'stealth' | 'moderate' | 'loud' */
+  level: 'stealth' | 'moderate' | 'loud';
+}
+
+const { level } = Astro.props;
+
+const meta: Record<Props['level'], { glyph: string; label: string; tip: string }> = {
+  stealth: {
+    glyph: '◐',
+    label: 'stealth',
+    tip: 'Stealth - a single probe blends into normal traffic. Safe under most engagement constraints.',
+  },
+  moderate: {
+    glyph: '◑',
+    label: 'moderate',
+    tip: 'Moderate - visible in logs and may trigger pattern-based detection. Use with awareness of monitoring.',
+  },
+  loud: {
+    glyph: '◉',
+    label: 'loud',
+    tip: 'Loud - will trigger most SIEM/IDS rules. Coordinate with blue team or limit to authorized windows.',
+  },
+};
+
+const m = meta[level];
+---
+
+<span class={`codex-noise-badge codex-noise-badge--${level}`} title={m.tip}>
+  <span class="codex-noise-badge__glyph" aria-hidden="true">{m.glyph}</span>
+  <span class="codex-noise-badge__label">{m.label}</span>
+</span>
+
+<style>
+  .codex-noise-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 3px 9px;
+    border-radius: var(--codex-radius-sm);
+    font-size: 11px;
+    font-family: var(--codex-font-mono);
+    border: 1px solid;
+    line-height: 1.3;
+    margin-right: 6px;
+    margin-bottom: 6px;
+    vertical-align: middle;
+    cursor: help;
+    /* The badge uses semantic warning/danger tokens, not the accent.
+       Noise is a defender-detection signal, not a Codex-brand signal,
+       so it intentionally doesn't hue-rotate with the palette tuner. */
+  }
+
+  .codex-noise-badge__glyph {
+    font-size: 10px;
+    opacity: 0.9;
+  }
+
+  .codex-noise-badge__label {
+    font-weight: 500;
+    letter-spacing: 0.02em;
+  }
+
+  /* === Stealth: success-soft (green). "Quiet, safe." === */
+  .codex-noise-badge--stealth {
+    background: var(--codex-success-soft);
+    color: var(--codex-success);
+    border-color: var(--codex-success-border);
+  }
+
+  /* === Moderate: warning-soft (amber). "Be aware." === */
+  .codex-noise-badge--moderate {
+    background: var(--codex-warning-soft);
+    color: var(--codex-warning);
+    border-color: var(--codex-warning-border);
+  }
+
+  /* === Loud: danger-soft (red). "Will be seen." === */
+  .codex-noise-badge--loud {
+    background: var(--codex-danger-soft);
+    color: var(--codex-danger);
+    border-color: var(--codex-danger-border);
+  }
+</style>

@@ -1,0 +1,183 @@
+---
+title: Shodan & Third-Party OSINT
+description: Enriching a host list with service banners, open ports, and version data - using third-party scan databases (Shodan, Censys) that have already done the active scanning so you don't have to.
+mitre: [T1596, T1596.001, T1593.002, T1595]
+d3fend: [D3-NTA]
+impact: [InternalAccess]
+sidebar:
+  order: 3
+  label: Shodan & OSINT
+---
+
+## TL;DR
+
+Once you have a list of IPs that belong to the target, you want banners, open ports, and version info for each - *without scanning them yourself*. Third-party services (Shodan, Censys, ZoomEye, BinaryEdge) continuously scan the public internet and let you query the results. You get scan data the target can't see you collect.
+
+```
+# Resolve subdomains to IPs
+for i in $(cat subdomains.txt); do
+  host "$i" | grep "has address" | grep "$DOMAIN" | awk '{print $NF}' >> ips.txt
+done
+
+# Run each IP through Shodan
+for ip in $(cat ips.txt); do shodan host "$ip"; done
+```
+
+Success indicator: per-IP open-port lists, service banners, and version strings - sourced from existing scan data, no packets sent from your address to the target.
+
+## Why use third-party scan data
+
+Three reasons:
+
+1. **Stealth.** A passive query against Shodan never touches the target. Nmap from your attack box does. On a hardened target with IDS/IPS, your `nmap -sV -p-` will land you in the alert queue. Shodan won't.
+2. **Coverage.** Shodan scans on a continuous rolling basis with massive infrastructure. They see things short-lived port openings you'd miss with a one-time scan.
+3. **History.** Shodan's results include timestamps. A port that was open three weeks ago but is closed now is sometimes more revealing than a port that's currently open.
+
+The trade-off: third-party scans can be stale (days to weeks old), incomplete (not every port scanned), or wrong (banner parsing errors). Cross-check anything important before relying on it.
+
+## Shodan basics
+
+[Shodan](https://www.shodan.io/) indexes internet-connected devices by scanning common ports (HTTP/HTTPS, FTP, SSH, SNMP, Telnet, RTSP, SIP, plus thousands of less-obvious ones). Search is by IP, hostname, banner content, or arbitrary string.
+
+The web UI is good for ad-hoc exploration. The CLI is better for scripted recon.
+
+### CLI setup
+
+```shell
+pip install shodan
+shodan init <YOUR_API_KEY>
+```
+
+The free tier limits queries hard; a paid Membership ($59 one-time) raises limits substantially.
+
+### Querying a single host
+
+```shell
+shodan host 10.129.24.93
+```
+
+```
+10.129.24.93
+City:                    Berlin
+Country:                 Germany
+Organization:            InlaneFreight
+Updated:                 2021-09-01T09:02:11.370085
+Number of open ports:    2
+
+Ports:
+     80/tcp nginx
+    443/tcp nginx
+```
+
+Useful fields:
+
+- **Organization** - confirms (or contradicts) attribution. If `Organization` says `InlaneFreight`, the IP genuinely belongs to them. If it says `Cloudflare, Inc.`, the IP is a CDN front for the real origin server.
+- **Open ports** - what was observed open. Often more revealing than a fresh nmap because Shodan catches services that open intermittently.
+- **Banners** - version strings. `OpenSSH (7.6p1 Ubuntu-4ubuntu0.3)` tells you Ubuntu 18.04 with that specific OpenSSH version. Match against the [CVE database](https://www.cvedetails.com/) for known issues.
+
+### Looping over an IP list
+
+```shell
+# After building ips.txt from DNS resolution
+for ip in $(cat ips.txt); do
+  echo "=== $ip ==="
+  shodan host "$ip"
+  echo
+done | tee shodan-results.txt
+```
+
+A medium-sized target might have 20-50 unique IPs. This loop completes in under a minute. Read the output. Note any host with unusual ports - a mail-looking IP serving 8080 might be running an admin panel.
+
+### Sample multi-host pattern from a real target
+
+```
+10.129.24.93        Berlin, Germany    nginx on 80/443                    → web app
+10.129.27.33        Berlin, Germany    OpenSSH 7.6p1, nginx on 80/443     → bastion or main web
+10.129.27.22        Berlin, Germany    SMTP 25, DNS 53, HTTP 80/81, POP3  → likely mail + DNS host
+10.129.95.250       AWS us-west-2      S3 static website                  → third-party (cloud)
+```
+
+Immediate observations:
+
+- The mail server (`10.129.27.22`) runs both SMTP and DNS, and exposes ports `80` and `81` (an admin panel?) and a non-standard `444`. Worth deeper investigation.
+- The Ubuntu version visible in the SSH banner can be tracked back to specific kernel versions and out-of-band update windows.
+- The `s3-website` IP is third-party hosted - out of scope for active testing, but worth checking for bucket misconfigurations (see [Cloud Resources](/codex/network/recon/cloud-resources/)).
+
+### Shodan search operators
+
+The CLI also supports search queries:
+
+```shell
+# Find hosts matching a banner string
+shodan search 'nginx country:DE org:"InlaneFreight"'
+
+# Find hosts running specific software versions
+shodan search 'product:"OpenSSH" version:"7.6"'
+
+# Find hosts with specific HTTP titles (useful for admin panels)
+shodan search 'http.title:"Login Page" org:"InlaneFreight"'
+
+# Find hosts exposing specific services
+shodan search 'port:3306 country:DE org:"InlaneFreight"'
+```
+
+Operators are documented at [Shodan Filters](https://www.shodan.io/search/filters). Combine `org:`, `country:`, `port:`, `product:`, `version:` to narrow searches to in-scope assets.
+
+## Censys
+
+[Censys](https://search.censys.io/) is the principal alternative to Shodan. Different scanner, different coverage, different scoring. Worth running both - they catch different things.
+
+```shell
+# Web UI: https://search.censys.io/
+# CLI:
+pip install censys
+censys config  # add API ID + secret
+censys hosts 10.129.27.33
+```
+
+Censys also offers certificate search - useful for finding IPs that present a TLS cert with a specific issuer/subject. Sometimes catches subdomains that crt.sh missed:
+
+```shell
+censys search 'services.tls.certificates.leaf_data.subject.organization: "InlaneFreight"'
+```
+
+## Other passive intel sources
+
+Quick mention of services worth knowing:
+
+| Service | Strength |
+| --- | --- |
+| [domain.glass](https://domain.glass/) | Aggregator showing DNS, TLS, CDN, security headers, and Cloudflare classification in one view. Good for quick "what's protecting this?" |
+| [SecurityTrails](https://securitytrails.com/) | Historical DNS records - see subdomains that *used to* exist. Great for forgotten infrastructure. |
+| [DNSDumpster](https://dnsdumpster.com/) | Free DNS recon with network map visualization |
+| [ViewDNS.info](https://viewdns.info/) | WHOIS, reverse-IP lookup, port scan, traceroute - assorted DNS utilities |
+| [ZoomEye](https://www.zoomeye.org/) | Chinese alternative to Shodan; better coverage on some Asia-Pacific assets |
+| [BinaryEdge](https://www.binaryedge.io/) | Continuous scanning + leaked credential database |
+| [Hunter.io](https://hunter.io/) | Email address discovery for an organization - common formats and verified addresses |
+
+## Cloudflare and other CDNs
+
+When you see Cloudflare IPs in DNS results, the public-facing IP is just the CDN edge. The real origin server is hidden behind it. Several techniques to find the origin:
+
+1. **Historical DNS** - SecurityTrails or DNS history archives often show the pre-Cloudflare IP from when the org first set up DNS.
+2. **Certificate transparency on subdomains** - many subdomains (especially mail, dev, staging) bypass Cloudflare. Their direct IPs are in crt.sh.
+3. **Email headers** - outbound email from the target's mail server includes the originating server IP. Send a support inquiry, read the headers.
+4. **Misconfigured services** - FTP, SSH, SMTP often aren't proxied through Cloudflare. If those services appear in DNS, their A records are the real origin.
+5. **Cloudflare-specific tools** - [CloudFlair](https://github.com/christophetd/CloudFlair) cross-references Censys data to find origin IPs by certificate match.
+
+`domain.glass` will explicitly tell you "Cloudflare protected" - useful flag for layer-2 gateway notes ("WAF observed, suggests Cloudflare bypass needed on origin").
+
+## Putting it together
+
+A reasonable Shodan-stage workflow:
+
+```
+1. Build ips.txt          → from DNS resolution + cert transparency
+2. shodan host <ip> loop  → per-host banner & port data
+3. shodan search org:X    → catch IPs that DNS didn't surface but Shodan attributes to org
+4. Cross-check Censys     → fills gaps in Shodan coverage
+5. Identify CDN-fronted   → note for later origin-IP discovery
+6. Save banners/versions  → input for CVE lookup and active scan prioritization
+```
+
+By the end, you have a per-host inventory: IP, hostname, geo, organization attribution, observed open ports, service banners, software versions, and a CDN/WAF classification. From there, active enumeration ([services cluster](/codex/network/services/)) becomes targeted instead of speculative.

