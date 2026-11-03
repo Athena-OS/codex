@@ -22,7 +22,9 @@ const registryTags = (registry: Record<string, unknown>, file: string) =>
     .array(z.string())
     .superRefine((ids, ctx) => {
       for (const id of ids) {
-        if (!(id in registry)) {
+        // Own-property check: `in` would also accept inherited names like
+        // `toString` or `__proto__`.
+        if (!Object.hasOwn(registry, id)) {
           ctx.addIssue({
             code: 'custom',
             message: `Unknown ID "${id}". Add it to ${file} or fix the typo.`,
