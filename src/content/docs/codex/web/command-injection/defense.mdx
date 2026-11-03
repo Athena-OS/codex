@@ -1,0 +1,93 @@
+---
+title: Defending Against Command Injection
+description: How OS command injection is actually prevented - avoid the shell entirely, pass arguments as a vector, allowlist input, and harden the runtime so a slip can't reach a shell.
+mitre: [T1190, T1059]
+d3fend: [D3-AH, D3-ACH]
+owasp: [A05]
+sidebar:
+  order: 9
+  label: Defense
+---
+import { Aside } from '@astrojs/starlight/components';
+
+Command injection exists because user input reaches a function that hands a string to a shell, and the shell parses that string for metacharacters (`;`, `|`, `` ` ``, `$()`, …). Remove the shell from the path and the metacharacters mean nothing; where a command genuinely must run, pass arguments as data, not as text to be re-parsed. This page is ordered by effectiveness - the first control removes the class, the rest limit what a missed case can do.
+
+<Aside type="note">
+For the operator, the absence of these is the signal: a feature that pings, converts, archives, resolves DNS, or shells out to a tool, where your separators survive, is the bug. The controls below are what your payload has to get past - and the weakest of them (blocklists, `escapeshellcmd`) are the ones the [filter-bypass](/codex/web/command-injection/filter-bypass/) page defeats.
+</Aside>
+
+## 1. Don't invoke a shell - use native functions
+
+The complete fix is to not build a shell command at all. Back-end languages have library calls for most things an app shells out for, and they can't be command-injected:
+
+- Pinging/host checks → a socket call (`fsockopen`) or an ICMP library, not `system("ping ...")`.
+- File operations, archiving, HTTP, DNS → the language's file/zip/HTTP/resolver libraries, not `tar`/`curl`/`dig` subprocesses.
+- Image/PDF processing → a binding to the library (not shelling to `convert`/`wkhtmltopdf`) where one exists.
+
+If nothing native exists, the question becomes *how* you spawn the process - section 2.
+
+## 2. If you must run a program, pass arguments as a vector (no shell)
+
+The single most important habit: execute the binary directly with an **argument array**, so no shell ever parses the input. The separator characters never get their special meaning because there is no shell to interpret them.
+
+```python
+# Vulnerable - a shell parses the whole string
+os.system("ping -c1 " + ip)
+subprocess.run("ping -c1 " + ip, shell=True)
+
+# Safe - argv vector, no shell; ip is one opaque argument
+subprocess.run(["ping", "-c1", ip])            # shell=False is the default
+```
+
+The equivalent in each stack: Node `execFile`/`spawn('ping', ['-c1', ip])` **without** `shell: true` (never `child_process.exec`); Java `ProcessBuilder("ping","-c1",ip)` or `Runtime.exec(String[])` (not the `String` overload); PHP `pcntl_exec`/`proc_open` with an argv array; Ruby `system("ping","-c1",ip)` (multi-arg form, not the single-string form).
+
+<Aside type="caution">
+Argv-vector exec stops *command* injection, but a user-controlled argument can still be **argument injection** - the binary is fixed, yet attacker-controlled flags change what it does (e.g. `curl`'s `-o`, `tar`'s `--checkpoint-action`). So still validate the value, and where the input is a positional argument, separate it from options with `--`. See [argument injection](/codex/web/command-injection/argument-injection/).
+</Aside>
+
+## 3. Allowlist the input - don't blocklist
+
+Validate every value against the format it must have, server-side, and reject anything else. Positive validation (permit a known-good set) not negative (strip bad characters):
+
+```php
+if (filter_var($_GET['ip'], FILTER_VALIDATE_IP)) { /* ok */ } else { /* reject */ }
+// non-standard formats: anchor a tight regex to the exact operand shape, and
+// make sure it can't start with '-'. ^[A-Za-z0-9._-]+$ is NOT enough - it
+// accepts --help, -rf, -o, so it still permits argument injection.
+// e.g. a hostname/label:  ^[A-Za-z0-9][A-Za-z0-9.-]*$   (leading char is alnum)
+```
+
+Validate on the back end, not just the front end - the front-end check is UX and is trivially skipped with a proxy. The subtlety that actually closes the [argument-injection](/codex/web/command-injection/argument-injection/) gap from section 2 is **rejecting option-like values**: a value that validates as "only safe characters" can still be a flag if it begins with `-`. Anchor the format so the operand can't start with `-`, validate it against the shape you expect (an IP, a hostname, a numeric id), and still `--`-separate positional arguments where the program supports it. Allowlisting is defence in depth behind sections 1–2.
+
+<Aside type="caution">
+Blocklisting characters/commands, and escaping, are the fragile options. `escapeshellcmd()` escapes metacharacters across a whole command string but leaves argument boundaries intact, so it does **not** stop argument injection and has known bypasses; `escapeshellarg()` (quote one argument) is stronger but only works if you actually wrap each argument and don't build the rest of the line from input. Prefer no-shell execution (section 2) over relying on either - the [filter-bypass](/codex/web/command-injection/filter-bypass/) page is a catalogue of how blocklists and escaping fall.
+</Aside>
+
+## 4. Harden the runtime (limits the blast radius)
+
+Configuration that shrinks what a successful injection yields:
+
+- **Least privilege:** run the web/app process as a low-privileged user (`www-data`), so RCE isn't instant root and can't read secrets it doesn't need.
+- **Disable the dangerous sinks:** PHP `disable_functions = system,exec,shell_exec,passthru,popen,proc_open,pcntl_exec` where the app doesn't need them. This removes the sinks at the PHP level, which is the useful part for command injection.
+- **Confine with OS-enforced isolation:** a minimal container with restricted mounts, seccomp/AppArmor, and the low-privileged account above - these constrain a process that *does* spawn. Note that PHP's `open_basedir` is **not** one of these: it restricts PHP's own file functions only, so a command run through `system()` is a child process outside its scope and can still read `/etc/passwd` (subject only to the OS user's permissions). Don't present `open_basedir` as confinement for a successful command injection.
+- **Normalise input at the edge:** reject double-encoded and non-ASCII where the parameter shouldn't contain it, so encoding tricks don't slip past validation.
+
+## 5. Defense in depth
+
+- **WAF** (ModSecurity, cloud): flags known separator/obfuscation patterns and, in report-only mode, is an early warning. It is evadable ([filter-bypass](/codex/web/command-injection/filter-bypass/), and the Bashfuscator/DOSfuscation tooling) - a layer, never the fix.
+- **Logging and alerting:** shell metacharacters, `$IFS`, base64-pipe-to-shell, and long encoded blobs in parameters are high-signal. Hardening's purpose is to make a hit noisier and slower, buying detection time.
+
+## For the report
+
+1. **Primary:** replace shell-spawning calls with native library functions; where a process is required, exec it with an argument vector and no shell.
+2. **Arguments:** allowlist-validate each user value, and `--`-separate positional args to close argument injection.
+3. **Runtime hardening:** low-privileged service account, `disable_functions`, and OS-enforced isolation (minimal container, seccomp/AppArmor) - not `open_basedir`, which doesn't constrain spawned commands.
+4. **Defense in depth:** WAF in at least report-only mode; alert on separator/obfuscation indicators.
+
+Avoid recommending a character blocklist, `escapeshellcmd`, or a WAF as the primary fix - each is bypassable, and this cluster documents how.
+
+## Related
+
+- [Argument injection](/codex/web/command-injection/argument-injection/) - the bug that survives a no-shell argv exec
+- [Filter bypass](/codex/web/command-injection/filter-bypass/) - why blocklists and escaping aren't a fix
+- [Detection](/codex/web/command-injection/detection/) - the separators and probes these controls must stop
