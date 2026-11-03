@@ -228,7 +228,7 @@ The top-level fail. Walk down this checklist:
 
 - `--parse-errors` shows nothing → could be error suppression OR could be WAF stripping payloads.
 - `-v 6` and look for `406 Not Acceptable`, `403 Forbidden`, or distinctive WAF banners in responses (`<title>Access Denied</title>`, `ModSecurity`, `Cloudflare Ray ID`).
-- Try `--tamper=between,space2comment --random-agent` as a first pass. See [WAF Bypass](/codex/web/sqli/sqlmap/waf-bypass/) for the full bypass toolkit.
+- Try `--tamper=between,space2comment --random-agent` as a first pass. See [Filter & WAF bypasses](/codex/web/sqli/bypasses/) for the full bypass toolkit.
 
 ### "the back-end DBMS is X" but enumeration fails
 
@@ -259,7 +259,7 @@ The injection works but specific operations return nothing.
 sqlmap -u '...' --is-dba
 ```
 
-If `current user is DBA: False`, file read is unlikely to work. See [OS Exploitation](/codex/web/sqli/sqlmap/os-exploitation/) for the privilege requirements per-DBMS.
+If `current user is DBA: False`, file read is unlikely to work. See [File operations](/codex/web/sqli/file-operations/) for the privilege requirements per-DBMS.
 
 **Another cause: result-size or output-encoding limits.**
 
