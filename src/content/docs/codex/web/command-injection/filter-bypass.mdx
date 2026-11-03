@@ -171,6 +171,35 @@ $env:PROGRAMFILES[0]            # "C"
 
 PowerShell treats strings as char arrays for indexing. No length needed for single chars.
 
+## Generating arbitrary blocked characters
+
+Environment-variable slicing (above) only yields characters that happen to sit in some variable's value. When the character you need isn't reachable that way, **shift it out of an adjacent one**: `tr` maps one character range onto another, so feeding it the character *before* your target and shifting the whole printable range up by one prints the target - without the target ever appearing in the payload.
+
+### Linux - `tr` range shift
+
+```bash
+# Need "\" (ASCII 92). The character just before it is "[" (91).
+echo $(tr '!-}' '"-~'<<<[)       # shifts every printable char up by one → "\"
+```
+
+`'!-}'` is the source range (ASCII 33-125), `'"-~'` the destination (34-126) - every character maps to the next one up. Look the target up in `man ascii`, feed `tr` the character one position lower, and the shifted output is the blocked character. The shifted output is character **data** in the current parse, so it slots in where a blocked character is needed as data - a path like `/etc/passwd`, or an argument a command filter would reject. To shift the other way, swap the ranges: `tr '"-~' '!-}'`.
+
+<Aside type="caution">
+These produce a character as **data, not shell syntax.** A generated `;`, `` | ``, `` ` `` or `>` won't separate commands, pipe, or redirect in the same injection - the shell finished parsing before the `$()` substitution ran and doesn't re-parse its output. To use a generated character *as* syntax you need a second parse stage: feed the assembled string to `eval` / `bash -c`, or land it in a separate injection point that gets parsed fresh.
+</Aside>
+
+### Windows
+
+PowerShell builds the same result straight from a code point - cast an integer to `[char]`, no shifting needed:
+
+```powershell
+[char]92                         # "\"
+[char]59                         # ";"
+"$([char]59)whoami"              # builds the STRING ";whoami" - data, not executed
+```
+
+As on Linux, this yields the character as data; running an assembled string as a command needs a second stage - `Invoke-Expression`/`iex` or the call operator `&`. cmd.exe has no clean equivalent; use the `%VAR:~i,1%` slicing above, or drop to PowerShell.
+
 ## Command name obfuscation
 
 Filter blocks the literal command (`whoami`, `cat`, `wget`). Insert characters the shell discards.
