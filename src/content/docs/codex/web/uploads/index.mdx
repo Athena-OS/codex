@@ -4,7 +4,7 @@ description: Operator reference for file-upload attacks - arbitrary file upload,
 mitre: [T1190, T1505.003, T1059]
 d3fend: [D3-EAL, D3-FA]
 impact: [RCE, ServerSideEval, FileWrite]
-owasp: [A03, A04, A05]
+owasp: [A05, A06, A02]
 noise: moderate
 sidebar:
   order: 1
@@ -111,6 +111,7 @@ A complete bypass on a hardened app may need to satisfy three or four of these s
 5. **Content-Type / MIME validation?** → [Content-Type bypass](/codex/web/uploads/content-type-bypass/)
 6. **Only specific non-executable types allowed?** → [Limited uploads](/codex/web/uploads/limited-uploads/)
 7. **Need to find the upload directory, or filename injection?** → [Post-upload](/codex/web/uploads/post-upload/)
+8. **Reporting it, or hardening against it?** → [Defense](/codex/web/uploads/defense/)
 
 ## Impact ladder
 

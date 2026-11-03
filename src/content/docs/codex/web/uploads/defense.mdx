@@ -1,0 +1,75 @@
+---
+title: Defending File Uploads
+description: How malicious file upload is actually prevented - store uploads where they can't execute, validate extension and content together, randomise stored names, and harden the runtime.
+mitre: [T1190, T1505.003]
+d3fend: [D3-EAL, D3-FA, D3-ACH]
+owasp: [A05, A06, A02]
+sidebar:
+  order: 9
+  label: Defense
+---
+import { Aside } from '@astrojs/starlight/components';
+
+Almost every attack in this cluster ends the same way: a file the attacker controls is stored somewhere it can execute or be served back dangerously. The highest-leverage fix is a design choice - put uploads where they can't run - and validation then stops the bad file ever landing. This page is ordered by effectiveness; the first control neutralises web-shell RCE even when a filter is bypassed.
+
+<Aside type="note">
+For the operator, the absence of these is the path in: an upload that lands under the webroot with its original extension and is directly reachable is the whole game ([shells](/codex/web/uploads/shells/)). Validation that checks only one of extension/content, or only on the client, is what the bypass pages defeat.
+</Aside>
+
+## 1. Store uploads so they can't execute (the design fix)
+
+This is the control that matters most, because it removes the *impact* even if a malicious file gets through:
+
+- **Store outside the webroot**, or in object storage / a bucket, and serve files through a download script - never let the upload directory be a URL the server will execute.
+- If files must live on disk under a served path, make that directory **non-executable**: no PHP/CGI handler, `php_admin_flag engine off` (Apache), or a location block that serves everything as a static download.
+- Better still, keep uploads on a **separate server or container** from the app, so a web shell that does run compromises only the upload host.
+
+Get this right and an uploaded `shell.php` is an inert file, not RCE - which is why the bypass pages in this cluster all assume it's *missing*.
+
+## 2. Validate extension and content together - and require they match
+
+Neither check alone is enough; do both, and confirm they agree:
+
+- **Extension:** whitelist the allowed types with an **end-anchored** test (`/\.(png|jpe?g|gif)$/`) so `shell.php.png` is the only accepted shape, *and* blacklist dangerous extensions as a backstop (`.php`, `.phtml`, `.phar`, `.php5`, `.asp`, `.aspx`, `.jsp`) in case the whitelist is bypassed. The blacklist should match the extension **anywhere** in the name (`shell.php.png` still contains `.php`).
+- **Content:** verify the file signature (magic bytes) *and* the MIME type (`mime_content_type()` on the stored temp file, not the client-supplied `Content-Type` header), and check they match the claimed extension.
+- Validate on the **back end**. Client-side checks are UX only and are [trivially bypassed](/codex/web/uploads/client-side-bypass/).
+
+<Aside type="caution">
+Content validation alone is not a cure: a valid image that also contains PHP (a polyglot) passes a magic-byte/MIME check and still executes if it lands under the webroot with a `.php`-handled extension - see [content-type bypass](/codex/web/uploads/content-type-bypass/). This is exactly why section 1 (non-executable storage) is primary, not this one.
+</Aside>
+
+## 3. Randomise stored names and broker access
+
+Closes [filename injection and directory disclosure](/codex/web/uploads/post-upload/):
+
+- Generate a random stored name (e.g. a UUID) and build every filesystem path from *that* generated name, never from the user-supplied filename. Because the user's name never reaches a path, this removes **path-based** filename attacks (traversal, extension tricks on disk).
+- It does **not**, on its own, stop SQL or command injection via the original filename - those depend on how the name is *used*, not where the file is stored. If you keep the original name (for display/download), write and read it with **parameterised queries** (it's untrusted data, not "sanitised"), and if any processing step takes the name, pass it to a native API or an argv vector with [no shell](/codex/web/command-injection/defense/) - never interpolate it into a query string or a command line.
+- Serve downloads through a script that looks up the file by id, enforces authorization (so it isn't an [IDOR](/codex/web/idor/)/[LFI](/codex/web/lfi/) in its own right), and sends `Content-Disposition: attachment`, `X-Content-Type-Options: nosniff`, and an accurate `Content-Type`.
+- Return `403` on direct access to the storage directory.
+
+## 4. Harden the runtime (limits the blast radius)
+
+- **Least privilege:** run the app as a low-privileged user so a shell that does execute isn't root and can't read unrelated secrets.
+- **Disable dangerous sinks:** PHP `disable_functions = system,exec,shell_exec,passthru,popen,proc_open,pcntl_exec` where unused - this is what blunts a web shell that reaches execution.
+- **OS-enforced isolation:** the separate upload server/container from section 1, plus seccomp/AppArmor, is what actually confines a running shell. Note PHP's `open_basedir` restricts PHP's *own* file functions only; a command spawned via `system()` runs outside its scope, so don't rely on it to contain a successful upload-to-RCE.
+- **Limits and hygiene:** cap file size (blunts [DoS uploads](/codex/web/uploads/limited-uploads/)), keep image/parsing libraries patched, and scan uploads for known-malicious content.
+
+## 5. Defense in depth
+
+- **WAF**: catches known shell/polyglot signatures; a secondary layer, evadable, never the fix.
+- **Logging and alerting:** uploads of double-extensions, executable types, or files whose content and extension disagree are high-signal. Suppress verbose server errors so a failed upload doesn't leak the storage path or stack traces.
+
+## For the report
+
+1. **Primary (design):** store uploads outside the webroot / in a non-executable location or separate host, served via a brokered download script.
+2. **Validation:** whitelist + blacklist the extension *and* validate signature/MIME, requiring all to agree, on the back end.
+3. **Naming/access:** build disk paths from a random generated name; treat the original filename as untrusted (parameterised DB writes, no-shell processing); authorized download script with `nosniff` + `Content-Disposition`, `403` on the directory.
+4. **Runtime:** low-privileged account, `disable_functions`, OS isolation (not `open_basedir` alone), size limits, patched libraries.
+
+Avoid presenting a single check - a MIME test, an extension blacklist, a WAF - as the fix; this cluster is a catalogue of how each falls on its own.
+
+## Related
+
+- [Shells](/codex/web/uploads/shells/) - the payloads non-executable storage renders inert
+- [Content-Type bypass](/codex/web/uploads/content-type-bypass/) - why content validation alone isn't enough
+- [Post-upload](/codex/web/uploads/post-upload/) - the filename/disclosure issues section 3 closes
