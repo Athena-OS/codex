@@ -1,0 +1,138 @@
+---
+title: DOM-based XSS
+description: Client-side XSS where a JavaScript source flows to a dangerous sink without the payload ever reaching the server - source-to-sink analysis, common sources and sinks, and postMessage attacks.
+mitre: [T1059.007, T1185]
+d3fend: [D3-AH]
+impact: [SessionTakeover, AccountTakeover]
+owasp: [A03]
+noise: stealth
+sidebar:
+  order: 4
+  label: DOM-based
+---
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+The vulnerability is entirely in client-side JavaScript: a **source** reads attacker-controllable input and passes it, unsanitized, to a **sink** that writes it into the page or executes it. The server may never see the payload at all - in the classic `location.hash` case it sits after the `#`, which browsers don't send in the request. That makes DOM XSS quiet (nothing in server logs) and invisible to tools that only diff server responses.
+
+## TL;DR
+
+```
+# Payload rides in a client-only source - fragment, often never sent to the server
+http://<TARGET>/#<img src=x onerror=alert(document.domain)>
+
+# Vulnerable when a source flows to a sink with no sanitization, e.g.:
+document.getElementById('out').innerHTML = location.hash.slice(1);
+```
+
+Success indicator: the payload executes, but the response HTML (View Source / the raw HTTP response) does **not** contain it - it only appears in the live DOM (Inspect / DevTools). That gap is the signature of DOM XSS.
+
+## Sources and sinks
+
+A DOM XSS exists only when a **source** reaches a **sink**. Learn to spot both.
+
+**Sources** (attacker-influenceable inputs read by JS):
+
+| Source | Notes |
+|---|---|
+| `location` / `location.hash` / `.search` / `.href` | The fragment (`#…`) is the classic one - not sent to the server |
+| `document.URL`, `document.documentURI`, `document.referrer` | URL-derived strings |
+| `window.name` | Survives cross-origin navigation - a cross-domain delivery vector |
+| `postMessage` data | Cross-window messages (see below) |
+| `localStorage` / `sessionStorage` / cookies | Persisted client-side values |
+
+**Sinks** (functions that turn a string into markup or code):
+
+| Sink | Effect |
+|---|---|
+| `innerHTML`, `outerHTML`, `insertAdjacentHTML` | Parses the string as HTML |
+| `document.write()`, `document.writeln()` | Writes HTML into the document |
+| `eval()`, `Function()`, `setTimeout`/`setInterval` with a string | Executes the string as JS |
+| `element.src` / `.href` set to `javascript:` | Executes on activation |
+| jQuery `.html()`, `$()` selector with markup, `.append()` | Parses HTML |
+
+<Aside type="note">
+`innerHTML` will **not** run a bare `<script>` tag inserted after load, which is why DOM XSS so often uses `<img src=x onerror=…>` or `<svg onload=…>` - the handler fires without a `<script>` element. Treat `<script>alert(1)</script>` as a false negative here.
+</Aside>
+
+## Step 1 - Trace source to sink
+
+<Steps>
+
+1. Open DevTools and search the page's JavaScript for sink names (`innerHTML`, `document.write`, `eval`, `.html(`).
+2. For each sink, work backwards: does its argument derive from a source (`location`, `document.referrer`, `postMessage`, storage)?
+3. If a source reaches a sink with no encoding/sanitization in between, you have a candidate. Burp's **DOM Invader** automates this trace and flags source→sink flows.
+4. Confirm by putting a canary in the source (e.g. in `#…`) and watching it appear in the live DOM via Inspect - not View Source.
+
+</Steps>
+
+## Step 2 - Match the payload to the sink
+
+The sink dictates the payload, independent of any server-side context:
+
+```
+# innerHTML / document.write (HTML sink) - no <script>; use a handler
+#<img src=x onerror=alert(document.domain)>
+#<svg onload=alert(document.domain)>
+
+# eval / setTimeout("…") (JS sink) - inject JS directly, close any wrapper
+';alert(document.domain);//
+
+# href/src set from a source (URL sink)
+javascript:alert(document.domain)
+```
+
+See [Payload construction](/codex/web/xss/payload-construction/) for the full catalog and [Filter bypasses](/codex/web/xss/filter-bypasses/) when client-side code tries to strip or encode the value.
+
+## postMessage attacks
+
+A frequent modern DOM XSS: a page registers a `message` listener and feeds the message into a sink without checking the sender.
+
+```javascript
+// Vulnerable listener - no origin check, data flows to innerHTML
+window.addEventListener('message', (e) => {
+  document.getElementById('out').innerHTML = e.data;
+});
+```
+
+If the handler does not validate `e.origin` (and sometimes `e.source`), any page that can open or frame the target can post a payload to it:
+
+```javascript
+// Attacker page
+const w = window.open('https://<TARGET>/');
+setTimeout(() => w.postMessage('<img src=x onerror=alert(document.domain)>', '*'), 2000);
+```
+
+Check every `addEventListener('message', …)` for a missing or weak origin check (e.g. `indexOf`/`startsWith` tests that a lookalike domain satisfies).
+
+## Why DOM XSS evades detection
+
+- The payload need never appear in the HTTP response, so response-diffing scanners and WAFs that inspect requests/responses miss it.
+- `location.hash` content is not sent to the server, so there is nothing in server logs - this is reflected in the `stealth` noise rating.
+- It can be purely reflected (fragment) or stored (a tainted value read from `localStorage` on every load) - the source decides, not the server.
+
+## Common failure modes
+
+- **Canary appears in View Source** → that's server-side [reflected](../reflected/)/[stored](../stored/), not DOM. DOM XSS shows only in the live DOM.
+- **`<script>` doesn't run via `innerHTML`** → expected; use `onerror`/`onload` handler payloads.
+- **Framework auto-escapes** (React/Angular/Vue) → default bindings encode output; look for the escape hatches (`dangerouslySetInnerHTML`, `[innerHTML]`, `v-html`, `bypassSecurityTrust*`) or template-injection sinks.
+- **Value is URL-decoded twice / re-encoded** → trace the exact transformations in the JS; the working payload matches what survives to the sink.
+
+## Quick reference
+
+| Step | Action |
+|---|---|
+| Find sinks | Grep JS for `innerHTML`, `document.write`, `eval`, `.html(` |
+| Trace back | Does the sink argument come from a source? |
+| Automate | Burp DOM Invader for source→sink flows |
+| Confirm | Canary in source → appears in live DOM, not View Source |
+| Payload | Match the sink (HTML sink → handler payload; JS sink → raw JS) |
+| postMessage | Check listeners for missing `e.origin` validation |
+
+## Next move
+
+- **Source→sink confirmed in HTML sink** → `<img src=x onerror=…>` / `<svg onload=…>`; escalate via [XSS to session](/codex/web/sessions/xss-to-session/)
+- **Sink is `eval`/`setTimeout`** → inject JS directly with `';…//`
+- **Vulnerable `postMessage` listener** → host an attacker page that opens/frames the target and posts the payload
+- **Payload sanitized client-side** → [Filter bypasses](/codex/web/xss/filter-bypasses/)
+- **Executes only in an admin/other view you can't see** → [Blind XSS](../blind-xss/)
+- **Strict CSP blocks inline handlers** → look for CSP bypasses in [Filter bypasses](/codex/web/xss/filter-bypasses/#csp-bypass)

@@ -1,0 +1,120 @@
+---
+title: Reflected XSS
+description: Non-persistent XSS where input echoed straight back into the response executes in the victim's browser - canary probing, the three rendering contexts, and the per-click victim model.
+mitre: [T1059.007, T1185]
+d3fend: [D3-AH]
+impact: [SessionTakeover, CredentialTheft]
+owasp: [A03]
+noise: moderate
+sidebar:
+  order: 2
+  label: Reflected
+---
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+The application takes a value from the request - a URL parameter, form field, or header - and echoes it back into the immediate response without context-aware encoding. The payload lives in the request, so there is nothing stored: each victim has to be sent a crafted URL and click it. One request in, one response out, your code runs in their session.
+
+## TL;DR
+
+```
+# Unique canary per input - greppable, no special chars to get filtered
+http://<TARGET>/search?q=xss7a9c
+
+# Find the canary in the response, read the surrounding markup, then pick the payload
+#   body context      → <svg onload=alert(document.domain)>
+#   attribute context → "><svg onload=alert(document.domain)>
+#   JS string context → ';alert(document.domain)//
+```
+
+Success indicator: `alert(document.domain)` fires when you load the crafted URL. `document.domain` (not `1`) proves *which* origin executed it - important when reflections bounce through redirects or iframes.
+
+## Victim model
+
+Reflected XSS fires only for someone who sends your exact request, so impact depends entirely on delivery:
+
+- The payload rides in a URL (GET) or a form you make the victim submit (POST). GET is the common case because a link is easy to deliver.
+- Delivery is a social-engineering step - a link in an email, chat, or another site. That makes reflected XSS **per-click** and noisier to exploit than [stored](../stored/), which fires for every viewer with no link.
+- It is still serious: one click from a logged-in admin is enough. The ceiling is the same as any XSS once code runs (see the [cluster overview](/codex/web/xss/) capability table).
+
+<Aside type="caution">
+A reflected payload in a POST body needs an auto-submitting form hosted on your page, not just a link. If only a GET reflection exists but the sink requires POST, you may be able to fall back to a cross-site form submission - but that overlaps CSRF defenses; see [XSS+CSRF chain](/codex/web/sessions/xss-csrf-chain/).
+</Aside>
+
+## Step 1 - Map and canary every input
+
+Send a unique, filter-neutral marker through each candidate and grep the response for it.
+
+<Steps>
+
+1. Enumerate inputs: every URL parameter, every form field, and reflected headers (`Referer`, `User-Agent`, `X-Forwarded-For`, sometimes `Cookie`).
+2. Send a distinct canary per input - e.g. `xss7a9c`, `xss7a9d` - so you know which input produced which reflection.
+3. Search the response body for each canary. No reflection means no reflected XSS on that input (it may still be [stored](../stored/) or [DOM-based](../dom-based/)).
+4. For every reflection, note **where** in the markup it landed - that is the context, and it decides the payload.
+
+</Steps>
+
+Plain alphanumeric canaries avoid the trap of a payload being filtered before you have even confirmed the input reflects.
+
+## Step 2 - Identify the context
+
+The canary's surrounding markup tells you which payload class applies. This is the single most important step - a reflected payload that "doesn't fire" is usually right input, wrong context, not a WAF.
+
+| Canary lands in | Example | Payload class |
+|---|---|---|
+| HTML body | `<p>Results for xss7a9c</p>` | Open a tag: `<svg onload=…>` |
+| Tag attribute | `<input value="xss7a9c">` | Break out: `"><svg onload=…>` or add a handler: `" onfocus=… autofocus x="` |
+| JS string | `var q = "xss7a9c";` | Break the string: `";alert(document.domain)//` |
+| URL attribute | `<a href="xss7a9c">` | `javascript:alert(document.domain)` |
+| CSS | `<style>…xss7a9c…</style>` | CSS-injection; rarely direct JS in modern browsers |
+
+See [Payload construction](/codex/web/xss/payload-construction/) for the full per-context catalog, and [Filter bypasses](/codex/web/xss/filter-bypasses/) when the obvious payload is stripped or encoded.
+
+## Step 3 - Check the reflection's encoding
+
+The same input often reflects in more than one place, encoded differently in each. A value HTML-entity-encoded in the visible body may be reflected raw inside a hidden attribute or a JS variable. Test every reflection, not just the first:
+
+```
+# One input, three reflections - only the third is exploitable
+<p>Results for: &lt;svg&gt;</p>           ← entity-encoded, dead
+<input value="&lt;svg&gt;">               ← entity-encoded, dead
+<script>var q="</script>...";</script>    ← raw in JS string, LIVE
+```
+
+<Aside type="note">
+**Markdown reflections** are a common variant: an app that renders user input as Markdown may encode `<` but still allow `[x](javascript:alert(1))` link syntax or raw HTML passthrough. Treat the rendered output as the context, not the raw input.
+</Aside>
+
+## Confirm and escalate
+
+Once a payload fires:
+
+1. Replace the `alert` proof with the real action - usually session exfiltration. The cookie-logger pattern and callback infrastructure live in [XSS to session](/codex/web/sessions/xss-to-session/).
+2. If cookies are `HttpOnly`, pivot to an in-browser CSRF action or scrape the DOM for data and tokens - see [XSS+CSRF chain](/codex/web/sessions/xss-csrf-chain/).
+3. Build the final deliverable: the crafted URL (or auto-submitting form page) you would actually send a victim.
+
+## Common failure modes
+
+- **Reflection is HTML-entity-encoded everywhere.** The app is output-encoding correctly in this sink. Check other sinks/contexts for the same input before concluding it is safe.
+- **Fires in Repeater but not the browser.** The browser may re-encode the URL, or a client-side framework may re-render and strip it. Test in a real browser, and consider whether it is actually [DOM-based](../dom-based/).
+- **Payload works logged-out but the target is logged-in-only.** Make sure your proof runs in the authenticated view; some reflections only exist on authenticated pages.
+
+## Quick reference
+
+| Step | Action |
+|---|---|
+| Map | Every param, field, and reflected header |
+| Canary | Unique alphanumeric marker per input |
+| Context | Read the markup around each reflection |
+| Payload | Pick by context ([catalog](/codex/web/xss/payload-construction/)) |
+| Bypass | If filtered, see [Filter bypasses](/codex/web/xss/filter-bypasses/) |
+| Confirm | `alert(document.domain)` |
+| Escalate | [Session theft](/codex/web/sessions/xss-to-session/) / [CSRF chain](/codex/web/sessions/xss-csrf-chain/) |
+
+## Next move
+
+- **Reflection in HTML body, no filtering** → `<svg onload=…>`; escalate straight to [session theft](/codex/web/sessions/xss-to-session/)
+- **Reflection inside an attribute** → break out with `">` or add `autofocus`+`onfocus`; see [Payload construction](/codex/web/xss/payload-construction/)
+- **Reflection inside a JS string** → `';alert(document.domain)//`, then repair the string so the page doesn't break
+- **Payload stripped or encoded** → [Filter bypasses](/codex/web/xss/filter-bypasses/)
+- **No reflection anywhere** → the sink may be client-side ([DOM-based](../dom-based/)) or persisted and rendered elsewhere ([Stored](../stored/) / [Blind](../blind-xss/))
+- **Confirmed but cookies are `HttpOnly`** → [XSS+CSRF chain](/codex/web/sessions/xss-csrf-chain/) or DOM scraping
