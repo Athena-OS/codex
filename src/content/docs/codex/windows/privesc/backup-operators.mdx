@@ -2,7 +2,7 @@
 title: Backup Operators
 description: Domain-compromise escalation via the Backup Operators group - membership grants SeBackupPrivilege and SeRestorePrivilege, which allow reading and writing any file with backup semantics regardless of DACL. On a Domain Controller this means dumping NTDS.dit (the AD credential database) and the SAM/SYSTEM registry hives, leading to every domain account's NTLM hash. The diskshadow VSS workflow handles the locked-file problem; SeBackupPrivilegeUtils handles the copy; secretsdump.py handles the offline credential extraction.
 mitre: [T1003.002, T1003.003, T1078.002, T1068]
-d3fend: [D3-FAC]
+d3fend: [D3-LFP]
 impact: [PrivEsc, CredentialTheft, DomainCompromise, AdminCompromise]
 owasp: []
 noise: loud

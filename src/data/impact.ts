@@ -56,6 +56,31 @@ export const IMPACT: Record<string, ImpactLabel> = {
     label: 'Session Takeover',
     description: 'Take over an authenticated user session',
   },
+  AccountTakeover: {
+    id: 'AccountTakeover',
+    label: 'Account Takeover',
+    description: 'Gain persistent control of another user account (password reset, email change, credential overwrite)',
+  },
+  AdminCompromise: {
+    id: 'AdminCompromise',
+    label: 'Admin Compromise',
+    description: 'Gain administrative control of the application or host',
+  },
+  SystemCompromise: {
+    id: 'SystemCompromise',
+    label: 'System Compromise',
+    description: 'Full control of the host operating system (SYSTEM / root)',
+  },
+  DomainCompromise: {
+    id: 'DomainCompromise',
+    label: 'Domain Compromise',
+    description: 'Control of the Active Directory domain (Domain Admin or equivalent)',
+  },
+  FilterBypass: {
+    id: 'FilterBypass',
+    label: 'Filter Bypass',
+    description: 'Evade input filters, WAF rules, or access-control checks',
+  },
 
   // === Data impacts ===
   DataExfil: {
@@ -78,6 +103,21 @@ export const IMPACT: Record<string, ImpactLabel> = {
     label: 'File Write',
     description: 'Write arbitrary files to the target system',
   },
+  SourceCodeDisclosure: {
+    id: 'SourceCodeDisclosure',
+    label: 'Source Disclosure',
+    description: 'Read application source code, exposing logic, secrets, and further bugs',
+  },
+  Integrity: {
+    id: 'Integrity',
+    label: 'Integrity',
+    description: 'Tamper with data or content the target trusts',
+  },
+  Defacement: {
+    id: 'Defacement',
+    label: 'Defacement',
+    description: 'Alter visible content presented to users of the target',
+  },
 
   // === Network / Lateral impacts ===
   InternalAccess: {
@@ -94,6 +134,30 @@ export const IMPACT: Record<string, ImpactLabel> = {
     id: 'Pivot',
     label: 'Pivot',
     description: 'Use the compromised host as a stepping-stone to other targets',
+  },
+  SSRF: {
+    id: 'SSRF',
+    label: 'SSRF',
+    description: 'Make the server issue requests on the attacker\'s behalf',
+  },
+
+  // === Information gathering ===
+  Reconnaissance: {
+    id: 'Reconnaissance',
+    label: 'Recon',
+    description: 'Learn about the target environment before acting on it',
+  },
+  Discovery: {
+    id: 'Discovery',
+    label: 'Discovery',
+    description: 'Enumerate users, groups, processes, and software on a compromised host',
+  },
+
+  // === Social engineering ===
+  PhishingDelivery: {
+    id: 'PhishingDelivery',
+    label: 'Phishing Delivery',
+    description: 'Use the trusted target domain to deliver phishing content or redirects',
   },
 
   // === Availability / Disruption ===

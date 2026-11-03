@@ -6,7 +6,7 @@
 // Pages can include a `d3fend:` frontmatter field with D3FEND IDs:
 //
 //   ---
-//   d3fend: [D3-IDA, D3-MH, D3-NTA]
+//   d3fend: [D3-MH, D3-NTA]
 //   ---
 //
 // These render in the page footer (not as a dedicated section) - defenders
@@ -21,7 +21,7 @@
 // new D3FEND IDs will be added here.
 
 export interface D3fendTechnique {
-  /** D3FEND ID, e.g. "D3-IDA" (Identifier-based Access Control) */
+  /** D3FEND ID, e.g. "D3-NTA" (Network Traffic Analysis) */
   id: string;
   /** Canonical technique name */
   name: string;
@@ -94,7 +94,7 @@ export const D3FEND: Record<string, D3fendTechnique> = {
   'D3-EAL': {
     id: 'D3-EAL',
     name: 'Executable Allowlisting',
-    tactic: 'Harden',
+    tactic: 'Isolate',
     slug: 'ExecutableAllowlisting',
   },
   'D3-SU': {
@@ -194,6 +194,57 @@ export const D3FEND: Record<string, D3fendTechnique> = {
     name: 'Process Eviction',
     tactic: 'Evict',
     slug: 'ProcessEviction',
+  },
+
+  // === Added for auth, session, and Windows privesc pages ===
+  // IDs verified against the D3FEND ontology (d3fend-ontology, d3fend-protege.ttl).
+  'D3-TB': {
+    id: 'D3-TB',
+    name: 'Token Binding',
+    tactic: 'Harden',
+    slug: 'TokenBinding',
+  },
+  'D3-LFP': {
+    id: 'D3-LFP',
+    name: 'Local File Permissions',
+    tactic: 'Isolate',
+    slug: 'LocalFilePermissions',
+  },
+  'D3-IAA': {
+    id: 'D3-IAA',
+    name: 'Identifier Activity Analysis',
+    tactic: 'Detect',
+    slug: 'IdentifierActivityAnalysis',
+  },
+  'D3-RAPA': {
+    id: 'D3-RAPA',
+    name: 'Resource Access Pattern Analysis',
+    tactic: 'Detect',
+    slug: 'ResourceAccessPatternAnalysis',
+  },
+  'D3-LAM': {
+    id: 'D3-LAM',
+    name: 'Local Account Monitoring',
+    tactic: 'Detect',
+    slug: 'LocalAccountMonitoring',
+  },
+  'D3-PM': {
+    id: 'D3-PM',
+    name: 'Platform Monitoring',
+    tactic: 'Detect',
+    slug: 'PlatformMonitoring',
+  },
+  'D3-FIM': {
+    id: 'D3-FIM',
+    name: 'File Integrity Monitoring',
+    tactic: 'Detect',
+    slug: 'FileIntegrityMonitoring',
+  },
+  'D3-SYSM': {
+    id: 'D3-SYSM',
+    name: 'System Mapping',
+    tactic: 'Model',
+    slug: 'SystemMapping',
   },
 };
 

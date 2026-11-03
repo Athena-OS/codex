@@ -434,4 +434,161 @@ export const MITRE_TECHNIQUES: Record<string, MitreTechnique> = {
 
   // Server-Side Includes - Apache mod_include exploitation, T1190 + T1505.003
   // (web shell persistence is the natural follow-up).
+
+  // === Valid accounts (sub-techniques) ===
+  'T1078.001': {
+    id: 'T1078.001',
+    name: 'Default Accounts',
+    tactic: 'Initial Access',
+  },
+  'T1078.002': {
+    id: 'T1078.002',
+    name: 'Domain Accounts',
+    tactic: 'Privilege Escalation',
+  },
+  'T1078.003': {
+    id: 'T1078.003',
+    name: 'Local Accounts',
+    tactic: 'Initial Access',
+  },
+
+  // === Web authentication & phishing ===
+  'T1556': {
+    id: 'T1556',
+    name: 'Modify Authentication Process',
+    tactic: 'Credential Access',
+  },
+  'T1606': {
+    id: 'T1606',
+    name: 'Forge Web Credentials',
+    tactic: 'Credential Access',
+  },
+  'T1110.002': {
+    id: 'T1110.002',
+    name: 'Password Cracking',
+    tactic: 'Credential Access',
+  },
+  'T1566.002': {
+    id: 'T1566.002',
+    name: 'Spearphishing Link',
+    tactic: 'Initial Access',
+  },
+  'T1491': {
+    id: 'T1491',
+    name: 'Defacement',
+    tactic: 'Impact',
+  },
+  'T1491.002': {
+    id: 'T1491.002',
+    name: 'External Defacement',
+    tactic: 'Impact',
+  },
+  'T1059.006': {
+    id: 'T1059.006',
+    name: 'Python',
+    tactic: 'Execution',
+  },
+
+  // === Windows - credential dumping ===
+  'T1003.001': {
+    id: 'T1003.001',
+    name: 'LSASS Memory',
+    tactic: 'Credential Access',
+  },
+  'T1003.002': {
+    id: 'T1003.002',
+    name: 'Security Account Manager',
+    tactic: 'Credential Access',
+  },
+  'T1003.003': {
+    id: 'T1003.003',
+    name: 'NTDS',
+    tactic: 'Credential Access',
+  },
+
+  // === Windows - privilege escalation ===
+  'T1134': {
+    id: 'T1134',
+    name: 'Access Token Manipulation',
+    tactic: 'Privilege Escalation',
+  },
+  'T1134.001': {
+    id: 'T1134.001',
+    name: 'Token Impersonation/Theft',
+    tactic: 'Privilege Escalation',
+  },
+  'T1134.002': {
+    id: 'T1134.002',
+    name: 'Create Process with Token',
+    tactic: 'Privilege Escalation',
+  },
+  'T1134.004': {
+    id: 'T1134.004',
+    name: 'Parent PID Spoofing',
+    tactic: 'Privilege Escalation',
+  },
+  'T1543.003': {
+    id: 'T1543.003',
+    name: 'Windows Service',
+    tactic: 'Privilege Escalation',
+  },
+  'T1574': {
+    id: 'T1574',
+    name: 'Hijack Execution Flow',
+    tactic: 'Privilege Escalation',
+  },
+  // T1574.002 (DLL Side-Loading) was revoked by MITRE and merged into
+  // T1574.001 - use the new ID on pages.
+  'T1574.001': {
+    id: 'T1574.001',
+    name: 'DLL',
+    tactic: 'Privilege Escalation',
+  },
+  'T1098': {
+    id: 'T1098',
+    name: 'Account Manipulation',
+    tactic: 'Persistence',
+  },
+  'T1222.001': {
+    id: 'T1222.001',
+    name: 'Windows Permissions',
+    tactic: 'Defense Evasion',
+  },
+  'T1559.001': {
+    id: 'T1559.001',
+    name: 'Component Object Model',
+    tactic: 'Execution',
+  },
+  'T1021.003': {
+    id: 'T1021.003',
+    name: 'Distributed Component Object Model',
+    tactic: 'Lateral Movement',
+  },
+
+  // === Windows - local discovery ===
+  'T1033': {
+    id: 'T1033',
+    name: 'System Owner/User Discovery',
+    tactic: 'Discovery',
+  },
+  'T1057': {
+    id: 'T1057',
+    name: 'Process Discovery',
+    tactic: 'Discovery',
+  },
+  'T1069.001': {
+    id: 'T1069.001',
+    name: 'Local Groups',
+    tactic: 'Discovery',
+  },
+  'T1518': {
+    id: 'T1518',
+    name: 'Software Discovery',
+    tactic: 'Discovery',
+  },
+  'T1518.001': {
+    id: 'T1518.001',
+    name: 'Security Software Discovery',
+    tactic: 'Discovery',
+  },
 };
