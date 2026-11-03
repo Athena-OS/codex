@@ -155,6 +155,8 @@ Once you have any working injection, identify the engine:
   </TabItem>
 </Tabs>
 
+When the injection reflects into a **numeric-only** context (a string like `@@version` won't render, or breaks the query), fingerprint with a function that returns a number: `SELECT POW(1,1)` returns `1` on MySQL/MariaDB. The short `POW` alias errors on PostgreSQL/MSSQL/Oracle (which expose only `POWER`), so a numeric `1` coming back is a strong MySQL/MariaDB tell.
+
 Behavioural fingerprinting (no UNION needed):
 
 | Test | True for |
