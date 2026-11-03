@@ -171,6 +171,31 @@ $env:PROGRAMFILES[0]            # "C"
 
 PowerShell treats strings as char arrays for indexing. No length needed for single chars.
 
+## Generating arbitrary blocked characters
+
+Environment-variable slicing (above) only yields characters that happen to sit in some variable's value. When the character you need isn't reachable that way, **shift it out of an adjacent one**: `tr` maps one character range onto another, so feeding it the character *before* your target and shifting the whole printable range up by one prints the target - without the target ever appearing in the payload.
+
+### Linux - `tr` range shift
+
+```bash
+# Need "\" (ASCII 92). The character just before it is "[" (91).
+echo $(tr '!-}' '"-~'<<<[)       # shifts every printable char up by one → "\"
+```
+
+`'!-}'` is the source range (ASCII 33-125), `'"-~'` the destination (34-126) - every character maps to the next one up. Look the target up in `man ascii`, feed `tr` the character one position lower, and the shifted output is the blocked character. Handy for producing `;`, `\`, `` | ``, `` ` `` and other separators/metacharacters a blacklist strips on sight. To shift the other way, swap the ranges: `tr '"-~' '!-}'`.
+
+### Windows
+
+PowerShell builds the same result straight from a code point - cast an integer to `[char]`, no shifting needed:
+
+```powershell
+[char]92                         # "\"
+[char]59                         # ";"
+"$([char]59)whoami"              # interpolate into a larger command string
+```
+
+cmd.exe has no clean equivalent; use the `%VAR:~i,1%` slicing above, or drop to PowerShell.
+
 ## Command name obfuscation
 
 Filter blocks the literal command (`whoami`, `cat`, `wget`). Insert characters the shell discards.
