@@ -93,6 +93,8 @@ For the FileZilla example, `127.0.0.1:14147` is the FileZilla Server administrat
 
 The Splunk Universal Forwarder pattern is similar: default management port `8089` running as SYSTEM, no authentication in older default configs, allows arbitrary script deployment via the forwarder agent. Worth checking even on modern hosts.
 
+The Erlang distribution port (`25672`, used by RabbitMQ, CouchDB, and some SolarWinds components) is another SYSTEM-context target. Erlang nodes authenticate to each other with a shared **Erlang cookie** - often the default `rabbit`, or a value sitting in a world-readable file (`%USERPROFILE%\.erlang.cookie`, `C:\Windows\.erlang.cookie`, or the install directory). With the cookie you can join the cluster as a peer node and execute Erlang - and therefore OS commands - in the service's context.
+
 ## Defensive products
 
 Knowing what's watching changes what's safe to do.

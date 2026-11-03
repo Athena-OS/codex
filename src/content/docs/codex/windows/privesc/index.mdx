@@ -177,8 +177,12 @@ When the engagement explicitly authorizes "loud" testing (configuration audit, n
 | [Backup Operators](/codex/windows/privesc/backup-operators/) | SeBackup/SeRestore for NTDS.dit dump and registry hive extraction |
 | [DnsAdmins](/codex/windows/privesc/dnsadmins/) | DNS plugin DLL injection on Domain Controllers |
 | [Other privileged groups](/codex/windows/privesc/other-privileged-groups/) | Event Log Readers, Hyper-V Admins, Print Operators, Server Operators |
+| [UAC bypass](/codex/windows/privesc/uac-bypass/) | Filtered-admin-token elevation via auto-elevating binaries (fodhelper registry hijack, srrstr DLL hijack) |
+| [Weak permissions](/codex/windows/privesc/weak-permissions/) | Modifiable service binary / config / registry key, unquoted paths, autoruns |
+| [Vulnerable services](/codex/windows/privesc/vulnerable-services/) | Exploiting known-vulnerable third-party SYSTEM services (e.g. Druva inSync) |
+| [DLL hijacking](/codex/windows/privesc/dll-hijacking/) | Search-order abuse - missing-DLL plant and DLL proxying |
 
-Subsequent rounds will cover OS attacks (UAC bypass, weak service ACLs, kernel exploits, DLL injection), credential hunting (config files, registry, browsers, password managers), restricted environments (Citrix breakout, kiosks), and miscellaneous techniques (LOLBAS, AlwaysInstallElevated, scheduled task abuse, VHDX mounting, EOL system attacks).
+Subsequent rounds will cover kernel exploits, credential hunting (config files, registry, browsers, password managers), restricted environments (Citrix breakout, kiosks), and miscellaneous techniques (LOLBAS, AlwaysInstallElevated, scheduled task abuse, VHDX mounting, EOL system attacks).
 
 ## Operational sequence
 
