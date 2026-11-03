@@ -23,12 +23,21 @@ The one control that removes the bug. On each request that names an object, the 
 - Check at the **object level**, not just "is the user logged in." Authentication (who you are) is not authorization (what you may touch).
 - Do it on **every** endpoint and **every** verb. A GET that checks and a PUT that doesn't is still IDOR - see [verb tampering](/codex/web/auth/verb-tampering/) and [insecure APIs](/codex/web/idor/insecure-apis/).
 - Deny by default: the resource is inaccessible unless a rule explicitly grants this caller access.
+- Authorize at the **field level** too, not just the object. Owning an object is not permission to change *every field* of it - if the record holds privilege-bearing fields (`role`, `is_admin`, `email` used for reset), an owner-write rule lets a user escalate their own role and come back as admin on the next login (this is the [chaining](/codex/web/idor/chaining/) finish). Restrict self-service writes to an explicit allowlist of editable fields and reserve `role`/privilege changes for an admin-only path.
 
 ```javascript
-// Firestore-style rule: read/write only if the caller owns the record or is admin
+// Object-level: owner or admin may touch the record...
 match /api/profile/{userId} {
-  allow read, write: if request.auth != null
+  allow read: if request.auth != null
     && (request.auth.uid == userId || request.auth.token.role == 'admin');
+  // ...but a self-service write may only set non-privileged fields.
+  // role / is_admin / verified-email changes require an admin path.
+  allow write: if request.auth != null && (
+    request.auth.token.role == 'admin'
+    || (request.auth.uid == userId
+        && !request.resource.data.diff(resource.data).affectedKeys()
+              .hasAny(['role', 'is_admin', 'email']))
+  );
 }
 ```
 
@@ -63,9 +72,10 @@ UUIDs can make IDOR *harder to detect* in testing without making it absent - a r
 ## For the report
 
 1. **Primary:** add a server-side object-level authorization check to the affected endpoint(s), for every verb, comparing the object's owner/ACL against the identity resolved from the session.
-2. **Systemic:** centralise this in an access-control layer (RBAC/ABAC) so new endpoints inherit it; deny by default.
-3. **Never trust the request** for identity or role - resolve both server-side.
-4. **Defence in depth:** unpredictable, server-generated references (UUIDv4); authorization-failure logging.
+2. **Field-level writes:** restrict self-service create/update to an allowlist of non-privileged fields; route `role`/`is_admin`/verified-email changes through an admin-only path, so owning a record can't become escalating it.
+3. **Systemic:** centralise this in an access-control layer (RBAC/ABAC) so new endpoints inherit it; deny by default.
+4. **Never trust the request** for identity or role - resolve both server-side.
+5. **Defence in depth:** unpredictable, server-generated references (UUIDv4); authorization-failure logging.
 
 Avoid presenting "switch to UUIDs" as the fix - it's the second step, and an app that does only that is still vulnerable to every reference-obtaining attack in this cluster.
 

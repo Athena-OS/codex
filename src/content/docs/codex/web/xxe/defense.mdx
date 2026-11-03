@@ -18,17 +18,22 @@ For the operator, the signal is in [identifying](/codex/web/xxe/identifying/): a
 
 ## 1. Disable DTDs and external entities in the parser
 
-The complete fix. Configure the XML parser to reject document type definitions; if the app legitimately needs DTDs, at minimum disable external general and parameter entities. The exact switch is per-library - use the official setting, don't hand-roll:
+The complete fix. Configure the XML parser to reject document type definitions; if the app legitimately needs DTDs, you must then disable external general entities, external parameter entities, **and external DTD loading** - the last one matters, because an allowed DOCTYPE can still pull in an external DTD (an outbound fetch / SSRF, and the carrier for blind parameter-entity exfil) even with the entity flags off. The exact switch is per-library - use the official setting, don't hand-roll:
 
 ```java
 // Java - the strongest single switch: forbid DOCTYPE entirely
 DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
 dbf.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
-// if DOCTYPE must be allowed, also:
+
+// If DOCTYPE MUST be allowed, drop the line above and instead disable all three:
 dbf.setFeature("http://xml.org/sax/features/external-general-entities", false);
 dbf.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
+dbf.setFeature("http://apache.org/xml/features/nonvalidating/load-external-dtd", false); // external DTD fetch (SSRF)
 dbf.setXIncludeAware(false);
 dbf.setExpandEntityReferences(false);
+// JAXP belt-and-braces: forbid any external access
+dbf.setAttribute(javax.xml.XMLConstants.ACCESS_EXTERNAL_DTD, "");
+dbf.setAttribute(javax.xml.XMLConstants.ACCESS_EXTERNAL_SCHEMA, "");
 ```
 
 Equivalents:
@@ -38,7 +43,7 @@ Equivalents:
 - **PHP (libxml):** avoid the deprecated `libxml_disable_entity_loader()` dance - on modern libxml (2.9+) external entities are off by default; don't re-enable them with `LIBXML_NOENT`.
 - **libxml2 generally:** don't pass `XML_PARSE_NOENT` / `XML_PARSE_DTDLOAD`.
 
-Harden all of: custom DTDs, external general **and** parameter entities, `XInclude`, and entity-reference expansion (the last blocks billion-laughs entity-expansion DoS).
+Harden all of: custom DTDs, external general **and** parameter entities, **external DTD loading** (the SSRF/blind-exfil carrier when DOCTYPE is permitted), `XInclude`, and entity-reference expansion (the last blocks billion-laughs entity-expansion DoS).
 
 <Aside type="caution">
 Watch the hidden XML parsers. SVG image processors, DOCX/XLSX/ODF openers, PDF generators, and SOAP/XML API layers all parse XML and are all XXE-able - the [uploads limited-uploads](/codex/web/uploads/limited-uploads/) page attacks exactly these. Apply the same parser hardening wherever any of them run, not just the obvious `/api` endpoint.
@@ -63,7 +68,7 @@ Error-based XXE ([blind exfil](/codex/web/xxe/blind-exfil/)) exfiltrates file co
 
 ## For the report
 
-1. **Primary:** disable DTD processing (or at least external general + parameter entities and XInclude) in every XML parser the app uses, via the library's official setting; prefer a hardened wrapper like `defusedxml`.
+1. **Primary:** disable DTD processing (or, if DOCTYPE must stay, external general + parameter entities, **external DTD loading**, and XInclude) in every XML parser the app uses, via the library's official setting; prefer a hardened wrapper like `defusedxml`.
 2. **Coverage:** apply it to every XML sink - SOAP, SVG/image, document, and PDF processors included, not just the obvious endpoint.
 3. **Patch:** update XML libraries and XML-consuming components to current versions.
 4. **Containment:** suppress verbose parser errors; restrict the app server's outbound network access; WAF as a secondary layer.
