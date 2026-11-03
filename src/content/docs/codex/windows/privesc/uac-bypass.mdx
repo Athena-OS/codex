@@ -42,7 +42,7 @@ This is **not** a standard-user-to-admin escalation - you must already be in the
 The **built-in RID 500 Administrator** is the exception - it runs at high integrity by default (unless `FilterAdministratorToken` is enabled), so it needs no bypass.
 
 <Aside type="note">
-Microsoft is explicit that UAC is a convenience feature, **not a security boundary** - bypasses are "won't fix" by design. It still matters operationally: elevating is an extra, noisier step, and a well-configured host (`ConsentPromptBehaviorAdmin = Always Notify`, `0x2`/`0x5`) closes many bypasses.
+Microsoft is explicit that UAC is a convenience feature, **not a security boundary** - bypasses are "won't fix" by design. It still matters operationally: elevating is an extra, noisier step, and a well-configured host (`ConsentPromptBehaviorAdmin = 0x2`, "Always Notify" on the secure desktop) closes many bypasses.
 </Aside>
 
 ## Enumerate the UAC state
@@ -54,7 +54,9 @@ REG QUERY HKLM\Software\Microsoft\Windows\CurrentVersion\Policies\System /v Enab
 
 # How aggressive is the prompt? (fewer bypasses at the highest level)
 REG QUERY HKLM\Software\Microsoft\Windows\CurrentVersion\Policies\System /v ConsentPromptBehaviorAdmin
-#   0x5 / 0x2 = Always Notify (hardest)   0x0 = elevate silently (easiest)
+#   0x2 = Always Notify, consent on secure desktop (hardest)
+#   0x5 = DEFAULT - prompt for consent for non-Windows binaries; still auto-elevates Windows binaries
+#   0x0 = elevate silently (easiest)
 
 # Which Windows build? UAC bypasses are build-specific
 [environment]::OSVersion.Version          # e.g. 10.0.14393 → Windows 10 release 1607

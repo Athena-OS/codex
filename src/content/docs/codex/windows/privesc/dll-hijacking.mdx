@@ -13,7 +13,7 @@ sidebar:
 
 ## TL;DR
 
-When a process loads a DLL **by name** rather than by full path, Windows walks a fixed search order to find it. If you can write a DLL into a directory that is searched *before* the legitimate one - or into a directory searched at all, for a DLL that is missing entirely - the privileged process loads your code and runs it in its own context. Against a SYSTEM service or an auto-elevated binary, that's SYSTEM.
+When a process loads a DLL **by name** rather than by full path, Windows walks a fixed search order to find it. If you can write a DLL into a directory that is searched *before* the legitimate one - or into a directory searched at all, for a DLL that is missing entirely - the privileged process loads your code and runs it in its own context. The privilege you gain is whatever the target runs as: hijack a service running as `LocalSystem` and you get **SYSTEM**; hijack an auto-elevating binary and you get the administrator's **high-integrity** token (not SYSTEM - that's a UAC bypass, see below).
 
 ```
 # 1. Watch what a target process loads (Sysinternals Procmon)
@@ -45,16 +45,17 @@ With **Safe DLL Search Mode** enabled (the default), a by-name load is resolved 
 
 With Safe mode **disabled** (`HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\SafeDllSearchMode = 0`), the *current directory* jumps up to position 2 - which widens the attack surface considerably.
 
-Two things make a load hijackable: a DLL requested by name (no absolute path), and a writable directory that appears in the search order at or before where the real DLL lives. A writable application directory beats System32; a writable `PATH` entry (the `%PATH%` abuse that also powers some [UAC bypasses](/codex/windows/privesc/uac-bypass/)) catches the tail.
+Two things are *necessary* for a hijack: a DLL requested by name (no absolute path), and a writable directory that appears in the search order at or before where the real DLL lives. They are not *sufficient* - the filesystem search above only runs after Windows has tried API sets, SxS/manifest redirection, modules already loaded in the process, and the **KnownDLLs** list. A KnownDLL (most of System32's core DLLs) is served from a protected section regardless of the search order, so planting one in a writable application directory does **not** override the system copy. So a writable application directory beats System32 *only for a DLL that isn't a KnownDLL and isn't otherwise redirected*; a writable `PATH` entry (the `%PATH%` abuse that also powers some [UAC bypasses](/codex/windows/privesc/uac-bypass/)) catches the tail. Always confirm against the target's actual load behaviour (next section) rather than assuming a writable directory is exploitable.
 
 ## Finding a hijackable load
 
 [Procmon](https://learn.microsoft.com/en-us/sysinternals/downloads/procmon) (Sysinternals) is the primary tool - it records every file operation. Launch the target, then filter:
 
-- **`Result is NAME NOT FOUND` + `Path ends with .dll`** - the gold case. The process asked for a DLL and *didn't find it anywhere*; drop yours in any searched directory you can write to.
+- **`Result is NAME NOT FOUND` + `Path ends with .dll`** - the lead to chase, but read it carefully. A single `NAME NOT FOUND` is *one filesystem probe*, not the outcome of the whole lookup: a load routinely fails in the application directory and then **succeeds** in System32 a few lines later. Follow the complete lookup for that DLL - only if *every* probe fails is the DLL genuinely missing and plantable anywhere searched. If it succeeds somewhere, you can only hijack a writable directory that is searched *before* that successful hit; dropping it in a later `PATH` directory would never load.
 
   ```
-  main.exe  CreateFile  C:\Program Files\App\x.dll  NAME NOT FOUND
+  main.exe  CreateFile  C:\Program Files\App\x.dll     NAME NOT FOUND   ← probe 1 failed
+  main.exe  CreateFile  C:\Windows\System32\x.dll      SUCCESS          ← actually loaded here
   ```
 
 - **`Operation is Load Image`** - shows DLLs the process *did* load, and from where. A load out of a writable directory (an app dir with loose ACLs) is hijackable by replacing/preempting that file.

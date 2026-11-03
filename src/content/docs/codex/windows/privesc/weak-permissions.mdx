@@ -91,9 +91,11 @@ Note the space after `binpath=` - `sc` requires it. The Update Orchestrator Serv
 **Cleanup:** restore the original `binPath` and restart so the service works:
 
 ```
-sc config WindscribeService binpath= "C:\Program Files (x86)\Windscribe\WindscribeService.exe"
+sc config WindscribeService binpath= "\"C:\Program Files (x86)\Windscribe\WindscribeService.exe\""
 sc start WindscribeService
 ```
+
+The inner escaped quotes matter: `sc`'s own parsing strips the outer pair, so `binpath= "C:\Program Files...\x.exe"` stores the path **unquoted** - restoring it that way reintroduces an unquoted-service-path weakness (see below) instead of fixing the service. Escape the quotes (`\"..\"`) so they're literally stored in `ImagePath`.
 
 ## 3. Permissive registry ACL (`ImagePath`)
 
