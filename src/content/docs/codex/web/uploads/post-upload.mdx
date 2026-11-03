@@ -173,9 +173,14 @@ filename="shell.aspx::$DATA"        # same, different syntax
 filename="shell.aspx.    .  "       # trailing dots/spaces - Windows strips
 filename="shell.aspx ."             # similar
 filename="HAC~1.TXT"                # 8.3 short name reference
+filename="sh|ll.aspx"               # invalid filename char (| < > * ?) → write API errors
+filename="CON" / "LPT1" / "COM1"    # reserved device names → write API errors
+filename="NUL"                      # device: often accepted and silently discarded (may NOT error)
 ```
 
 The first form abuses NTFS Alternate Data Streams - when Windows receives a filename containing `:`, it interprets everything after the colon as a stream name. The base file (`shell.aspx`) is what actually gets written to disk; the stream name (`.jpg`) is metadata. The application sees `shell.aspx:.jpg` and runs its `.jpg` validation, but the on-disk file is `shell.aspx`.
+
+The reserved **filename characters** (`|`, `<`, `>`, `*`, `?` - invalid in Windows filenames and rejected even when quoted) and reserved **device names** (`CON`, `LPT1`, `COM1`…) make the write-file API fail. Whether that failure *leaks* anything is application-dependent: if the app surfaces the exception and the message includes the destination path, you get the upload directory; otherwise you just get a generic error. Note `NUL` is a device that *accepts and discards* writes, so it often doesn't error at all. Treat these as API-dependent probes, useful only where errors are exposed.
 
 ## Finding the upload directory
 
