@@ -1,0 +1,107 @@
+---
+title: Defending Sessions
+description: Consolidated remediation for the session-attack cluster - cookie flags, session regeneration, strong identifiers, anti-CSRF, open-redirect handling, and transport, ordered by what each attack needs.
+mitre: [T1539]
+d3fend: [D3-TB, D3-CH]
+owasp: [A01, A07]
+sidebar:
+  order: 12
+  label: Defense
+---
+import { Aside } from '@astrojs/starlight/components';
+
+Every attack in this cluster targets one of a few weaknesses: a cookie the browser hands to the wrong party, an identifier that survives login or can be predicted, or a state-changing request the server trusts without proof it came from its own page. This page gathers the fixes in one place and maps each to the attack it closes, so a report can cite them together.
+
+<Aside type="note">
+For the operator: the presence or absence of these controls is a fast triage signal. No `HttpOnly` → try [XSS cookie theft](../xss-to-session/). No `SameSite` and no token → [CSRF](../csrf/). Session ID unchanged after login → [fixation](../fixation/). Session cookie over plain HTTP → [sniffing](../obtaining-tokens/). A custom, decodable token → [weak identifiers](../weak-identifiers/).
+</Aside>
+
+## Cookie flags (the cheapest, highest-leverage fix)
+
+Three attributes on the session cookie neutralise three different attacks:
+
+| Flag | What it does | Attack it closes |
+|---|---|---|
+| `HttpOnly` | JavaScript can't read the cookie (`document.cookie` omits it) | [XSS cookie exfiltration](../xss-to-session/) |
+| `Secure` | Cookie is only sent over HTTPS | [Plaintext sniffing](../obtaining-tokens/) |
+| `SameSite=Lax` or `Strict` | Cookie isn't sent on cross-site requests | [CSRF](../csrf/) |
+
+```
+Set-Cookie: session=…; HttpOnly; Secure; SameSite=Lax; Path=/
+```
+
+`SameSite=Lax` is a sensible default (it still sends the cookie on top-level GET navigations); use `Strict` for high-value apps that don't need cross-site entry. `HttpOnly` blocks the *simplest* XSS theft but not XSS itself - an attacker can still act in-session and scrape the DOM, so it is containment, not a cure (see [XSS defense](/codex/web/xss/defense/)).
+
+## Regenerate the identifier on every privilege change
+
+Issuing a **new** session ID at login (and logout, and privilege elevation) and invalidating the old one closes [session fixation](../fixation/): a value the attacker planted before login is dead the moment the victim authenticates. Use the framework's built-in call, not a custom scheme.
+
+```php
+// PHP - keep session data, swap the ID
+session_regenerate_id(true);   // true = delete the old session file
+```
+
+```java
+// Java - invalidate, then get a fresh session
+session.invalidate();
+session = request.getSession(true);
+```
+
+```csharp
+// .NET - Session.Abandon() alone is not enough: the ID cookie persists
+// and is reused. Abandon AND overwrite/expire the session cookie.
+Session.Abandon();
+Response.Cookies.Add(new HttpCookie("ASP.NET_SessionId", "") { Expires = DateTime.Now.AddDays(-1) });
+```
+
+<Aside type="caution">
+The .NET caveat is real and commonly missed: `Session.Abandon()` clears server state but leaves the same session-ID cookie in the browser, so the next request reuses it. Expire/overwrite the cookie as well, or fixation survives the "fix."
+</Aside>
+
+## Strong identifiers and lifecycle
+
+Closes [weak-identifier prediction and brute-forcing](../weak-identifiers/):
+
+- **Randomness:** use the platform CSPRNG via the framework's session manager - never a custom generator, a counter, a timestamp, or `hash(username)`. A secure ID carries no reversible structure.
+- **Validity scope:** one identifier per session; don't accept a pre-login ID post-login (see regeneration above).
+- **Expiry:** enforce an absolute and an idle server-side timeout, and invalidate server-side on logout - don't rely on deleting the client cookie.
+
+## Anti-CSRF: token plus SameSite
+
+Closes [CSRF](../csrf/) and resists the [token-bypass tricks](../csrf-token-bypass/):
+
+- **Synchronizer token pattern:** a per-session (ideally per-request) random, unpredictable token on every state-changing request, verified server-side. This is the primary control.
+- Reject the request when the token is missing, empty, malformed, or belongs to another session - the bypass categories exist precisely because apps skip one of these checks.
+- **Defence in depth:** `SameSite` cookies, and Origin/Referer checks done with exact origin comparison (not substring/regex, which [bypasses](../csrf-token-bypass/#category-6---referer--origin-bypasses) defeat). None of these replace the token on their own.
+
+## Don't trust redirect targets
+
+Closes [open redirect](../open-redirect/) (and the token-leak chains built on it):
+
+- Prefer not taking a URL from the user at all. Where a destination is needed, map an opaque key to a server-side URL rather than redirecting to a user-supplied address.
+- If a URL must be accepted, validate against an **allowlist** of permitted hosts with exact matching - not "starts-with", "contains", or a loose regex, each of which has a [documented bypass](../open-redirect/#validation-bypasses).
+- Keep session tokens out of URLs entirely, so a redirect can't leak them via `Referer` or history.
+
+## Transport and monitoring
+
+- **HTTPS everywhere**, with HSTS, so there is no plaintext leg for [sniffing](../obtaining-tokens/) and `Secure` cookies are never downgraded.
+- **Hijacking has no clean single fix** - a valid identifier is authority by design. Beyond eliminating the acquisition paths above, anomaly detection (sudden IP/User-Agent/geo change on a session) can flag a ridden session, and short timeouts shrink the window. Binding a session to coarse client attributes can help but breaks mobile/roaming users, so apply it judgmentally.
+
+## For the report
+
+Lead with the control that closes the finding you actually demonstrated, then the defence-in-depth layers:
+
+1. **Fixation →** regenerate the session ID on login/logout (framework call; mind the .NET cookie caveat).
+2. **XSS cookie theft →** `HttpOnly` + `Secure`; and fix the XSS itself ([XSS defense](/codex/web/xss/defense/)).
+3. **CSRF →** synchronizer tokens with full validation, plus `SameSite`.
+4. **Sniffing →** HTTPS + HSTS + `Secure`.
+5. **Weak identifiers →** CSPRNG generation, proper scope/expiry.
+6. **Open redirect →** key-to-URL mapping or exact-host allowlist; keep tokens out of URLs.
+
+Avoid presenting a single flag or a Referer check as the whole fix - each closes one path, and this cluster exists because real apps ship with only some of them in place.
+
+## Related
+
+- [XSS defense](/codex/web/xss/defense/) - fixing the XSS that `HttpOnly` only contains
+- [Auth: cookie tampering](/codex/web/auth/cookie-tampering/) - cookie attribute handling in depth
+- [Auth: JWT](/codex/web/auth/jwt/) - when the "session" is a signed token with its own failure modes
