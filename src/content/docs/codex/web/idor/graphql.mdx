@@ -1,0 +1,114 @@
+---
+title: IDOR in GraphQL
+description: GraphQL concentrates object access behind one endpoint - introspection maps the objects, direct id arguments and Relay global IDs expose them, and alias/batch queries enumerate them en masse in a single request.
+mitre: [T1190, T1213]
+d3fend: [D3-IAA]
+impact: [DataExfil, AuthBypass, AccountTakeover]
+owasp: [A01]
+noise: moderate
+sidebar:
+  order: 5
+  label: GraphQL
+---
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+GraphQL doesn't change what IDOR *is* - it's still a missing object-level authorization check - but it changes how you find and exploit it. Objects are fetched by argument (`user(id: 42)`) through a single endpoint, the schema is often self-describing via introspection, and aliases/batching let you pull hundreds of objects in **one** request. If the resolver authorizes the *query* but not the *object*, every one of those is an IDOR.
+
+## TL;DR
+
+```graphql
+# 1. Map the schema (if introspection is on)
+query { __schema { queryType { fields { name } } types { name fields { name } } } }
+
+# 2. Direct object access - swap the id
+query { user(id: 42) { id email role } }
+
+# 3. Mass-enumerate in ONE request via aliases (bypasses per-request rate limits)
+query { u1: user(id:1){email} u2: user(id:2){email} u3: user(id:3){email} }
+
+# 4. Relay global node IDs are usually base64("Type:pk")
+#    "VXNlcjo0Mg==" -> "User:42"; decode, change the pk, re-encode
+query { node(id: "VXNlcjo0Mw==") { ... on User { email } } }
+```
+
+Success indicator: a field you shouldn't see (another user's email, a private record) comes back - or a mutation on someone else's object succeeds.
+
+## Why GraphQL is IDOR-prone
+
+- **One endpoint, many objects.** `/graphql` resolves any object the schema exposes; developers often put authentication on the endpoint and forget per-object authorization in the resolvers.
+- **Introspection hands you the map.** When enabled (common outside production, and left on in production more than it should be), `__schema` lists every type, field, query, and mutation - no guessing which objects exist.
+- **Aliases and batching remove the rate limit.** A single document can request the same field hundreds of times under different aliases, so the per-request throttles that would slow REST [mass enumeration](/codex/web/idor/mass-enumeration/) don't apply.
+- **Mutations are object calls too.** `updateUser(id: 42, role: ADMIN)` is the GraphQL form of the [insecure-API](/codex/web/idor/insecure-apis/) function-call IDOR.
+
+## Step 1 - Map the schema
+
+<Steps>
+
+1. Try introspection. If it's on, pull the full type/field/query/mutation list; a tool like GraphQL Voyager or InQL (Burp) renders it.
+2. If introspection is disabled, fall back to field suggestions ("did you mean …" errors leak names), known-schema wordlists, or the client-side JS, which often contains the queries.
+3. Note every query/mutation that takes an `id`/`uuid`/object-reference argument - those are your IDOR candidates.
+
+</Steps>
+
+## Step 2 - Test direct object access
+
+Request an object that isn't yours and see whether the resolver checks ownership:
+
+```graphql
+query { user(id: 42) { id email role ssn } }
+mutation { updateUser(id: 42, input: { email: "attacker@evil.com" }) { id } }
+```
+
+Swap `id` to another user's. If data comes back (or the mutation succeeds) without you being that user or an admin, it's IDOR - same bug as REST, different transport.
+
+<Aside type="caution">
+Mutations are where GraphQL IDOR turns critical - an `updateUser`/`setRole`/`resetPassword` mutation that trusts its `id` argument is account takeover or privilege escalation. As with the [chaining](/codex/web/idor/chaining/) finish, a resolver that lets you set a privileged field (`role`, `isAdmin`) on your *own* object is also escalation, so test field-by-field, not just object-by-object.
+</Aside>
+
+## Step 3 - Decode Relay global IDs
+
+Relay-style APIs expose a `node(id: ID!)` field and opaque global IDs. These are almost always base64 of `Type:primarykey`:
+
+```bash
+echo -n 'VXNlcjo0Mg==' | base64 -d      # -> User:42
+echo -n 'User:43' | base64              # -> VXNlcjo0Mw==   (the next user)
+```
+
+Decode one you legitimately hold, change the primary key, re-encode, and pass it to `node(id: …)`. The opacity is not access control - it's the GraphQL equivalent of the encoded-reference reversal on the [mass-enumeration](/codex/web/idor/mass-enumeration/) page.
+
+## Step 4 - Mass-enumerate with aliases (and batching)
+
+Aliases let one query ask for the same resolver many times, so you dump a whole table in a single request - no per-request rate limit to fight:
+
+```graphql
+query {
+  u1: user(id: 1) { email role }
+  u2: user(id: 2) { email role }
+  u3: user(id: 3) { email role }
+  # ...generate up to the server's document/complexity limit
+}
+```
+
+Generate the document programmatically (a short script emitting `uN: user(id:N){...}` lines). If the endpoint also accepts a **JSON array of operations** (query batching), that's a second batching channel. Watch for depth/complexity/alias caps - those are the server-side limits you may hit.
+
+## Defense
+
+Same core fix as all IDOR - server-side object-level authorization in every resolver - plus GraphQL-specific hardening (disable introspection in production, cap query depth/complexity and alias/batch counts, rate-limit by operation cost). See [IDOR defense](/codex/web/idor/defense/).
+
+## Quick reference
+
+| Step | Action |
+|---|---|
+| Map | `__schema` introspection; InQL/Voyager; field-suggestion leaks if off |
+| Direct | `user(id:N)` / `updateUser(id:N,...)` - swap the id |
+| Global IDs | base64-decode `node` IDs (`Type:pk`), change pk, re-encode |
+| Mass | alias the resolver `uN: user(id:N)` in one document; or JSON batch |
+| Escalate | mutations on others' objects; privileged fields on your own |
+
+## Next move
+
+- **Introspection returns the schema** → enumerate id-taking queries/mutations; start [direct object access](#step-2---test-direct-object-access)
+- **`node(id:)` present** → decode the global IDs and enumerate by primary key
+- **Need bulk** → alias-batch in one request to dodge rate limits ([mass enumeration](/codex/web/idor/mass-enumeration/) for the extraction/parsing side)
+- **Mutation accepts another user's id** → account takeover / privilege escalation; see [chaining](/codex/web/idor/chaining/)
+- **Hardening this** → [IDOR defense](/codex/web/idor/defense/)

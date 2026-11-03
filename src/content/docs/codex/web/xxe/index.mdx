@@ -4,7 +4,7 @@ description: Operator reference for XML External Entity injection - when a parse
 mitre: [T1190, T1213, T1083, T1499]
 d3fend: [D3-IAA, D3-MENCR]
 impact: [DataExfil, FileRead, SSRF, RCE, DoS]
-owasp: [A05, A04]
+owasp: [A05, A02]
 sidebar:
   order: 1
   label: Overview
@@ -160,6 +160,7 @@ The most common deliverable is file read - extracting `/etc/passwd`, configurati
 | [RCE and SSRF](/codex/web/xxe/rce-and-ssrf/) | PHP `expect://` to webshell drop, internal port scanning, billion-laughs DoS, Windows UNC hash theft |
 | [Automation](/codex/web/xxe/automation/) | XXEinjector tool walkthrough, request-file format, automated CDATA/error/OOB modes |
 | [Skill assessment chain](/codex/web/xxe/skill-assessment-chain/) | Capstone walkthrough - IDOR + verb tampering + XXE combining to read `/flag.php` |
+| [Defense](/codex/web/xxe/defense/) | Disable DTDs/external entities in the parser (per-language), patch XML libraries, suppress parser errors, reduce surface |
 
 ## Cross-cluster references
 
