@@ -173,9 +173,13 @@ filename="shell.aspx::$DATA"        # same, different syntax
 filename="shell.aspx.    .  "       # trailing dots/spaces - Windows strips
 filename="shell.aspx ."             # similar
 filename="HAC~1.TXT"                # 8.3 short name reference
+filename="she|ll.aspx"              # reserved wildcard char (| < > * ?) → error leaks upload path
+filename="CON" / "NUL" / "LPT1"     # reserved device names → write error leaks path
 ```
 
 The first form abuses NTFS Alternate Data Streams - when Windows receives a filename containing `:`, it interprets everything after the colon as a stream name. The base file (`shell.aspx`) is what actually gets written to disk; the stream name (`.jpg`) is metadata. The application sees `shell.aspx:.jpg` and runs its `.jpg` validation, but the on-disk file is `shell.aspx`.
+
+The reserved **wildcard characters** (`|`, `<`, `>`, `*`, `?`) and reserved **device names** (`CON`, `NUL`, `COM1`, `LPT1`) are a different lever: when the filename isn't sanitized or quoted, Windows treats them specially - a wildcard refers to some other (often non-existent) file, a device name can't be written as a file - and the resulting error frequently leaks the absolute upload path, which solves the next section outright.
 
 ## Finding the upload directory
 
