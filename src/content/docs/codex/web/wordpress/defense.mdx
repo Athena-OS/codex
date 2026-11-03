@@ -21,7 +21,7 @@ For the operator, the absence of these controls is the triage signal. Version an
 The standard finding - "outdated plugin X = unauthenticated $impact" - is a patch-and-inventory failure, not a code bug the defender can fix. The controls:
 
 - **Update core, plugins, and themes promptly.** Enable background updates (see the `wp-config.php` constants below). Core auto-updates close the rare core CVE; the plugin/theme updates are the ones that matter, because that is where the CVEs land ([vulnerable plugins](/codex/web/wordpress/vulnerable-plugins/)).
-- **Delete unused plugins and themes - don't just deactivate them.** Activation is a database flag; the files stay on disk and stay directly callable over HTTP, so a deactivated-but-present vulnerable plugin is still exploitable. This is the [deactivation gap](/codex/web/wordpress/plugin-theme-enum/), and deletion is the only control that closes it.
+- **Delete unused plugins and themes - don't just deactivate them.** Activation is only a database flag; the files stay on disk. Whether a deactivated plugin is still exploitable depends on the bug: a vuln in a **directly-callable** PHP script (hit by its file path, like the Mail Masta LFI) stays reachable because it bypasses WordPress's bootstrap entirely, while a vuln that depends on the plugin's registered hooks, AJAX, or REST handlers goes dormant once WordPress stops loading it. You can't reliably tell which from the outside, so delete rather than deactivate. This is the [deactivation gap](/codex/web/wordpress/plugin-theme-enum/), and deletion is the control that reliably closes it.
 - **Minimize the installed set.** Every plugin directory on disk is in scope. Fewer components, smaller surface, less to patch.
 - **Track versions against an advisory feed.** The same [WPScan database](/codex/web/wordpress/wpscan/) an attacker uses is a defender's inventory check: run it against your own estate and remediate what it flags.
 
@@ -51,8 +51,9 @@ The constants worth setting in one place. The edit/mod constants are the mechani
 
 ```php
 // --- Remove the editor write primitive (see Admin to RCE) ---
-define( 'DISALLOW_FILE_EDIT', true );   // disables theme/plugin editors
-define( 'DISALLOW_FILE_MODS', true );   // also disables install/upload of plugins & themes
+define( 'DISALLOW_FILE_EDIT', true );   // disables theme/plugin editors; leaves updates working
+// Optional, and ONLY if you patch out-of-band (deploy from version control, no dashboard updates):
+// define( 'DISALLOW_FILE_MODS', true ); // also blocks install/upload AND the background updater
 
 // --- Automatic updates (see component lifecycle) ---
 define( 'WP_AUTO_UPDATE_CORE', true );  // true = all core updates; 'minor' = security/minor only
@@ -65,12 +66,12 @@ define( 'FORCE_SSL_ADMIN', true );      // force admin/login over HTTPS so sessi
 | Constant | Effect | Closes |
 |---|---|---|
 | `DISALLOW_FILE_EDIT` | Disables dashboard theme/plugin editors | Theme/plugin editor webshell ([admin-to-RCE](/codex/web/wordpress/admin-to-rce/)) |
-| `DISALLOW_FILE_MODS` | Disables editors **and** plugin/theme install/upload | Editor webshell **and** malicious plugin ZIP upload |
+| `DISALLOW_FILE_MODS` | Disables editors **and** install/upload — **but also disables the background auto-updater**, so only use it with an external patching process | Editor webshell **and** malicious plugin ZIP upload |
 | `WP_AUTO_UPDATE_CORE` | Enables background core updates (`true` or `'minor'`) | Unpatched-core CVEs ([lifecycle](/codex/web/wordpress/version-fingerprinting/)) |
 | `FORCE_SSL_ADMIN` | Forces admin/login over HTTPS | Cleartext session-cookie capture on the admin path |
 
 <Aside type="caution">
-`DISALLOW_FILE_EDIT` alone is a common half-measure: it kills the theme/plugin *editor* but leaves plugin *upload* via `plugin-install.php` working, which is its own RCE path. Use `DISALLOW_FILE_MODS` when the site doesn't need in-place plugin management - it's the one that closes both.
+`DISALLOW_FILE_EDIT` is the safe default: it kills the theme/plugin *editor* while still allowing updates, including the background security updater. It does **not** stop plugin *upload* via `plugin-install.php`, which is its own RCE path. `DISALLOW_FILE_MODS` closes that upload path too - but it also disables the auto-updater, so setting it on a site that relies on automatic updates trades a contained-admin risk for unpatched components. Use `DISALLOW_FILE_MODS` only where patching is handled out-of-band (deploy from version control); otherwise prefer `DISALLOW_FILE_EDIT` plus prompt, update-driven patching.
 </Aside>
 
 ## A note on security plugins
@@ -84,10 +85,10 @@ Wordfence, iThemes Security, and Sucuri bundle many of the above - lockout, enum
 
 Lead with the control that closes the finding you demonstrated, then the lifecycle and containment layers:
 
-1. **Vulnerable/outdated plugin →** update it, and **delete** unused plugins (deactivation leaves them exploitable).
+1. **Vulnerable/outdated plugin →** update it, and **delete** unused plugins - deactivation still exposes directly-callable vulnerable scripts (hook/AJAX/REST-only bugs go dormant, but delete regardless since you can't tell from outside).
 2. **Weak credentials / default admin →** strong passwords, enforced 2FA, rename `admin`, least-privilege roles.
 3. **Open user enumeration / brute-force →** lockout on both `wp-login.php` and `xmlrpc.php`, suppress the `?author=`/REST oracles, homogenize login errors.
-4. **Admin-to-RCE →** `DISALLOW_FILE_MODS`, and a web user with no write access to the webroot.
+4. **Admin-to-RCE →** `DISALLOW_FILE_EDIT` as the default (keeps auto-updates working), or `DISALLOW_FILE_MODS` where patching is external (it also closes the plugin-upload path but disables the updater), plus a web user with no write access to the webroot.
 5. **Transport →** `FORCE_SSL_ADMIN` + HTTPS everywhere.
 
 Avoid presenting a single security plugin as the whole fix - this cluster exists because real installs ship with only some of these behaviors actually configured.
