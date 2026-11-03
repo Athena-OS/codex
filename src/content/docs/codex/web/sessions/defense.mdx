@@ -79,7 +79,7 @@ Closes [CSRF](../csrf/) and resists the [token-bypass tricks](../csrf-token-bypa
 Closes [open redirect](../open-redirect/) (and the token-leak chains built on it):
 
 - Prefer not taking a URL from the user at all. Where a destination is needed, map an opaque key to a server-side URL rather than redirecting to a user-supplied address.
-- If a URL must be accepted, validate against an **allowlist** of permitted hosts with exact matching - not "starts-with", "contains", or a loose regex, each of which has a [documented bypass](../open-redirect/#validation-bypasses).
+- If a URL must be accepted, validate the **scheme and the origin**, not just the hostname. Allowlist the scheme to `http`/`https` (reject `javascript:`, `data:`, and scheme-relative `//evil`) - a host check alone passes `javascript://trusted.example/%0Aalert(document.domain)`, whose host is `trusted.example` but which runs script in a DOM redirect. Then exact-match the host against an allowlist - not "starts-with", "contains", or a loose regex, each of which has a [documented bypass](../open-redirect/#validation-bypasses). Parse with the **same URL parser the redirect consumer uses**, since parser differentials are themselves a bypass.
 - Keep session tokens out of URLs entirely, so a redirect can't leak them via `Referer` or history.
 
 ## Transport and monitoring
@@ -96,7 +96,7 @@ Lead with the control that closes the finding you actually demonstrated, then th
 3. **CSRF →** synchronizer tokens with full validation, plus `SameSite`.
 4. **Sniffing →** HTTPS + HSTS + `Secure`.
 5. **Weak identifiers →** CSPRNG generation, proper scope/expiry.
-6. **Open redirect →** key-to-URL mapping or exact-host allowlist; keep tokens out of URLs.
+6. **Open redirect →** key-to-URL mapping, or scheme-and-exact-origin validation (not host alone), parsed as the redirect consumer parses it; keep tokens out of URLs.
 
 Avoid presenting a single flag or a Referer check as the whole fix - each closes one path, and this cluster exists because real apps ship with only some of them in place.
 

@@ -20,11 +20,11 @@ Most of this cluster assumes you have to *steal* a session identifier. This page
 # 1. Collect many identifiers (log in repeatedly / many fresh requests)
 # 2. Decode and look for structure
 echo 'dХNlcj0xMDE7dHM9MTc  ...' | base64 -d      → "user=101;ts=17..."   ← reversible!
-# 3. If structured → forge another user's token. If just short/low-entropy → brute-force.
-# 4. Ride it: see Hijacking.
+# 3. If structured → forge another user's token. If genuinely low-entropy → brute-force.
+# 4. CONFIRM: the forged/guessed token is accepted as the target account, then ride it.
 ```
 
-Success indicator: a session identifier you *constructed or guessed* - never issued to you for the target account - is accepted as that account's authenticated session.
+Decoding a token is a *hypothesis*, not a win. Readable fields don't prove forgeability (a signature, nonce, or server-side lookup can still reject a tampered value), and a short-looking token isn't necessarily guessable (effective entropy, not character count, decides that). Treat every finding here as "test this," and the real success indicator is the proof: a session identifier you *constructed or guessed* - never issued to you for the target account - is accepted by the server as that account's authenticated session.
 
 ## When this is worth trying
 
@@ -32,11 +32,11 @@ Strong, framework-issued IDs are not predictable - don't waste time on them. Rea
 
 | Signal | Why it matters |
 |---|---|
-| Short token (< ~16 random chars) | Small enough keyspace to brute-force |
-| Sequential / incrementing across logins | Next/other users' IDs are adjacent |
-| Base64/hex that decodes to readable data | Token embeds `user=`, email, a counter, a timestamp |
-| Looks like `md5(username)` / `sha1(email)` | Derivable from data you know - same class as a [weak CSRF token](../csrf-token-bypass/#category-4---predictable-token) |
-| Changes only slightly between issuances | Low effective entropy; part is static |
+| Low **effective entropy** - few random positions over a small alphabet | The guessable keyspace, not the character count, is what makes brute force feasible (15 random base64 chars is ~90 bits - infeasible despite looking short) |
+| Sequential / incrementing across logins | Next/other users' IDs are adjacent - trivially predictable regardless of length |
+| Base64/hex that decodes to readable data | Token *may* embed `user=`, email, a counter, a timestamp - a forgery hypothesis to test, not a guarantee |
+| Looks like `md5(username)` / `sha1(email)` | Potentially derivable from data you know - same class as a [weak CSRF token](../csrf-token-bypass/#category-4---predictable-token) |
+| Changes only slightly between issuances | A static prefix/suffix shrinks the effective entropy to the part that actually varies |
 | Custom cookie name (not `PHPSESSID`, `JSESSIONID`, `ASP.NET_SessionId`, `connect.sid`) | Suggests a hand-rolled scheme to scrutinise |
 
 <Aside type="note">
@@ -59,7 +59,7 @@ You need many identifiers to judge randomness.
 
 Two independent questions: is it *structured* (reversible), and is it *random enough*?
 
-- **Structure:** decode as base64, base64url, hex, URL-encoding. If the result contains a username, email, numeric user id, counter, or timestamp, the token is forgeable - you don't need to guess, you *build* the target's.
+- **Structure:** decode as base64, base64url, hex, URL-encoding. If the result contains a username, email, numeric user id, counter, or timestamp, forging is *plausible* - but readability alone doesn't prove it. A verified signature/HMAC, an unpredictable nonce in the blob, or an exact server-side lookup can still reject a token you rebuild. Treat the decode as a hypothesis and confirm it in Step 3 by getting a *modified* token accepted.
 - **Randomness:** Burp **Sequencer** estimates effective entropy (bits) and runs FIPS-style randomness tests. Low entropy, or obvious patterns (shared prefix, monotonic region, time-correlated bytes), means a reduced keyspace you can brute-force or narrow.
 
 ```
@@ -79,9 +79,9 @@ echo -n '<token>' | xxd -r -p 2>/dev/null        # if it's hex
 echo -n 'user=1;role=admin' | base64            → the forged token
 ```
 
-Set the forged value and ride it - see [Hijacking](../hijacking/). If a field is an HMAC/signature you can't reproduce, this becomes a signing-key problem ([JWT](/codex/web/auth/jwt/)), not pure prediction.
+Set the forged value and **confirm forgeability**: the modified token must be accepted by the server as the *other* account (test with a second controlled account before claiming it). Only then ride it - see [Hijacking](../hijacking/). If the rebuilt token is rejected, there is a control you can't reproduce - an HMAC/signature (a signing-key problem → [JWT](/codex/web/auth/jwt/)), a nonce, or a server-side lookup - and this is not a forging bug.
 
-**If low-entropy (brute-force):** enumerate the plausible keyspace (sequential neighbours of known IDs, or the full space if short) against an endpoint that distinguishes authenticated from anonymous.
+**If low-entropy (brute-force):** first decide whether it is actually feasible. Estimate the *effective* keyspace from the alphabet and the number of genuinely random positions (a static prefix doesn't count), then weigh it against the number of currently valid sessions (more live sessions = more hits per guess), the request rate you're allowed, and the session lifetime (the window a guess stays valid). Only if that math is tractable, enumerate - sequential neighbours of known IDs, or the full space when it's genuinely small - against an endpoint that distinguishes authenticated from anonymous.
 
 <Aside type="caution">
 Brute-forcing identifiers is **loud** - thousands of requests, and on a live app it can trample real users' sessions. It needs explicit scope agreement, rate-limiting awareness (you may hit lockouts or WAF bans), and care not to disrupt production. Prediction/forging of a structured token, by contrast, is a handful of quiet requests.
@@ -108,19 +108,19 @@ Report any identifier that is managed with no server interference, is predictabl
 
 | Step | Action |
 |---|---|
-| Spot | Short / sequential / decodable / `hash(known)` / custom cookie name |
+| Spot | Low effective entropy / sequential / decodable / `hash(known)` / custom cookie name |
 | Collect | Many tokens; Burp Sequencer (5k–20k) |
-| Analyse | Decode for structure; measure entropy |
-| Forge | Rebuild another user's structured token, re-encode |
-| Brute | Only if short/low-entropy and in scope (loud) |
+| Analyse | Decode for structure; measure effective entropy |
+| Forge | Rebuild another user's token, re-encode, **confirm it's accepted as that account** |
+| Brute | Only if effective keyspace is tractable and in scope (loud) |
 | Lifecycle | Check scope reuse ([fixation](../fixation/)), logout, expiry |
 | Ride | [Hijacking](../hijacking/) |
 
 ## Next move
 
-- **Token decodes to readable fields** → forge the target's and ride via [Hijacking](../hijacking/)
-- **Token decodes to data + signature** → [JWT](/codex/web/auth/jwt/) / [cookie tampering](/codex/web/auth/cookie-tampering/)
-- **Short / low-entropy, in scope** → brute-force the keyspace (loud); confirm with an authenticated-only endpoint
+- **Token decodes to readable fields** → rebuild the target's, confirm the server accepts it as that account, then ride via [Hijacking](../hijacking/)
+- **Rebuilt token rejected, or decodes to data + signature** → [JWT](/codex/web/auth/jwt/) / [cookie tampering](/codex/web/auth/cookie-tampering/) (signing-key problem, not forging)
+- **Genuinely low effective entropy, in scope** → brute-force the keyspace (loud); confirm with an authenticated-only endpoint
 - **Pre-login ID still valid after login** → [Session fixation](../fixation/)
 - **Strong random ID** → abandon prediction; steal it via [obtaining tokens](../obtaining-tokens/) or [XSS to session](../xss-to-session/)
 - **Hardening this** → [Defense](../defense/)
