@@ -174,9 +174,14 @@ NSE's `oracle-sid-brute` walks a built-in wordlist. It'll find common SIDs quick
 
 ```shell
 sudo apt install libaio1 python3-dev alien -y
-# download Instant Client "basic" + "sqlplus" zips from Oracle, unzip them, then:
-export LD_LIBRARY_PATH=instantclient_21_12:$LD_LIBRARY_PATH
-pip3 install cx_Oracle
+# download Instant Client "basic" + "sqlplus" zips from Oracle, unzip them, then
+# point the loader AND PATH at the extracted dir, using the absolute path:
+IC="$PWD/instantclient_21_12"
+export LD_LIBRARY_PATH="$IC:$LD_LIBRARY_PATH"
+export PATH="$IC:$PATH"                     # so the `sqlplus` binary resolves
+# system Python is externally managed (PEP 668) on Debian 12+/Kali - use a venv:
+python3 -m venv ~/.venvs/odat && . ~/.venvs/odat/bin/activate
+pip install cx_Oracle
 ```
 
 With that in place:

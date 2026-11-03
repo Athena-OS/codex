@@ -169,7 +169,7 @@ hashcat -m 7300 ipmi.hashes /usr/share/wordlists/rockyou.txt
 For an **HP iLO** still on its factory-default password - a randomized 8-character string of uppercase letters and digits - skip the wordlist and brute the exact keyspace with a mask:
 
 ```shell
-hashcat -m 7300 ipmi.hashes -a 3 ?1?1?1?1?1?1?1?1 -1 ?d?u
+hashcat -m 7300 ipmi.hashes -a 3 '?1?1?1?1?1?1?1?1' -1 '?d?u'
 ```
 
 `-1 ?d?u` defines a custom charset of digits + uppercase, and eight of them (`?1` ×8) covers the entire iLO default space - which falls fast at this mode's speed.
