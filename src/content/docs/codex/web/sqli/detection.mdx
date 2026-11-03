@@ -155,7 +155,7 @@ Once you have any working injection, identify the engine:
   </TabItem>
 </Tabs>
 
-When the injection reflects into a **numeric-only** context (a string like `@@version` won't render, or breaks the query), fingerprint with a function that returns a number: `SELECT POW(1,1)` returns `1` on MySQL/MariaDB. The short `POW` alias errors on PostgreSQL/MSSQL/Oracle (which expose only `POWER`), so a numeric `1` coming back is a strong MySQL/MariaDB tell.
+When the injection reflects into a **numeric-only** context (a string like `@@version` won't render, or breaks the query), fingerprint with a function that returns a number. HTB's module teaches `SELECT POW(1,1)` → `1`, but `POW` alone isn't conclusive: PostgreSQL exposes it as an undocumented alias for `POWER`, and SQLite accepts it when math functions are enabled, so a `1` coming back doesn't rule those out. A more specific numeric tell is MySQL/MariaDB-only `SELECT CONNECTION_ID()` (returns the numeric session id; errors on PostgreSQL/MSSQL/Oracle/SQLite). Pair either with the behavioural tests below to confirm.
 
 Behavioural fingerprinting (no UNION needed):
 
