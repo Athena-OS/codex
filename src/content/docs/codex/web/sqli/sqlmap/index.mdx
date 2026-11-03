@@ -50,18 +50,18 @@ The manual techniques behind each of SQLMap's classes live in the rest of the [S
 | Flag | Class | How it extracts | Speed | Manual page |
 | --- | --- | --- | --- | --- |
 | `B` | Boolean-based blind | TRUE/FALSE inferred from response differences, 1 bit/request | Slow | [Boolean blind](/codex/web/sqli/blind-boolean/) |
-| `E` | Error-based | Data smuggled into DBMS error text, ~200 B/request | Fast | [Error-based blind](/codex/web/sqli/blind-error/) |
+| `E` | Error-based | Data smuggled into reflected DBMS error text, ~200 B/request | Fast | [UNION: error-based extraction](/codex/web/sqli/union-based/#error-based-extraction) |
 | `U` | UNION query | Injected `SELECT` appended to the original result set | Fastest | [UNION-based](/codex/web/sqli/union-based/) |
 | `S` | Stacked queries | `; <stmt>` - runs non-`SELECT` (needed for some RCE paths) | n/a | [Detection](/codex/web/sqli/detection/) |
 | `T` | Time-based blind | TRUE/FALSE inferred from `SLEEP`-anchored response delay | Slowest | [Time-based blind](/codex/web/sqli/blind-time/) |
 | `Q` | Inline query | Sub-query embedded in the original query | n/a | [Detection](/codex/web/sqli/detection/) |
 
-Plus **out-of-band** via DNS exfiltration (`--dns-domain`, you control the domain's DNS) - the fallback when every in-band and inferential class is unavailable or too slow. See [Out-of-band](/codex/web/sqli/out-of-band/).
+Plus **out-of-band** via DNS exfiltration (`--dns-domain`, you control the domain's DNS). This is an *extraction channel for an injection SQLMap has already confirmed* - not a way to detect a silent injection after the other techniques fail detection - and it needs the DB host to be able to resolve external DNS. Reach for it to speed up extraction once a point is found but in-band/inferential retrieval is slow or blocked. The manual out-of-band *detection* technique is a separate thing - see [Out-of-band](/codex/web/sqli/out-of-band/).
 
 Narrow the set when a class is causing trouble (e.g. time-based timeouts): `--technique=BEU` skips stacked, time, and inline.
 
 <Aside type="note">
-`S` (stacked) is what makes some `--os-shell` / `--sql-shell` paths work, because OS-command and non-`SELECT` statements need a second statement. If `--os-shell` fails on a target that only confirmed `B`/`U`, that's expected - stacking isn't available.
+`S` (stacked) is required for takeover methods that need a *second* statement - e.g. MSSQL's stacked `xp_cmdshell`. It is **not** a blanket requirement for `--os-shell`: on MySQL a `U`-only injection can still drop a web backdoor via `INTO OUTFILE` given the `FILE` privilege and a writable, PHP-serving web directory, and `--sql-shell` read queries run over `B`/`E`/`U` too. So a `B`/`U`-only target isn't out of reach - it just constrains *which* takeover path works. If `--os-shell` fails, check `--is-dba` / `FILE` privilege and the writable-webroot requirements ([File operations](/codex/web/sqli/file-operations/)) before blaming the missing stacked technique.
 </Aside>
 
 ## Pointing SQLMap at a target
