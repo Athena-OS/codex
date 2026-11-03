@@ -50,32 +50,33 @@ If you can describe the feature as "the application takes my input and uses it t
 1. **Confirm template evaluation** - does `{{7*7}}` / `${7*7}` / `<%= 7*7 %>` return `49`? → [Detection](/codex/web/server-side/ssti/detection/)
 2. **Identify the engine** - syntax dialect + behavior of polyglot probes narrows it down → [Detection](/codex/web/server-side/ssti/detection/)
 3. **Engine = Jinja2 / Flask / Django / Ansible** → [Jinja2](/codex/web/server-side/ssti/jinja2/)
-4. **Engine = Twig / Symfony / Craft / Drupal 8+** → [Twig](/codex/web/server-side/ssti/twig/)
-5. **Engine = Freemarker / Confluence / Spring** → [Freemarker](/codex/web/server-side/ssti/freemarker/)
-6. **Engine = Velocity / Liferay / legacy Spring** → [Velocity](/codex/web/server-side/ssti/velocity/)
-7. **Engine = ERB / Rails / Puppet** → [ERB](/codex/web/server-side/ssti/erb/)
-8. **Engine = Handlebars / Express / Ghost** → [Handlebars](/codex/web/server-side/ssti/handlebars/)
-9. **Engine = Razor / ASP.NET** → [Razor](/codex/web/server-side/ssti/razor/)
-10. **Inside a sandboxed environment** - payload evaluates but `os`/`subprocess`/`Runtime` unreachable → [Sandbox escape](/codex/web/server-side/ssti/sandbox-escape/)
-11. **Payload rejected / filtered** - keywords like `system`, `__class__`, `Runtime` stripped → [Filter bypass](/codex/web/server-side/ssti/filter-bypass/)
+4. **Engine = Tornado** (Python `{{...}}` where `{% import os %}` works) → [Tornado](/codex/web/server-side/ssti/tornado/)
+5. **Engine = Twig / Symfony / Craft / Drupal 8+** → [Twig](/codex/web/server-side/ssti/twig/)
+6. **Engine = Freemarker / Confluence / Spring** → [Freemarker](/codex/web/server-side/ssti/freemarker/)
+7. **Engine = Velocity / Liferay / legacy Spring** → [Velocity](/codex/web/server-side/ssti/velocity/)
+8. **Engine = ERB / Rails / Puppet** → [ERB](/codex/web/server-side/ssti/erb/)
+9. **Engine = Handlebars / Express / Ghost** → [Handlebars](/codex/web/server-side/ssti/handlebars/)
+10. **Engine = Razor / ASP.NET** → [Razor](/codex/web/server-side/ssti/razor/)
+11. **Inside a sandboxed environment** - payload evaluates but `os`/`subprocess`/`Runtime` unreachable → [Sandbox escape](/codex/web/server-side/ssti/sandbox-escape/)
+12. **Payload rejected / filtered** - keywords like `system`, `__class__`, `Runtime` stripped → [Filter bypass](/codex/web/server-side/ssti/filter-bypass/)
 
 ## Engine fingerprint table
 
 The probes below differ between engines. Run them in order; the first one that produces a useful divergence identifies the engine.
 
-| Probe | Jinja2 | Twig | Freemarker | Velocity | ERB | Handlebars | Razor |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| `{{7*7}}` | `49` | `49` | error | error | unchanged | `49` | unchanged |
-| `${7*7}` | unchanged | unchanged | `49` | `49` | unchanged | unchanged | unchanged |
-| `<%= 7*7 %>` | unchanged | unchanged | unchanged | unchanged | `49` | unchanged | unchanged |
-| `@(7*7)` | unchanged | unchanged | unchanged | unchanged | unchanged | unchanged | `49` |
-| `{{7*'7'}}` | `7777777` | `49` | n/a | n/a | n/a | error | n/a |
-| `{{config}}` | dumps config | dumps config | n/a | n/a | n/a | empty | n/a |
-| `{{self}}` | object repr | object repr | n/a | n/a | n/a | unchanged | n/a |
+| Probe | Jinja2 | Tornado | Twig | Freemarker | Velocity | ERB | Handlebars | Razor |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `{{7*7}}` | `49` | `49` | `49` | error | error | unchanged | `49` | unchanged |
+| `${7*7}` | unchanged | unchanged | unchanged | `49` | `49` | unchanged | unchanged | unchanged |
+| `<%= 7*7 %>` | unchanged | unchanged | unchanged | unchanged | unchanged | `49` | unchanged | unchanged |
+| `@(7*7)` | unchanged | unchanged | unchanged | unchanged | unchanged | unchanged | unchanged | `49` |
+| `{{7*'7'}}` | `7777777` | `7777777` | `49` | n/a | n/a | n/a | error | n/a |
+| `{{config}}` | dumps config | error | dumps config | n/a | n/a | n/a | empty | n/a |
+| `{% import os %}{{os.getcwd()}}` | error | path | error | n/a | n/a | n/a | n/a | n/a |
 
 "unchanged" means the literal string `{{7*7}}` appears in the response - the engine doesn't recognize the syntax, so it's not that engine.
 
-The single most diagnostic probe is `{{7*'7'}}`: Jinja2 does string repetition (`'7777777'`), Twig does numeric coercion (`49`). Same input, different behavior, immediate disambiguation.
+The single most diagnostic probe is `{{7*'7'}}`: Jinja2 and Tornado (both Python) do string repetition (`'7777777'`), Twig does numeric coercion (`49`). That splits the PHP engine from the Python ones in one request. It does **not** split Jinja2 from Tornado - both are Python and both repeat the string. To separate those two, use `{% import os %}{{os.getcwd()}}`: Tornado runs it as a real Python `import` and returns a path, while Jinja2 (whose `{% import %}` is for templates, not modules) throws. See [Detection](/codex/web/server-side/ssti/detection/).
 
 ## Impact ladder
 
@@ -115,11 +116,11 @@ The detection page is the right starting point unless you already know the engin
 
 ## Next move
 
-- **`{{7*7}}` returns `49`** → Jinja2 or Twig or similar - run [detection](/codex/web/server-side/ssti/detection/) probes to disambiguate engine
+- **`{{7*7}}` returns `49`** → Jinja2, Tornado, Twig, or similar - run [detection](/codex/web/server-side/ssti/detection/) probes to disambiguate engine (`{{7*'7'}}` splits Python from PHP; `{% import os %}` splits Tornado from Jinja2)
 - **`${7*7}` returns `49`** → Freemarker, Velocity, or Spring EL - narrow with engine-specific probes
 - **`<%= 7*7 %>` returns `49`** → ERB (Ruby) or ASP.NET Razor - see [erb](/codex/web/server-side/ssti/erb/) or [razor](/codex/web/server-side/ssti/razor/)
 - **`{{= 7*7}}` returns `49`** → underscore.js / EJS - server-side JavaScript template
-- **Engine confirmed → ready to RCE** → jump straight to the per-engine page ([jinja2](/codex/web/server-side/ssti/jinja2/), [freemarker](/codex/web/server-side/ssti/freemarker/), [twig](/codex/web/server-side/ssti/twig/), [velocity](/codex/web/server-side/ssti/velocity/), [handlebars](/codex/web/server-side/ssti/handlebars/), [erb](/codex/web/server-side/ssti/erb/), [razor](/codex/web/server-side/ssti/razor/))
+- **Engine confirmed → ready to RCE** → jump straight to the per-engine page ([jinja2](/codex/web/server-side/ssti/jinja2/), [tornado](/codex/web/server-side/ssti/tornado/), [freemarker](/codex/web/server-side/ssti/freemarker/), [twig](/codex/web/server-side/ssti/twig/), [velocity](/codex/web/server-side/ssti/velocity/), [handlebars](/codex/web/server-side/ssti/handlebars/), [erb](/codex/web/server-side/ssti/erb/), [razor](/codex/web/server-side/ssti/razor/))
 - **Evaluation works but RCE payload is filtered** → [sandbox-escape](/codex/web/server-side/ssti/sandbox-escape/) (engine sandboxes vary widely - Jinja2 has well-known escapes, Twig sandbox is harder)
 - **Specific tokens (`__class__`, `os`, `exec`) blocked** → [filter-bypass](/codex/web/server-side/ssti/filter-bypass/) (string concatenation, alternate object traversal, encoded payloads)
 - **Got RCE inside the template** → confirm the user context (`whoami`/`id`), check if app runs in container (no `/etc/shadow`, restricted commands), pivot to credential hunting if rooted
