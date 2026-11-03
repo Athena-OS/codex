@@ -1,0 +1,96 @@
+---
+title: Defending Against XSS
+description: How cross-site scripting is actually prevented - context-aware output encoding, framework auto-escaping, CSP and Trusted Types, safe sinks, and the controls that only reduce risk.
+mitre: [T1059.007]
+d3fend: [D3-AH, D3-ACH]
+owasp: [A05]
+sidebar:
+  order: 11
+  label: Defense
+---
+import { Aside } from '@astrojs/starlight/components';
+
+Every page in this cluster exploits the same root cause: untrusted input rendered as executable content without context-aware encoding. This page is the other side - what removes the vulnerability, what only narrows it, and what to recommend in a report. It is ordered by effectiveness: the first control eliminates the class, the rest are defence in depth.
+
+<Aside type="note">
+If you're here to exploit, not fix: the one control that actually stops you is **context-aware output encoding** (usually via a framework's default auto-escaping). When you see output consistently encoded for its context, that sink is dead - move on. The weaker layers below (input filtering, WAF, a blocklist) are the ones worth probing for gaps.
+</Aside>
+
+## 1. Context-aware output encoding (the actual fix)
+
+XSS is an output problem, not an input problem. The fix is to encode data for the exact context it is rendered into, at the moment it is rendered:
+
+| Render context | Encode as |
+|---|---|
+| HTML body / text | HTML-entity encode (`<` → `&lt;`, `&` → `&amp;`) |
+| HTML attribute value | Attribute-encode and always quote the attribute |
+| Inside a `<script>` / JS string | An HTML-aware JavaScript-string encoder - plain JS escaping is **not** enough, because a literal `</script>` in the data closes the element before the JS parser runs, so the encoder must also escape `<` / `/` (or at least the `</script>` sequence). Better: don't put data in script at all - emit it as JSON in a `data-` attribute (HTML-attribute-encoded) and read it with `JSON.parse(el.dataset.x)`. |
+| URL attribute (`href`, `src`) | URL-encode **and** allowlist the scheme (reject `javascript:`) |
+| CSS | CSS-escape; avoid putting data in `<style>` at all |
+
+The critical word is *context*: HTML-encoding a value that lands inside a JavaScript string does nothing. Encode for where it actually goes.
+
+## 2. Let the framework do it
+
+Modern frameworks auto-escape by default, which is why they prevent most XSS for free - the fix is to **not opt out**:
+
+- React escapes values in JSX; the hole is `dangerouslySetInnerHTML`.
+- Angular escapes interpolated bindings; the holes are `[innerHTML]` and `bypassSecurityTrust*`.
+- Vue escapes `{{ }}`; the hole is `v-html`.
+- Server-side templates vary - don't assume. Razor and Thymeleaf auto-escape by default; **Jinja only escapes when `autoescape` is on** (Flask enables it for `.html`, but a bare `jinja2.Environment` defaults to *off*), and **plain Ruby ERB does not HTML-escape at all** (Rails' ERB does, via `<%= %>` + its integration). Using these engines directly, you must enable auto-escaping (`autoescape=True`) or encode explicitly (ERB: `<%= ERB::Util.html_escape(x) %>` / Rails `h`). Then the remaining hole is the "raw"/"safe" opt-out (`|safe`, `{{{ }}}`, `raw`, `.html_safe`).
+
+<Aside type="caution">
+Audit every escape hatch (`dangerouslySetInnerHTML`, `v-html`, `[innerHTML]`, `|safe`, `{{{ }}}`). Each one turns auto-escaping off for that value and is where framework-based apps get their XSS. If raw HTML genuinely must be rendered, run it through a sanitizer first (section 4).
+</Aside>
+
+## 3. Content-Security-Policy and Trusted Types
+
+CSP is a second line that limits what injected script can do even if encoding fails:
+
+- A strict policy - per-request **nonces or hashes** plus `'strict-dynamic'`, and **no** `unsafe-inline` - blocks inline event handlers and injected `<script>`. Leave `'self'` *out* of `script-src`: keeping it lets an injected `<script src=/…>` pull in any same-origin script without a nonce, including JSONP endpoints that echo a callback and uploaded/user-controlled files - a common CSP bypass. A policy that keeps `unsafe-inline` buys almost nothing either (see [CSP bypass](/codex/web/xss/filter-bypasses/#csp-bypass)).
+- **Trusted Types** (`require-trusted-types-for 'script'`) attacks DOM-based XSS specifically: it makes dangerous sinks (`innerHTML`, `eval`, `script.src`) reject plain strings, forcing data through a vetted policy. This is the strongest single control against the [DOM-based](../dom-based/) variant.
+
+CSP is defence in depth, not a substitute for encoding - treat a CSP finding as "reduce blast radius," never as the primary fix.
+
+## 4. Sanitize when you must allow HTML
+
+Some features legitimately need to render user HTML (rich-text comments, WYSIWYG). Don't hand-roll a filter - use a maintained, allowlist-based sanitizer:
+
+- **DOMPurify** (client-side, and server-side via jsdom) is the standard: `DOMPurify.sanitize(dirty)` strips scripts and dangerous attributes against an allowlist.
+
+Allowlist sanitization (permit known-safe tags/attributes, drop everything else) is robust; blocklist filtering (strip `<script>`, strip `onerror`) is not - the whole [Filter bypasses](/codex/web/xss/filter-bypasses/) page is reasons why.
+
+## 5. Safe DOM APIs
+
+For the [DOM-based](../dom-based/) class specifically, prevention is choosing non-executing sinks in the client code:
+
+- Use `textContent` / `innerText`, not `innerHTML`, to insert text.
+- Use `setAttribute` with validated values, not string-built markup.
+- Never pass a user-derived string to `eval`, `Function`, or `setTimeout`/`setInterval`.
+- Validate `postMessage` handlers against `event.origin` before using the data.
+
+## 6. Controls that only reduce risk
+
+Real, but none closes the hole - never present one as the primary remediation:
+
+- **`HttpOnly` cookies** make `document.cookie` unreadable, blocking the simplest session-theft path. They do **not** stop XSS - an attacker can still act in the session (CSRF-style) and scrape the DOM. Pair with `Secure` and a sensible `SameSite`.
+- **Input validation** (allowlist by type/format) shrinks the surface and is good practice, but data valid for its field can still be malicious in the wrong output context. It complements output encoding; it doesn't replace it.
+- **WAF** catches mass scanning and known payloads, but pattern rules are routinely evaded ([Filter bypasses](/codex/web/xss/filter-bypasses/)). A WAF in front of an injectable app is still injectable.
+- **`X-XSS-Protection`** is obsolete - the browser auditors it controlled have been removed from Chrome and Edge, and it could introduce its own bugs. Set it to `0` and rely on CSP instead; do not recommend enabling it.
+
+## For the report
+
+Lead with the fix that removes the class:
+
+1. **Primary:** context-aware output encoding at every sink (or: stop disabling the framework's auto-escaping on the affected values).
+2. **Rich-HTML sinks:** replace any hand-rolled filtering with allowlist sanitization (DOMPurify).
+3. **Defense in depth:** a strict `script-src` CSP built on nonces/hashes + `'strict-dynamic'`, without `'self'` or `unsafe-inline`; Trusted Types for DOM sinks.
+4. **Containment:** `HttpOnly` + `Secure` + `SameSite` cookies to limit what a successful XSS can steal.
+
+Avoid recommending "add a WAF," "enable X-XSS-Protection," or "filter `<script>`" as the main remediation - the first two are weak or obsolete and the third is a blocklist that bypasses defeat.
+
+## Related
+
+- [DOM-based XSS](../dom-based/) - the sinks sections 3 and 5 are designed to neutralise
+- [Filter bypasses](/codex/web/xss/filter-bypasses/) - why blocklists and loose CSP can't be relied on
+- [XSS to session](/codex/web/sessions/xss-to-session/) - the theft that `HttpOnly` blocks (and what it doesn't)

@@ -4,7 +4,7 @@ description: Operator reference for cross-site scripting - the three vulnerabili
 mitre: [T1059.007, T1185, T1539]
 d3fend: [D3-AH]
 impact: [SessionTakeover, CredentialTheft, AccountTakeover, AdminCompromise]
-owasp: [A03, A07]
+owasp: [A05, A07]
 noise: moderate
 sidebar:
   order: 1
@@ -143,6 +143,7 @@ See [Payload construction](/codex/web/xss/payload-construction/) for the full co
 | [Filter bypasses](/codex/web/xss/filter-bypasses/) | WAF evasion; case juggling; encoding; alternative event handlers; quote-/paren-/space-free JS; CSP bypass paths |
 | [Blind XSS](/codex/web/xss/blind-xss/) | XSS that fires in admin-only contexts; XSSHunter/Interactsh setup; out-of-band callback patterns |
 | [Skill assessment chain](/codex/web/xss/skill-assessment-chain/) | Capstone - reflected to stored to blind, then chain to CSRF for admin takeover |
+| [Defense](/codex/web/xss/defense/) | Context-aware output encoding, framework auto-escaping, CSP and Trusted Types, sanitization, and the controls that only reduce risk |
 
 ## What this cluster does NOT cover
 

