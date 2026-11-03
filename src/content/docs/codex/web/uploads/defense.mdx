@@ -42,7 +42,8 @@ Content validation alone is not a cure: a valid image that also contains PHP (a 
 
 Closes [filename injection and directory disclosure](/codex/web/uploads/post-upload/):
 
-- Generate a random stored name (e.g. a UUID) and keep the sanitised original in a database; never write the user-supplied filename to disk. This also kills filename-based command/SQL/path-traversal injection.
+- Generate a random stored name (e.g. a UUID) and build every filesystem path from *that* generated name, never from the user-supplied filename. Because the user's name never reaches a path, this removes **path-based** filename attacks (traversal, extension tricks on disk).
+- It does **not**, on its own, stop SQL or command injection via the original filename - those depend on how the name is *used*, not where the file is stored. If you keep the original name (for display/download), write and read it with **parameterised queries** (it's untrusted data, not "sanitised"), and if any processing step takes the name, pass it to a native API or an argv vector with [no shell](/codex/web/command-injection/defense/) - never interpolate it into a query string or a command line.
 - Serve downloads through a script that looks up the file by id, enforces authorization (so it isn't an [IDOR](/codex/web/idor/)/[LFI](/codex/web/lfi/) in its own right), and sends `Content-Disposition: attachment`, `X-Content-Type-Options: nosniff`, and an accurate `Content-Type`.
 - Return `403` on direct access to the storage directory.
 
@@ -62,7 +63,7 @@ Closes [filename injection and directory disclosure](/codex/web/uploads/post-upl
 
 1. **Primary (design):** store uploads outside the webroot / in a non-executable location or separate host, served via a brokered download script.
 2. **Validation:** whitelist + blacklist the extension *and* validate signature/MIME, requiring all to agree, on the back end.
-3. **Naming/access:** random stored names, sanitised original in DB, authorized download script with `nosniff` + `Content-Disposition`, `403` on the directory.
+3. **Naming/access:** build disk paths from a random generated name; treat the original filename as untrusted (parameterised DB writes, no-shell processing); authorized download script with `nosniff` + `Content-Disposition`, `403` on the directory.
 4. **Runtime:** low-privileged account, `disable_functions`, OS isolation (not `open_basedir` alone), size limits, patched libraries.
 
 Avoid presenting a single check - a MIME test, an extension blacklist, a WAF - as the fix; this cluster is a catalogue of how each falls on its own.
