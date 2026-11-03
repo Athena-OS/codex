@@ -41,7 +41,7 @@ Closes the third surface - authenticated [admin-to-RCE](/codex/web/wordpress/adm
 
 - **`DISALLOW_FILE_EDIT`** disables the in-dashboard theme and plugin editors (`theme-editor.php`, `plugin-editor.php`).
 - **`DISALLOW_FILE_MODS`** goes further and disables *both* editing and installing/uploading plugins and themes - the control that also closes the plugin-upload path `DISALLOW_FILE_EDIT` leaves open.
-- **Keep the code directories read-only to the web user**, so even a slip can't drop a PHP file into the webroot. Don't make *every* served directory unwritable, though - that breaks media uploads and, on direct-filesystem installs, the auto-updates from section 1. Separate the concerns instead: code read-only (updated out-of-band or by a different owner than the web user), and `wp-content/uploads` writable **but with PHP execution disabled** there (an `.htaccess` or nginx rule denying `.php` under the uploads path), so a planted file can't run.
+- **Keep the code directories read-only to the web user**, so even a slip can't drop a PHP file into the webroot. Don't make *every* served directory unwritable, though - that breaks media uploads and, on direct-filesystem installs, the auto-updates from section 1. Separate the concerns instead: code read-only (updated out-of-band or by a different owner than the web user), and `wp-content/uploads` writable **but with script execution disabled across the whole subtree**. Set that in server configuration the web user can't modify - not a writable `.htaccess`, which a planted file could overwrite to re-enable handlers - and cover *every* PHP-mapped extension (`.php`, `.phtml`, `.phar`, …), not just `.php`, so a planted file can't run. See [upload defenses](/codex/web/uploads/defense/) for the directory-wide approach.
 
 This is containment of a compromised admin, not a substitute for sections 1 and 2 - but on a hardened install it turns "admin password cracked" into "admin access without a straightforward shell."
 
@@ -88,7 +88,7 @@ Lead with the control that closes the finding you demonstrated, then the lifecyc
 1. **Vulnerable/outdated plugin →** update it, and **delete** unused plugins - deactivation still exposes directly-callable vulnerable scripts (hook/AJAX/REST-only bugs go dormant, but delete regardless since you can't tell from outside).
 2. **Weak credentials / default admin →** strong passwords, enforced 2FA, rename `admin`, least-privilege roles.
 3. **Open user enumeration / brute-force →** lockout on both `wp-login.php` and `xmlrpc.php`, suppress the `?author=`/REST oracles, homogenize login errors.
-4. **Admin-to-RCE →** `DISALLOW_FILE_EDIT` as the default (keeps auto-updates working), or `DISALLOW_FILE_MODS` where patching is external (it also closes the plugin-upload path but disables the updater), plus read-only code directories and a writable-but-non-executable `wp-content/uploads` (deny PHP execution there).
+4. **Admin-to-RCE →** `DISALLOW_FILE_EDIT` as the default (keeps auto-updates working), or `DISALLOW_FILE_MODS` where patching is external (it also closes the plugin-upload path but disables the updater), plus read-only code directories and a writable `wp-content/uploads` with script execution disabled across the whole subtree in server config (every PHP-mapped extension, not a writable `.htaccess`).
 5. **Transport →** `FORCE_SSL_ADMIN` + HTTPS everywhere.
 
 Avoid presenting a single security plugin as the whole fix - this cluster exists because real installs ship with only some of these behaviors actually configured.
