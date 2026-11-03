@@ -182,7 +182,11 @@ Environment-variable slicing (above) only yields characters that happen to sit i
 echo $(tr '!-}' '"-~'<<<[)       # shifts every printable char up by one → "\"
 ```
 
-`'!-}'` is the source range (ASCII 33-125), `'"-~'` the destination (34-126) - every character maps to the next one up. Look the target up in `man ascii`, feed `tr` the character one position lower, and the shifted output is the blocked character. Handy for producing `;`, `\`, `` | ``, `` ` `` and other separators/metacharacters a blacklist strips on sight. To shift the other way, swap the ranges: `tr '"-~' '!-}'`.
+`'!-}'` is the source range (ASCII 33-125), `'"-~'` the destination (34-126) - every character maps to the next one up. Look the target up in `man ascii`, feed `tr` the character one position lower, and the shifted output is the blocked character. The shifted output is character **data** in the current parse, so it slots in where a blocked character is needed as data - a path like `/etc/passwd`, or an argument a command filter would reject. To shift the other way, swap the ranges: `tr '"-~' '!-}'`.
+
+<Aside type="caution">
+These produce a character as **data, not shell syntax.** A generated `;`, `` | ``, `` ` `` or `>` won't separate commands, pipe, or redirect in the same injection - the shell finished parsing before the `$()` substitution ran and doesn't re-parse its output. To use a generated character *as* syntax you need a second parse stage: feed the assembled string to `eval` / `bash -c`, or land it in a separate injection point that gets parsed fresh.
+</Aside>
 
 ### Windows
 
@@ -191,10 +195,10 @@ PowerShell builds the same result straight from a code point - cast an integer t
 ```powershell
 [char]92                         # "\"
 [char]59                         # ";"
-"$([char]59)whoami"              # interpolate into a larger command string
+"$([char]59)whoami"              # builds the STRING ";whoami" - data, not executed
 ```
 
-cmd.exe has no clean equivalent; use the `%VAR:~i,1%` slicing above, or drop to PowerShell.
+As on Linux, this yields the character as data; running an assembled string as a command needs a second stage - `Invoke-Expression`/`iex` or the call operator `&`. cmd.exe has no clean equivalent; use the `%VAR:~i,1%` slicing above, or drop to PowerShell.
 
 ## Command name obfuscation
 
