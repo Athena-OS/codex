@@ -4,7 +4,7 @@ description: Client-side XSS where a JavaScript source flows to a dangerous sink
 mitre: [T1059.007, T1185]
 d3fend: [D3-AH]
 impact: [SessionTakeover, AccountTakeover]
-owasp: [A03]
+owasp: [A05]
 noise: stealth
 sidebar:
   order: 4
@@ -21,10 +21,12 @@ The vulnerability is entirely in client-side JavaScript: a **source** reads atta
 http://<TARGET>/#<img src=x onerror=alert(document.domain)>
 
 # Vulnerable when a source flows to a sink with no sanitization, e.g.:
-document.getElementById('out').innerHTML = location.hash.slice(1);
+document.getElementById('out').innerHTML = decodeURIComponent(location.hash.slice(1));
 ```
 
-Success indicator: the payload executes, but the response HTML (View Source / the raw HTTP response) does **not** contain it - it only appears in the live DOM (Inspect / DevTools). That gap is the signature of DOM XSS.
+The `decodeURIComponent` matters: browsers percent-encode `<`, `>`, and spaces in the fragment, so a sink that assigns `location.hash` *raw* to `innerHTML` inserts the text `%3Cimg...%3E`, not an element. Real-world DOM sinks almost always decode first (as above) - that decode step is what makes the payload fire.
+
+Success indicator: the payload executes, but the raw HTTP response does **not** contain it in a form the client reads from the body - it is assembled into the live DOM by JavaScript (visible under Inspect / DevTools, not necessarily in View Source). That source→sink assembly, not mere absence from the response, is the signature of DOM XSS.
 
 ## Sources and sinks
 
@@ -61,7 +63,7 @@ A DOM XSS exists only when a **source** reaches a **sink**. Learn to spot both.
 1. Open DevTools and search the page's JavaScript for sink names (`innerHTML`, `document.write`, `eval`, `.html(`).
 2. For each sink, work backwards: does its argument derive from a source (`location`, `document.referrer`, `postMessage`, storage)?
 3. If a source reaches a sink with no encoding/sanitization in between, you have a candidate. Burp's **DOM Invader** automates this trace and flags source→sink flows.
-4. Confirm by putting a canary in the source (e.g. in `#…`) and watching it appear in the live DOM via Inspect - not View Source.
+4. Confirm by putting a canary in the source (e.g. in `#…`) and watching JavaScript assemble it into the live DOM via Inspect. Seeing it appear in the DOM but not View Source is a strong signal; but the reverse is not proof of safety (see the failure modes).
 
 </Steps>
 
@@ -112,7 +114,7 @@ Check every `addEventListener('message', …)` for a missing or weak origin chec
 
 ## Common failure modes
 
-- **Canary appears in View Source** → that's server-side [reflected](../reflected/)/[stored](../stored/), not DOM. DOM XSS shows only in the live DOM.
+- **Canary appears in View Source** → this does *not* rule out DOM XSS. A value can be server-rendered into the response (a JSON blob, a `data-` attribute, a hidden field) and *then* read by client JS that passes it to an unsafe sink. Classify by the client-side source→sink flow, not by presence in the response. Absence from View Source but presence in the live DOM is a strong positive signal; presence in View Source is simply inconclusive.
 - **`<script>` doesn't run via `innerHTML`** → expected; use `onerror`/`onload` handler payloads.
 - **Framework auto-escapes** (React/Angular/Vue) → default bindings encode output; look for the escape hatches (`dangerouslySetInnerHTML`, `[innerHTML]`, `v-html`, `bypassSecurityTrust*`) or template-injection sinks.
 - **Value is URL-decoded twice / re-encoded** → trace the exact transformations in the JS; the working payload matches what survives to the sink.

