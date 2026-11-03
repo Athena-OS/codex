@@ -181,8 +181,10 @@ When the engagement explicitly authorizes "loud" testing (configuration audit, n
 | [Weak permissions](/codex/windows/privesc/weak-permissions/) | Modifiable service binary / config / registry key, unquoted paths, autoruns |
 | [Vulnerable services](/codex/windows/privesc/vulnerable-services/) | Exploiting known-vulnerable third-party SYSTEM services (e.g. Druva inSync) |
 | [DLL hijacking](/codex/windows/privesc/dll-hijacking/) | Search-order abuse - missing-DLL plant and DLL proxying |
+| [Credential hunting](/codex/windows/privesc/credential-hunting/) | Secrets at rest - config files, PowerShell history, DPAPI creds, Sticky Notes, shares |
+| [Stored credentials](/codex/windows/privesc/stored-credentials/) | Secrets held by apps/OS - cmdkey, browsers, KeePass cracking, registry, wifi, LaZagne |
 
-Subsequent rounds will cover kernel exploits, credential hunting (config files, registry, browsers, password managers), restricted environments (Citrix breakout, kiosks), and miscellaneous techniques (LOLBAS, AlwaysInstallElevated, scheduled task abuse, VHDX mounting, EOL system attacks).
+Subsequent rounds will cover kernel exploits, restricted environments (Citrix breakout, kiosks), and miscellaneous techniques (LOLBAS, AlwaysInstallElevated, scheduled task abuse, VHDX mounting, EOL system attacks).
 
 ## Operational sequence
 
@@ -193,6 +195,6 @@ For a standard "low-privileged shell, escalate to SYSTEM" task:
 3. **Group membership** - `whoami /groups` and `net localgroup`. Any of `Backup Operators`, `DnsAdmins`, `Hyper-V Administrators`, `Print Operators`, `Server Operators`, or `Event Log Readers`: jump to the relevant page
 4. **System version & patches** - `systeminfo` → feed to WES-NG or run Watson locally. Match missing KBs to public exploits
 5. **Service / file ACL audit** - `accesschk`, `winPEAS`, `PowerUp` look for weak permissions
-6. **Credential hunting** - only if the above fail; covered in a later round
+6. **Credential hunting** - only if the above fail; [secrets at rest](/codex/windows/privesc/credential-hunting/) and [app/OS stored credentials](/codex/windows/privesc/stored-credentials/)
 
 The order matters because each step is cheaper than the next. A `whoami /priv` check is one command and reveals JuicyPotato-style wins instantly; a full file-system credential hunt is hours of work and the lowest-value lookup.

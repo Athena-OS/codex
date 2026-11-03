@@ -392,7 +392,7 @@ This dumps all environment variables. Read for:
 - **HOMEDRIVE** / **HOMEPATH** - Sometimes maps to a network share. The presence of `H:` mapped to `\\server\users$\username` indicates roaming profiles; navigating to that share may reveal other users' folders if ACLs are loose.
 - **LOGONSERVER** - Same data as in `systeminfo`, confirms which DC handled auth.
 - **USERDNSDOMAIN** / **USERDOMAIN** - Confirms domain context.
-- **USERPROFILE** - Your home directory. Always check `Desktop`, `Documents`, `Downloads`, `AppData\Local`, and `AppData\Roaming` for credential files (covered in later rounds).
+- **USERPROFILE** - Your home directory. Always check `Desktop`, `Documents`, `Downloads`, `AppData\Local`, and `AppData\Roaming` for credential files (see [credential hunting](/codex/windows/privesc/credential-hunting/)).
 
 A common operator-targeted thing: any non-standard entries in PATH. If you see `C:\CustomApps\bin\` left of `C:\Windows\System32`, the `CustomApps\bin\` directory is high-priority - if writable, you can shadow standard Windows binaries by dropping a same-named binary there.
 
@@ -418,7 +418,7 @@ From the data this produces, the decision tree is:
 2. Did `whoami /groups` show a privileged group from the escalation list? → Jump to that group's page.
 3. Are missing patches old enough to suggest kernel-exploit candidacy? → Run WES-NG, pick the best match.
 4. Is there interesting installed software with known vulnerabilities? → Search for that product+version.
-5. None of the above? → Run [winPEAS](https://github.com/peass-ng/PEASS-ng/tree/master/winPEAS) or [Seatbelt](https://github.com/GhostPack/Seatbelt) for misconfiguration sweep, then proceed to credential hunting.
+5. None of the above? → Run [winPEAS](https://github.com/peass-ng/PEASS-ng/tree/master/winPEAS) or [Seatbelt](https://github.com/GhostPack/Seatbelt) for misconfiguration sweep, then proceed to [credential hunting](/codex/windows/privesc/credential-hunting/).
 
 ## Quick reference
 
