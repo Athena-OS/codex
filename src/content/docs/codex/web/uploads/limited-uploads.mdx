@@ -154,7 +154,7 @@ When the application parses this SVG to render or analyze it, the XML parser res
 <!ENTITY xxe SYSTEM "expect://id">
 ```
 
-Even with no reflected output, a `file://` entity doubles as a **path-existence oracle**: a 200 response means the path exists and is readable, a 500 means it's missing or access-restricted. Sweep candidate files and directories to map the filesystem before committing to a read.
+Even with no reflected output, a `file://` entity can act as a rough **path oracle** - but the signal is application-dependent, not a clean 200/500 split: an existing, readable file whose bytes break XML parsing (an unescaped `&`/`<`, or binary content) can still error, and an app that swallows resolution errors can still return 200. Calibrate against one path you know exists-and-is-readable and one you know is missing, confirm they produce different responses, then sweep.
 
 ### Where the XXE output appears
 
@@ -360,7 +360,7 @@ The XXE OOB callback uses Burp Collaborator (or your own DNS/HTTP server). The p
 
 - **Limited-upload attacks often look "less severe" but compose into serious findings.** A stored XSS via uploaded HTML is medium-severity alone but leads to admin session theft. An XXE in SVG leads to source disclosure leading to other vulnerabilities. The chain matters more than the individual primitive.
 - **Image format processors are a CVE goldmine.** ImageMagick, Pillow, libpng, libjpeg have all had memory-corruption CVEs from malformed uploads. When the target is an app that processes user images server-side, version-specific exploits sometimes give RCE through pure image upload.
-- **Media processing beyond images is exploitable too.** Any automatic server-side processing of an upload - video transcoding, archive extraction, document conversion - carries its own CVE history. The classic example is an **AVI upload triggering XXE in `ffmpeg`**; any pipeline that decodes or transcodes what you upload is worth checking against known library CVEs.
+- **Media processing beyond images is exploitable too.** Any automatic server-side processing of an upload - video transcoding, archive extraction, document conversion - carries its own CVE history. The classic example is a crafted **AVI upload that makes `ffmpeg` disclose arbitrary local files** through its HLS/playlist demuxer (CVE-2017-9993) - often loosely called "XXE" but really the demuxer following attacker-controlled references, not XML entity expansion. Any pipeline that decodes or transcodes what you upload is worth checking against known library CVEs.
 - **SVG is the most versatile limited-upload primitive.** XML for XXE, script tags for XSS, image rendering for stealth, sometimes server-side rendering for additional attack surface. When SVG uploads are allowed, several attack classes are reachable.
 - **DoS findings have lower severity in pentest reports** but real impact during incident response. A user discovering that they can take down the application with a 10 KB file is genuinely useful to know.
 
