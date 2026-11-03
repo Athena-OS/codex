@@ -29,7 +29,8 @@ When the response under "true" differs from "false" (different content, length, 
 
 | Symptom | Class |
 |---|---|
-| Errors visible | Use [UNION-based](../union-based/) or error-based |
+| Errors visible with query output | Use [UNION-based](../union-based/) / error-based extraction |
+| Response identical, but a condition triggers a DB error | Use [Error-based blind](../blind-error/) |
 | Response identical, only timing differs | Use [Time-based](../blind-time/) |
 | Response differs on logically true vs. false condition | **This page** |
 | No response feedback at all | Use [Out-of-band](../out-of-band/) |
