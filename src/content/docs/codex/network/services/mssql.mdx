@@ -154,12 +154,25 @@ ms-sql-config             # configuration enumeration (needs creds)
 ms-sql-dac                # try the Dedicated Admin Connection
 ms-sql-dump-hashes        # password hash dump (needs creds)
 ms-sql-empty-password     # test empty password on default accounts
+ms-sql-hasdbaccess        # which databases the login can access (needs creds)
 ms-sql-info               # banner / version
 ms-sql-ntlm-info          # AD intel via NTLM challenge
 ms-sql-query              # run a query (needs creds)
 ms-sql-tables             # list tables (needs creds)
 ms-sql-xp-cmdshell        # test xp_cmdshell (needs sa)
 ```
+
+### Metasploit `mssql_ping`
+
+An alternative instance-discovery probe - it returns the server name, instance name, version, and whether named pipes / TCP are enabled:
+
+```shell
+msf > use auxiliary/scanner/mssql/mssql_ping
+msf > set RHOSTS 10.129.14.128
+msf > run
+```
+
+Handy when the instance is on a non-default port - it queries the SQL Server Browser on UDP 1434 to enumerate instances - or when you just want the instance metadata without a full NSE scan.
 
 ### Connecting with impacket-mssqlclient
 

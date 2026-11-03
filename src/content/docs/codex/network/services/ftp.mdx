@@ -146,6 +146,12 @@ Three NSE scripts that run by default and matter here:
 - **`ftp-syst`** - runs `STAT` command, reveals server version and runtime config.
 - **`ftp-bounce`** - tests for the (very old) FTP bounce attack, where the server could be coerced into scanning third parties.
 
+Add `--script-trace` to any NSE scan to watch the scripts' wire traffic - the exact commands Nmap sends, the ports used, and the server's responses - useful when a script's result is surprising or you're debugging why one didn't fire:
+
+```shell
+sudo nmap -sV -p21 -sC -A <target> --script-trace
+```
+
 Other NSE scripts available in `/usr/share/nmap/scripts/`:
 
 ```shell

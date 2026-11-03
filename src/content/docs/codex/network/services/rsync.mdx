@@ -70,6 +70,17 @@ The rsync daemon serves a list of **modules**. Each module is a named directory 
 
 A module with no `auth users` directive is **anonymous-readable** by default. If `read only = false` is set without `auth users`, it's **anonymous-writable** - which is operationally rare but devastating when found.
 
+### Rsync over SSH
+
+When the target runs rsync over SSH rather than the standalone daemon (no open `873/tcp`, but you have SSH access or credentials), select the remote shell with `-e`:
+
+```shell
+rsync -av -e ssh <user>@<target>:/path/ ./local/            # over SSH on 22
+rsync -av -e "ssh -p2222" <user>@<target>:/path/ ./local/   # non-standard SSH port
+```
+
+Same transfer semantics as daemon mode; the difference is the transport and that SSH handles authentication.
+
 ### Wire protocol
 
 Plaintext, line-based, with a brief version handshake. The daemon-mode client sends:

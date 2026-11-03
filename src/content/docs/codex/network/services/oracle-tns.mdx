@@ -170,7 +170,21 @@ NSE's `oracle-sid-brute` walks a built-in wordlist. It'll find common SIDs quick
 
 ### SID enumeration with ODAT
 
-[ODAT](https://github.com/quentinhardy/odat) (Oracle Database Attacking Tool) is the operator's Swiss Army knife for Oracle:
+[ODAT](https://github.com/quentinhardy/odat) (Oracle Database Attacking Tool) is the operator's Swiss Army knife for Oracle. It needs Oracle Instant Client (and `cx_Oracle`) to reach the listener - on Debian/Kali:
+
+```shell
+sudo apt install libaio1 python3-dev alien -y
+# download Instant Client "basic" + "sqlplus" zips from Oracle, unzip them, then
+# point the loader AND PATH at the extracted dir, using the absolute path:
+IC="$PWD/instantclient_21_12"
+export LD_LIBRARY_PATH="$IC:$LD_LIBRARY_PATH"
+export PATH="$IC:$PATH"                     # so the `sqlplus` binary resolves
+# system Python is externally managed (PEP 668) on Debian 12+/Kali - use a venv:
+python3 -m venv ~/.venvs/odat && . ~/.venvs/odat/bin/activate
+pip install cx_Oracle
+```
+
+With that in place:
 
 ```shell
 odat sidguesser -s 10.129.14.128 -p 1521

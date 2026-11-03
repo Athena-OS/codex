@@ -108,7 +108,13 @@ PORT    STATE         SERVICE
 623/udp open|filtered asf-rmcp
 ```
 
-`open|filtered` is the common UDP result. Confirm via Metasploit module:
+The `ipmi-version` NSE script fingerprints the protocol version in the same scan - an alternative to the Metasploit module below:
+
+```shell
+sudo nmap -sU --script ipmi-version -p623 10.129.14.128
+```
+
+`open|filtered` is the common UDP result. Confirm the version with that script or the Metasploit module:
 
 ```shell
 msfconsole
@@ -159,6 +165,14 @@ hashcat -m 7300 ipmi.hashes /usr/share/wordlists/rockyou.txt
 ```
 
 `-m 7300` is the IPMI 2.0 RAKP HMAC-SHA1 mode. Cracking rate is fast - typical hardware gets hundreds of millions of guesses per second on this mode. Most default and short passwords fall in minutes.
+
+For an **HP iLO** still on its factory-default password - a randomized 8-character string of uppercase letters and digits - skip the wordlist and brute the exact keyspace with a mask:
+
+```shell
+hashcat -m 7300 ipmi.hashes -a 3 '?1?1?1?1?1?1?1?1' -1 '?d?u'
+```
+
+`-1 ?d?u` defines a custom charset of digits + uppercase, and eight of them (`?1` ×8) covers the entire iLO default space - which falls fast at this mode's speed.
 
 ### Vendor default credential test
 
