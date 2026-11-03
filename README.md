@@ -64,7 +64,7 @@ sidebar:
 | `impact` | every page except overviews | `src/data/impact.ts` |
 | `owasp` | web pages | `src/data/owasp.ts` |
 | `cve` | when tied to a specific vulnerability | none (free-form) |
-| `noise` | technique pages | none (`stealth` / `moderate` / `loud`) |
+| `noise` | optional; single-technique pages with one clear footprint | none (`stealth` / `moderate` / `loud`) |
 
 > **Defense pages:** MITRE ATT&CK is an offensive catalog and D3FEND is its defensive counterpart, so on a `defense.mdx` page the two tags point in opposite directions. There, `mitre` names the **attack the page defends against** (not a defense — ATT&CK has no defensive techniques), and `d3fend` names the actual countermeasures. Keeping the ATT&CK ID lets each attack line up with its mitigation under one identifier (e.g. attack `T1190` ↔ defense `D3-AH`). Omit `impact` and `noise` on defense pages.
 
