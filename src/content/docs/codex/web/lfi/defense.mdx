@@ -56,16 +56,16 @@ if ($real === false || !str_starts_with($real, $base)) {
 readfile($real);
 ```
 
-Use the platform's own primitives (`basename`, `realpath`; Node `path.basename` + `path.resolve` with a prefix check; Java `Path.normalize` + `startsWith`). Hand-rolled canonicalizers miss edge cases - the classic being that `realpath`/`basename` behave differently from a shell, so a custom check can pass input that a later `system()` call expands.
+Use a primitive that **resolves symlinks**, and check containment against the resolved paths - PHP `realpath()`, Node `fs.realpath()`, Java `Path.toRealPath()`. String-only normalizers (`path.resolve()`, `Path.normalize()`) collapse `../` but do *not* follow symlinks, so a link planted inside the base directory passes the prefix check while the actual read lands outside it. Resolve both the base and the candidate, then compare at a directory boundary (e.g. base + separator) so `/var/www/files-evil/` can't satisfy a `startsWith('/var/www/files')` test. Hand-rolled canonicalizers miss edge cases - the classic being that `realpath`/`basename` behave differently from a shell, so a custom check can pass input that a later `system()` call expands.
 
 ## 4. Harden the runtime (limits the blast radius)
 
 Configuration that turns "arbitrary file read" into "a much smaller problem" - the controls that decide how far [RFI](/codex/web/lfi/rfi/), wrappers, and traversal can reach:
 
-- **Disable remote inclusion:** `allow_url_include = Off` **and** `allow_url_fopen = Off` in `php.ini`. This kills [RFI](/codex/web/lfi/rfi/) and the `data://` / `http://` [wrappers](/codex/web/lfi/wrappers/) outright - the single highest-value LFI→RCE paths.
-- **Confine the filesystem:** `open_basedir = /var/www` (PHP), or run the app in a container so there is simply no `/etc/passwd`, `id_rsa`, or sibling-app source to reach. This is what blunts path traversal even when it works.
+- **Disable remote inclusion:** `allow_url_include = Off` **and** `allow_url_fopen = Off` in `php.ini`. This kills the URL-wrapper [RFI](/codex/web/lfi/rfi/) paths - `http://`, `ftp://`, and the `data://` / `php://input` [wrappers](/codex/web/lfi/wrappers/) - the highest-value LFI→RCE routes. It does **not** stop everything on Windows: a UNC path (`\\attacker\share\shell.php`) is treated as a *filesystem* path, not a URL, so [SMB-based RFI](/codex/web/lfi/rfi/) still works with both flags off. On Windows, also reject UNC/`\\` inputs and block outbound SMB (445) egress.
+- **Confine the filesystem:** `open_basedir = /var/www` (PHP), or run the app in a container. Note what a container does and doesn't do: it limits reads to the *container's* filesystem, not the host's - but a normal image still contains `/etc/passwd`, and app secrets, sibling source, or mounted volumes may be readable inside it. So pair it with a minimal image, restricted/read-only mounts, and a web user without read access to in-container secrets. `open_basedir`/containerization blunts host traversal; it is not "the files aren't there."
 - **Drop dangerous extensions/modules:** don't load the `expect` extension (the [`expect://`](/codex/web/lfi/wrappers/) wrapper); restrict `php://filter` where the app doesn't need it.
-- **Least privilege:** run the web user with no read access to secrets it doesn't need (`/etc/shadow`, other users' homes, SSH keys) and no write access to web-served directories - the latter breaks the [upload](/codex/web/lfi/file-upload-chain/) and [log-poisoning](/codex/web/lfi/log-poisoning/) RCE chains.
+- **Least privilege:** run the web user with no read access to secrets it doesn't need (`/etc/shadow`, other users' homes, SSH keys), and no *write* access to web-served directories. This breaks the [upload-into-webroot](/codex/web/lfi/file-upload-chain/) chain, but note it does **not** stop [log poisoning](/codex/web/lfi/log-poisoning/): the poisoned log is written by another service (not through a webroot write) and the include only needs *read* access to it - likewise uploads or session files written outside the webroot. The control that actually denies these executable inclusion is the fixed allowlist in section 2; least privilege only shrinks what's reachable.
 
 ## 5. Defense in depth
 
@@ -74,13 +74,13 @@ Configuration that turns "arbitrary file read" into "a much smaller problem" - t
 
 ## Note for non-PHP stacks
 
-Outside PHP the *execute* path is rarer, but the *read* path (path traversal → file disclosure) is identical, and the fixes are the same: allowlist the selector, or `path.resolve`/`normalize` + base-directory check. Node's `res.render()` and Java's `<c:import>` do execute/fetch, so treat those exactly like PHP `include` - no user input in the template name, and no remote URLs.
+Outside PHP the *execute* path is rarer, but the *read* path (path traversal → file disclosure) is identical, and the fixes are the same: allowlist the selector, or a symlink-resolving canonicalization (`fs.realpath()` / `Path.toRealPath()`, **not** `path.resolve()`/`Path.normalize()`) plus a base-directory containment check. Node's `res.render()` and Java's `<c:import>` do execute/fetch, so treat those exactly like PHP `include` - no user input in the template name, and no remote URLs.
 
 ## For the report
 
 1. **Primary:** remove user input from the file-loading call, or map it through an allowlist to a fixed file.
-2. **If a path is required:** canonicalize with platform primitives and verify containment in an allowed base directory.
-3. **Runtime hardening:** `allow_url_include`/`allow_url_fopen = Off`, `open_basedir` or containerization, least-privilege web user, drop `expect`.
+2. **If a path is required:** canonicalize with a symlink-resolving primitive (`realpath`/`fs.realpath`/`toRealPath`) and verify containment in an allowed base directory.
+3. **Runtime hardening:** `allow_url_include`/`allow_url_fopen = Off` (plus UNC rejection + SMB egress block on Windows), `open_basedir` or a minimal container with restricted mounts, least-privilege web user, drop `expect`.
 4. **Defense in depth:** WAF in at least report-only mode; alert on traversal/wrapper indicators.
 
 Avoid recommending a `../` filter or a WAF as the primary fix - both are bypassable, and this cluster is a catalogue of how.
