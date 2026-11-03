@@ -113,6 +113,7 @@ The "Critical" tier is where chained IDORs land. Information-disclosure IDOR + f
 | [Mass enumeration](/codex/web/idor/mass-enumeration/) | Burp Intruder / ffuf / scripted bulk pulls; reversing MD5-of-base64-style "hashed" references |
 | [Insecure APIs](/codex/web/idor/insecure-apis/) | REST verb-by-verb attack surface (PUT/POST/DELETE on user objects), uid-mismatch / uuid-mismatch defense bypass, role-field manipulation |
 | [Chaining](/codex/web/idor/chaining/) | End-to-end: GET disclosure → uuid harvest → PUT modification → role escalation → admin function calls |
+| [Defense](/codex/web/idor/defense/) | Server-side object-level authorization on every request/verb, identity from the session not the request, unpredictable references as defence in depth |
 
 ## Cross-cluster references
 

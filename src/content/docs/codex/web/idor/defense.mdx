@@ -1,0 +1,76 @@
+---
+title: Defending Against IDOR
+description: How IDOR is actually prevented - server-side object-level authorization on every request, derived from the session not the request, with unpredictable references as defence in depth.
+mitre: [T1190, T1213]
+d3fend: [D3-AH]
+owasp: [A01]
+sidebar:
+  order: 6
+  label: Defense
+---
+import { Aside } from '@astrojs/starlight/components';
+
+IDOR is a missing-authorization bug, not a reference bug: the app exposes a handle to a resource and then trusts the caller to only ask for handles that are theirs. The fix is to check, on the server, for **every** request, that the authenticated caller is allowed to touch the specific object named - and to derive "who the caller is" from the session, never from the request. Obscuring the reference helps a little; it is never the fix.
+
+<Aside type="note">
+For the operator, the absence of these is the finding: an object handle you can change (`?uid=`, `/api/profile/74`, a hash) where swapping it returns someone else's resource means the server isn't doing object-level authorization - see [identifying](/codex/web/idor/identifying/). Everything below is what has to be in place to close that.
+</Aside>
+
+## 1. Enforce object-level authorization server-side, on every request
+
+The one control that removes the bug. On each request that names an object, the server must answer "is *this caller* permitted to perform *this action* on *this specific object*?" before acting:
+
+- Check at the **object level**, not just "is the user logged in." Authentication (who you are) is not authorization (what you may touch).
+- Do it on **every** endpoint and **every** verb. A GET that checks and a PUT that doesn't is still IDOR - see [verb tampering](/codex/web/auth/verb-tampering/) and [insecure APIs](/codex/web/idor/insecure-apis/).
+- Deny by default: the resource is inaccessible unless a rule explicitly grants this caller access.
+
+```javascript
+// Firestore-style rule: read/write only if the caller owns the record or is admin
+match /api/profile/{userId} {
+  allow read, write: if request.auth != null
+    && (request.auth.uid == userId || request.auth.token.role == 'admin');
+}
+```
+
+## 2. Derive identity and role from the session, never the request
+
+The decisive detail. Authorization must use the caller's identity as the server knows it, not values the client sent:
+
+- Resolve the user id / role from the **server-side session or a verified token**, then compare that to the object's owner. Never trust a `uid`, `role`, `is_admin`, or `uuid` taken from the URL, body, cookie, or a hidden field - those are attacker-controlled (the [chaining](/codex/web/idor/chaining/) and [insecure-API](/codex/web/idor/insecure-apis/) attacks are exactly the app trusting a request-supplied role or uid).
+- Centralise it. An RBAC/ABAC layer that every request funnels through is far safer than per-endpoint checks that drift and get forgotten.
+
+<Aside type="caution">
+A request that carries its own authorization decision (`is_admin=true`, `role=admin`, `uid=<victim>`) is the anti-pattern. The server must look those up from the session and ignore the request's claims entirely.
+</Aside>
+
+## 3. Unpredictable references - defence in depth, not the fix
+
+Replacing sequential ids with UUIDv4 or salted hashes raises the bar for [mass enumeration](/codex/web/idor/mass-enumeration/), but it does **not** fix IDOR:
+
+- An unguessable reference that still isn't access-controlled falls to any attack that *obtains* a valid reference - a leaked id, a reference from another response, or replaying one user's request in another user's session.
+- So treat random references as a second layer **behind** section 1, never instead of it. The authorization check is what makes the app safe; the opaque id only makes enumeration harder.
+- If you use references: generate them **server-side** at object-creation time and store the mapping in the database. Never compute an object's reference on the client, and never derive it from a predictable input (`md5(uid)` is reversible/enumerable - see [mass enumeration](/codex/web/idor/mass-enumeration/)).
+
+<Aside type="caution">
+UUIDs can make IDOR *harder to detect* in testing without making it absent - a reviewer who can't guess the next id may miss that there's no authorization at all. Don't let an opaque reference substitute for the access-control review.
+</Aside>
+
+## 4. Keep the authorization model off the client
+
+- Don't ship the full function catalogue to the browser and gate it by a client-side role flag - the server must re-check, because the endpoint is reachable regardless of what the SPA chooses to render (the JS-disclosure attack in [identifying](/codex/web/idor/identifying/) is this mistake).
+- Log and alert on authorization failures and on sequential/bulk access to object references - a spike is the signature of [mass enumeration](/codex/web/idor/mass-enumeration/).
+
+## For the report
+
+1. **Primary:** add a server-side object-level authorization check to the affected endpoint(s), for every verb, comparing the object's owner/ACL against the identity resolved from the session.
+2. **Systemic:** centralise this in an access-control layer (RBAC/ABAC) so new endpoints inherit it; deny by default.
+3. **Never trust the request** for identity or role - resolve both server-side.
+4. **Defence in depth:** unpredictable, server-generated references (UUIDv4); authorization-failure logging.
+
+Avoid presenting "switch to UUIDs" as the fix - it's the second step, and an app that does only that is still vulnerable to every reference-obtaining attack in this cluster.
+
+## Related
+
+- [Identifying](/codex/web/idor/identifying/) - the client-side-role and reference-swap mistakes section 2 and 4 close
+- [Insecure APIs](/codex/web/idor/insecure-apis/) - per-verb authorization gaps
+- [Verb tampering](/codex/web/auth/verb-tampering/) - why "every verb" matters
