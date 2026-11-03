@@ -99,7 +99,7 @@ Then to split Twig vs Nunjucks (both returned `49`):
 Or the surest tell - try a constructor expression:
 
 ```
-{{ "".__class__ }}                # Jinja2: <class 'str'>
+{{ "".__class__ }}                # Python family (Jinja2 OR Tornado): <class 'str'>
 {{ _self }}                       # Twig: object dump of __TwigTemplate_...
 {{ range }}                       # Nunjucks: [object Function]
 {{ handler }}                     # Tornado: RequestHandler object (when sink is a handler)

