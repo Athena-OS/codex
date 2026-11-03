@@ -51,10 +51,13 @@ Validate every value against the format it must have, server-side, and reject an
 
 ```php
 if (filter_var($_GET['ip'], FILTER_VALIDATE_IP)) { /* ok */ } else { /* reject */ }
-// non-standard formats: a tight allowlist regex, e.g. ^[A-Za-z0-9._-]+$
+// non-standard formats: anchor a tight regex to the exact operand shape, and
+// make sure it can't start with '-'. ^[A-Za-z0-9._-]+$ is NOT enough - it
+// accepts --help, -rf, -o, so it still permits argument injection.
+// e.g. a hostname/label:  ^[A-Za-z0-9][A-Za-z0-9.-]*$   (leading char is alnum)
 ```
 
-Validate on the back end, not just the front end - the front-end check is UX and is trivially skipped with a proxy. Allowlisting is defence in depth behind sections 1–2, and it is also the control that closes the argument-injection gap above.
+Validate on the back end, not just the front end - the front-end check is UX and is trivially skipped with a proxy. The subtlety that actually closes the [argument-injection](/codex/web/command-injection/argument-injection/) gap from section 2 is **rejecting option-like values**: a value that validates as "only safe characters" can still be a flag if it begins with `-`. Anchor the format so the operand can't start with `-`, validate it against the shape you expect (an IP, a hostname, a numeric id), and still `--`-separate positional arguments where the program supports it. Allowlisting is defence in depth behind sections 1–2.
 
 <Aside type="caution">
 Blocklisting characters/commands, and escaping, are the fragile options. `escapeshellcmd()` escapes metacharacters across a whole command string but leaves argument boundaries intact, so it does **not** stop argument injection and has known bypasses; `escapeshellarg()` (quote one argument) is stronger but only works if you actually wrap each argument and don't build the rest of the line from input. Prefer no-shell execution (section 2) over relying on either - the [filter-bypass](/codex/web/command-injection/filter-bypass/) page is a catalogue of how blocklists and escaping fall.
@@ -65,8 +68,8 @@ Blocklisting characters/commands, and escaping, are the fragile options. `escape
 Configuration that shrinks what a successful injection yields:
 
 - **Least privilege:** run the web/app process as a low-privileged user (`www-data`), so RCE isn't instant root and can't read secrets it doesn't need.
-- **Disable the dangerous sinks:** PHP `disable_functions = system,exec,shell_exec,passthru,popen,proc_open,pcntl_exec` where the app doesn't need them.
-- **Confine the filesystem:** `open_basedir = /var/www/html`, or run in a minimal container with restricted mounts, so a shell that does spawn has little to reach.
+- **Disable the dangerous sinks:** PHP `disable_functions = system,exec,shell_exec,passthru,popen,proc_open,pcntl_exec` where the app doesn't need them. This removes the sinks at the PHP level, which is the useful part for command injection.
+- **Confine with OS-enforced isolation:** a minimal container with restricted mounts, seccomp/AppArmor, and the low-privileged account above - these constrain a process that *does* spawn. Note that PHP's `open_basedir` is **not** one of these: it restricts PHP's own file functions only, so a command run through `system()` is a child process outside its scope and can still read `/etc/passwd` (subject only to the OS user's permissions). Don't present `open_basedir` as confinement for a successful command injection.
 - **Normalise input at the edge:** reject double-encoded and non-ASCII where the parameter shouldn't contain it, so encoding tricks don't slip past validation.
 
 ## 5. Defense in depth
@@ -78,7 +81,7 @@ Configuration that shrinks what a successful injection yields:
 
 1. **Primary:** replace shell-spawning calls with native library functions; where a process is required, exec it with an argument vector and no shell.
 2. **Arguments:** allowlist-validate each user value, and `--`-separate positional args to close argument injection.
-3. **Runtime hardening:** low-privileged service account, `disable_functions`, `open_basedir`/container.
+3. **Runtime hardening:** low-privileged service account, `disable_functions`, and OS-enforced isolation (minimal container, seccomp/AppArmor) - not `open_basedir`, which doesn't constrain spawned commands.
 4. **Defense in depth:** WAF in at least report-only mode; alert on separator/obfuscation indicators.
 
 Avoid recommending a character blocklist, `escapeshellcmd`, or a WAF as the primary fix - each is bypassable, and this cluster documents how.
