@@ -1,0 +1,77 @@
+---
+title: Defending Against XXE
+description: How XXE is actually prevented - disable DTDs and external entities in the parser, keep XML libraries current, and don't leak parser errors.
+mitre: [T1190, T1083]
+d3fend: [D3-AH, D3-ACH]
+owasp: [A05, A02]
+sidebar:
+  order: 8
+  label: Defense
+---
+import { Aside } from '@astrojs/starlight/components';
+
+XXE is almost always a parser-configuration problem, not a coding one: the application hands attacker-controlled XML to a library whose external-entity and DTD processing is switched on. That makes it one of the easier classes to shut cleanly - turn those features off in the parser (ideally disable DTDs entirely), keep the library current, and the file-read/SSRF/DoS primitives in this cluster simply stop resolving.
+
+<Aside type="note">
+For the operator, the signal is in [identifying](/codex/web/xxe/identifying/): an XML sink where a defined entity reflects, or an external entity reaches your listener, means entity processing is on. Everything below is what turns it off.
+</Aside>
+
+## 1. Disable DTDs and external entities in the parser
+
+The complete fix. Configure the XML parser to reject document type definitions; if the app legitimately needs DTDs, at minimum disable external general and parameter entities. The exact switch is per-library - use the official setting, don't hand-roll:
+
+```java
+// Java - the strongest single switch: forbid DOCTYPE entirely
+DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
+dbf.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+// if DOCTYPE must be allowed, also:
+dbf.setFeature("http://xml.org/sax/features/external-general-entities", false);
+dbf.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
+dbf.setXIncludeAware(false);
+dbf.setExpandEntityReferences(false);
+```
+
+Equivalents:
+
+- **Python:** parse with **`defusedxml`** instead of the stdlib (`xml.etree`, `lxml` with resolvers) - it disables entities and DTDs by default.
+- **.NET:** on `XmlReaderSettings`, set `DtdProcessing = DtdProcessing.Prohibit` (the default on modern framework versions); don't set an `XmlResolver`.
+- **PHP (libxml):** avoid the deprecated `libxml_disable_entity_loader()` dance - on modern libxml (2.9+) external entities are off by default; don't re-enable them with `LIBXML_NOENT`.
+- **libxml2 generally:** don't pass `XML_PARSE_NOENT` / `XML_PARSE_DTDLOAD`.
+
+Harden all of: custom DTDs, external general **and** parameter entities, `XInclude`, and entity-reference expansion (the last blocks billion-laughs entity-expansion DoS).
+
+<Aside type="caution">
+Watch the hidden XML parsers. SVG image processors, DOCX/XLSX/ODF openers, PDF generators, and SOAP/XML API layers all parse XML and are all XXE-able - the [uploads limited-uploads](/codex/web/uploads/limited-uploads/) page attacks exactly these. Apply the same parser hardening wherever any of them run, not just the obvious `/api` endpoint.
+</Aside>
+
+## 2. Keep XML libraries and components current
+
+Because XXE is a library-behaviour issue, patching is unusually effective here:
+
+- Modern parsers increasingly disable external entities **by default** (libxml 2.9+, recent .NET); an out-of-date library is often the whole reason a target is vulnerable.
+- This extends to everything that parses XML downstream: SOAP stacks, SVG/image and document processors, and transitive dependencies. Keep them patched alongside the core parser.
+
+## 3. Don't leak parser errors
+
+Error-based XXE ([blind exfil](/codex/web/xxe/blind-exfil/)) exfiltrates file contents through parser error messages. Disable runtime/verbose error display in production and return generic errors, so a forced parse failure can't carry data back.
+
+## 4. Reduce the attack surface and add depth
+
+- **Prefer JSON** where a format choice exists; dropping XML (and XML-based APIs like SOAP) removes the class outright for that endpoint.
+- **WAF** can block classic `<!DOCTYPE ... <!ENTITY` patterns - a secondary layer that is evadable, never the fix.
+- **Egress controls:** blocking outbound traffic from the app server limits blind/OOB exfil and SSRF even if a parser is misconfigured.
+
+## For the report
+
+1. **Primary:** disable DTD processing (or at least external general + parameter entities and XInclude) in every XML parser the app uses, via the library's official setting; prefer a hardened wrapper like `defusedxml`.
+2. **Coverage:** apply it to every XML sink - SOAP, SVG/image, document, and PDF processors included, not just the obvious endpoint.
+3. **Patch:** update XML libraries and XML-consuming components to current versions.
+4. **Containment:** suppress verbose parser errors; restrict the app server's outbound network access; WAF as a secondary layer.
+
+Avoid presenting a WAF rule as the fix - the parser configuration is the fix; the WAF only buys time.
+
+## Related
+
+- [Identifying](/codex/web/xxe/identifying/) - the entity-processing signals this configuration removes
+- [Blind exfil](/codex/web/xxe/blind-exfil/) - why suppressing parser errors matters
+- [Uploads: limited uploads](/codex/web/uploads/limited-uploads/) - the SVG/document parsers that also need hardening
