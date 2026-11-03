@@ -40,7 +40,7 @@ Parameterisation binds **values**, not identifiers. Table names, column names, a
 
 Reject input that doesn't match the shape the field requires, server-side, before it reaches any query. Validation is a complement to parameterisation, not a replacement - it narrows the attack surface and catches the identifier case above.
 
-- **Allowlist, not blocklist.** Define what's permitted (`^[A-Za-z0-9 ]+$` for a port code, a known set for an enum) and reject everything else. Blocklisting characters invites [bypasses](./bypasses/).
+- **Allowlist, not blocklist.** Define what's permitted (`^[A-Za-z0-9 ]+$` for a port code, a known set for an enum) and reject everything else. Blocklisting characters invites [bypasses](../bypasses/).
 - Validate type and range: an `id` that should be a positive integer is cast and bounds-checked, so string payloads never survive.
 - Do it on the server. Client-side validation is a UX feature and is trivially skipped with a proxy.
 
@@ -54,7 +54,7 @@ CREATE USER 'webapp'@'localhost' IDENTIFIED BY '<strong-random>';
 GRANT SELECT ON shop.products TO 'webapp'@'localhost';
 ```
 
-- Never connect as `root` / `sa` / a DBA. Those accounts enable [file read/write and command execution](./file-operations/); a low-privilege account turns a would-be RCE into a limited data read.
+- Never connect as `root` / `sa` / a DBA. Those accounts enable [file read/write and command execution](../file-operations/); a low-privilege account turns a would-be RCE into a limited data read.
 - Separate accounts per application and per trust level. Read-only where the app only reads.
 - Revoke `FILE` (MySQL), `pg_read_server_files`/`pg_execute_server_program` (PostgreSQL), and disable `xp_cmdshell` (MSSQL) unless genuinely required.
 
@@ -63,7 +63,7 @@ GRANT SELECT ON shop.products TO 'webapp'@'localhost';
 These help, but none closes the hole on its own - treat them as layers, and never as the primary defence in a finding.
 
 - **Escaping** (`mysqli_real_escape_string`, `pg_escape_string`): escapes quotes so they lose their special meaning. Fragile - it depends on correct charset handling and consistent quoting, and misses numeric contexts where no quotes are involved. Prefer parameterisation.
-- **Web Application Firewall** (ModSecurity, cloud WAFs): blocks requests matching known SQLi patterns such as `INFORMATION_SCHEMA` or `UNION SELECT`. Buys time and catches mass scanning, but pattern-based rules are routinely evaded - see [Bypasses](./bypasses/). A WAF in front of an injectable app is still an injectable app.
+- **Web Application Firewall** (ModSecurity, cloud WAFs): blocks requests matching known SQLi patterns such as `INFORMATION_SCHEMA` or `UNION SELECT`. Buys time and catches mass scanning, but pattern-based rules are routinely evaded - see [Bypasses](../bypasses/). A WAF in front of an injectable app is still an injectable app.
 - **Stored procedures**: safe *only* when they themselves use parameterised statements internally; a procedure that concatenates its arguments into dynamic SQL is just as vulnerable.
 - **ORMs**: parameterise by default, which is why they help - but raw-query escape hatches (`.raw()`, string-built `WHERE` fragments) reintroduce the bug.
 
@@ -74,12 +74,12 @@ When writing SQLi up, lead with the fix that removes it:
 1. **Primary:** convert the affected query (and ideally all queries) to parameterised statements / prepared statements.
 2. **Supporting:** server-side allowlist validation on the affected parameters; allowlist any dynamic identifiers.
 3. **Containment:** reduce the database account's privileges to the minimum the application needs; disable file and command primitives.
-4. **Detection:** database error monitoring and query logging - [error-based blind](./blind-error/) extraction is quiet in the HTTP response but noisy in DB error logs, so that log is where it shows up.
+4. **Detection:** database error monitoring and query logging - [error-based blind](../blind-error/) extraction is quiet in the HTTP response but noisy in DB error logs, so that log is where it shows up.
 
 Avoid recommending "add a WAF" or "escape input" as the main remediation; both are defence in depth behind parameterisation, and presenting either as the fix leaves the client exposed.
 
 ## Related
 
-- [Detection](./detection/) - how the vulnerability is found, i.e. what these controls have to stop
-- [File operations](./file-operations/) - the privileges section 3 is designed to deny
-- [Bypasses](./bypasses/) - why the layer-4 controls can't be relied on alone
+- [Detection](../detection/) - how the vulnerability is found, i.e. what these controls have to stop
+- [File operations](../file-operations/) - the privileges section 3 is designed to deny
+- [Bypasses](../bypasses/) - why the layer-4 controls can't be relied on alone
