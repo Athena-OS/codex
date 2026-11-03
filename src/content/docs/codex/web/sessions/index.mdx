@@ -80,12 +80,14 @@ The **cookie with `HttpOnly` + `Secure` + `SameSite=Strict`** is the strongest b
 | [Hijacking](/codex/web/sessions/hijacking/) | The mechanics of riding a stolen identifier - DevTools cookie swap, Burp swap, curl with `-b`/`-c` |
 | [Fixation](/codex/web/sessions/fixation/) | Forcing a known identifier on the victim; auth-doesn't-regenerate detection |
 | [Obtaining tokens](/codex/web/sessions/obtaining-tokens/) | Sniffing (Wireshark, mitmproxy, ARP poisoning context), post-exploit retrieval (PHP/Java/.NET paths), DB extraction |
+| [Weak identifiers](/codex/web/sessions/weak-identifiers/) | Predicting or brute-forcing poorly generated IDs; entropy analysis, decoding structured tokens, validity-scope/lifetime checks |
 | [XSS to session](/codex/web/sessions/xss-to-session/) | XSS as a cookie-stealing primitive; cookie-logger PHP server; HttpOnly check; XSSHunter/Collaborator/Interactsh callback infra |
 | [CSRF](/codex/web/sessions/csrf/) | CSRF fundamentals; HTML auto-submit forms; GET vs POST; SameSite; anti-CSRF tokens |
 | [CSRF token bypass](/codex/web/sessions/csrf-token-bypass/) | Weak token analysis (`md5(username)`), null/blank/random token bypass, cross-account tokens, Referer regex bypass, method tampering |
 | [XSS + CSRF chain](/codex/web/sessions/xss-csrf-chain/) | When SameSite blocks cross-origin requests: stage the request from the target's own origin via XSS; the `XMLHttpRequest` token-extract pattern |
 | [Open redirect](/codex/web/sessions/open-redirect/) | Discovery patterns (`?url=`, `?redirect=`, `?next=`...); leaking session tokens that travel with redirects; phishing chains |
 | [Chaining final](/codex/web/sessions/chaining-final/) | End-to-end engagement: XSS in profile + open redirect on admin endpoint → admin session theft, the canonical real-world chain |
+| [Defense](/codex/web/sessions/defense/) | Consolidated remediation: cookie flags, session regeneration, strong identifiers, anti-CSRF, open-redirect handling, transport |
 
 ## Cross-cluster references
 

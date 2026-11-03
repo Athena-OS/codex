@@ -1,0 +1,126 @@
+---
+title: Weak Session Identifiers
+description: Predicting or brute-forcing session identifiers that aren't random enough - entropy analysis, decoding structured tokens, and the validity-scope/lifetime checks that make an ID forgeable.
+mitre: [T1539, T1110]
+d3fend: [D3-CH]
+impact: [SessionTakeover, AuthBypass]
+owasp: [A07]
+noise: moderate
+sidebar:
+  order: 5
+  label: Weak identifiers
+---
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+Most of this cluster assumes you have to *steal* a session identifier. This page is the case where you don't need to: when the identifier is generated poorly - too short, sequential, or a reversible encoding of predictable data - you can derive or guess a valid one and hijack without ever touching the victim. Framework defaults (PHP, JSP, ASP.NET, Rails) produce strong IDs; this is a vulnerability of **custom** session management, so the first job is recognising when you're looking at one.
+
+## TL;DR
+
+```
+# 1. Collect many identifiers (log in repeatedly / many fresh requests)
+# 2. Decode and look for structure
+echo 'dХNlcj0xMDE7dHM9MTc  ...' | base64 -d      → "user=101;ts=17..."   ← reversible!
+# 3. If structured → forge another user's token. If just short/low-entropy → brute-force.
+# 4. Ride it: see Hijacking.
+```
+
+Success indicator: a session identifier you *constructed or guessed* - never issued to you for the target account - is accepted as that account's authenticated session.
+
+## When this is worth trying
+
+Strong, framework-issued IDs are not predictable - don't waste time on them. Reach for this only when you see signals of a weak or custom scheme:
+
+| Signal | Why it matters |
+|---|---|
+| Short token (< ~16 random chars) | Small enough keyspace to brute-force |
+| Sequential / incrementing across logins | Next/other users' IDs are adjacent |
+| Base64/hex that decodes to readable data | Token embeds `user=`, email, a counter, a timestamp |
+| Looks like `md5(username)` / `sha1(email)` | Derivable from data you know - same class as a [weak CSRF token](../csrf-token-bypass/#category-4---predictable-token) |
+| Changes only slightly between issuances | Low effective entropy; part is static |
+| Custom cookie name (not `PHPSESSID`, `JSESSIONID`, `ASP.NET_SessionId`, `connect.sid`) | Suggests a hand-rolled scheme to scrutinise |
+
+<Aside type="note">
+Structured tokens blur into other clusters: if the "session" is actually a signed/encoded blob rather than a random lookup key, you're likely looking at a [JWT](/codex/web/auth/jwt/) or a tamperable cookie - see [cookie tampering](/codex/web/auth/cookie-tampering/). Decode first; the structure tells you which attack applies.
+</Aside>
+
+## Step 1 - Collect a sample set
+
+You need many identifiers to judge randomness.
+
+<Steps>
+
+1. Gather identifiers: repeat the login (or whatever issues a session) and record each token, or capture a burst of fresh IDs.
+2. In Burp, send a request that sets a new session cookie to **Sequencer** and let it collect 5,000–20,000 tokens.
+3. Keep the raw values - you'll both measure their randomness and try to decode their structure.
+
+</Steps>
+
+## Step 2 - Analyse
+
+Two independent questions: is it *structured* (reversible), and is it *random enough*?
+
+- **Structure:** decode as base64, base64url, hex, URL-encoding. If the result contains a username, email, numeric user id, counter, or timestamp, the token is forgeable - you don't need to guess, you *build* the target's.
+- **Randomness:** Burp **Sequencer** estimates effective entropy (bits) and runs FIPS-style randomness tests. Low entropy, or obvious patterns (shared prefix, monotonic region, time-correlated bytes), means a reduced keyspace you can brute-force or narrow.
+
+```
+# Quick manual decode checks
+echo -n '<token>' | base64 -d 2>/dev/null | xxd | head
+echo -n '<token>' | xxd -r -p 2>/dev/null        # if it's hex
+```
+
+## Step 3 - Exploit
+
+**If structured (forge):**
+
+```
+# Observed: your own cookie decodes to user=101;role=user
+#   base64('user=101;role=user')  → your token
+# Forge the admin's by changing the fields and re-encoding:
+echo -n 'user=1;role=admin' | base64            → the forged token
+```
+
+Set the forged value and ride it - see [Hijacking](../hijacking/). If a field is an HMAC/signature you can't reproduce, this becomes a signing-key problem ([JWT](/codex/web/auth/jwt/)), not pure prediction.
+
+**If low-entropy (brute-force):** enumerate the plausible keyspace (sequential neighbours of known IDs, or the full space if short) against an endpoint that distinguishes authenticated from anonymous.
+
+<Aside type="caution">
+Brute-forcing identifiers is **loud** - thousands of requests, and on a live app it can trample real users' sessions. It needs explicit scope agreement, rate-limiting awareness (you may hit lockouts or WAF bans), and care not to disrupt production. Prediction/forging of a structured token, by contrast, is a handful of quiet requests.
+</Aside>
+
+## Step 4 - Check validity scope and lifetime
+
+Weak *generation* often travels with weak *lifecycle*, which widens the attack:
+
+- **Scope:** does a pre-login identifier stay valid after authentication? If so, you also have [session fixation](../fixation/).
+- **Reuse:** does logout actually invalidate the ID server-side, or can a captured/old ID keep working?
+- **Expiry:** does the ID ever expire? A token with no server-side timeout means a single leaked or predicted value is good indefinitely.
+
+Report any identifier that is managed with no server interference, is predictable, or never expires as weak in its own right - even before you demonstrate full forging.
+
+## Common failure modes
+
+- **High entropy, no structure.** It's a framework-grade random ID; prediction is a dead end - go back to stealing it ([obtaining tokens](../obtaining-tokens/), [XSS](../xss-to-session/)).
+- **Decodes to data + a signature.** You can read it but can't forge without the key - pivot to [JWT](/codex/web/auth/jwt/) / key-recovery, not brute force.
+- **Brute force stalls on lockout / rate limits.** Expected; prediction beats brute force whenever structure exists. Reassess the keyspace before grinding.
+- **Forged token rejected despite correct structure.** There's a server-side binding you missed (an HMAC, a bound IP/User-Agent, a DB lookup) - capture more samples to find it.
+
+## Quick reference
+
+| Step | Action |
+|---|---|
+| Spot | Short / sequential / decodable / `hash(known)` / custom cookie name |
+| Collect | Many tokens; Burp Sequencer (5k–20k) |
+| Analyse | Decode for structure; measure entropy |
+| Forge | Rebuild another user's structured token, re-encode |
+| Brute | Only if short/low-entropy and in scope (loud) |
+| Lifecycle | Check scope reuse ([fixation](../fixation/)), logout, expiry |
+| Ride | [Hijacking](../hijacking/) |
+
+## Next move
+
+- **Token decodes to readable fields** → forge the target's and ride via [Hijacking](../hijacking/)
+- **Token decodes to data + signature** → [JWT](/codex/web/auth/jwt/) / [cookie tampering](/codex/web/auth/cookie-tampering/)
+- **Short / low-entropy, in scope** → brute-force the keyspace (loud); confirm with an authenticated-only endpoint
+- **Pre-login ID still valid after login** → [Session fixation](../fixation/)
+- **Strong random ID** → abandon prediction; steal it via [obtaining tokens](../obtaining-tokens/) or [XSS to session](../xss-to-session/)
+- **Hardening this** → [Defense](../defense/)
