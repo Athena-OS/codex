@@ -2,7 +2,7 @@
 title: SeTakeOwnership
 description: File-access escalation via ownership manipulation - SeTakeOwnership grants the right to take ownership of any securable object regardless of its DACL, after which the new owner can grant themselves arbitrary permissions. The workflow is take-ownership → grant-self-full-control → read-the-file, applied to credential-bearing targets like KeePass databases, web.config files, SSH keys, registry hive backups, and password.txt files on shared drives. Comes with the unique operational hazard of being a destructive change that can break legitimate access.
 mitre: [T1222.001, T1068]
-d3fend: [D3-FAC]
+d3fend: [D3-LFP]
 impact: [PrivEsc, CredentialTheft]
 owasp: []
 sidebar:

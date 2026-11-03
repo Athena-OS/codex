@@ -3,7 +3,7 @@ title: Skill assessment chain
 description: The capstone end-to-end walkthrough - login as a low-privilege user, IDOR to enumerate accounts and discover the admin uid and password-reset token, verb-tamper a POST reset endpoint into a GET to bypass session check, log in as admin, reach an admin-only events feature with an XML endpoint, and XXE the flag out of /flag.php via php://filter base64 encoding. Every primitive from this round chained into one engagement.
 mitre: [T1190, T1212, T1556, T1213, T1083]
 d3fend: [D3-IAA]
-impact: [DataExfil, AccountTakeover, PrivilegeEscalation]
+impact: [DataExfil, AccountTakeover, PrivEsc]
 owasp: [A01, A05]
 sidebar:
   order: 7

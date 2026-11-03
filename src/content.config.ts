@@ -7,6 +7,32 @@ import { defineCollection } from 'astro:content';
 import { docsLoader } from '@astrojs/starlight/loaders';
 import { docsSchema } from '@astrojs/starlight/schema';
 import { z } from 'astro:content';
+import { MITRE_TECHNIQUES } from './data/mitre';
+import { OWASP_2025 } from './data/owasp';
+import { IMPACT } from './data/impact';
+import { D3FEND } from './data/d3fend';
+
+/**
+ * A list of tag IDs that must exist in the given registry. Unknown IDs fail
+ * the build with a message naming the registry file to update, so typos and
+ * invented IDs can't slip through as generic fallback badges.
+ */
+const registryTags = (registry: Record<string, unknown>, file: string) =>
+  z
+    .array(z.string())
+    .superRefine((ids, ctx) => {
+      for (const id of ids) {
+        // Own-property check: `in` would also accept inherited names like
+        // `toString` or `__proto__`.
+        if (!Object.hasOwn(registry, id)) {
+          ctx.addIssue({
+            code: 'custom',
+            message: `Unknown ID "${id}". Add it to ${file} or fix the typo.`,
+          });
+        }
+      }
+    })
+    .optional();
 
 export const collections = {
   docs: defineCollection({
@@ -19,15 +45,15 @@ export const collections = {
          * Example: mitre: [T1190, T1199]
          * IDs should match entries in src/data/mitre.ts.
          */
-        mitre: z.array(z.string()).optional(),
+        mitre: registryTags(MITRE_TECHNIQUES, 'src/data/mitre.ts'),
 
         /**
-         * OWASP Top 10 2021 category IDs (short form, no year suffix).
+         * OWASP Top 10:2025 category IDs (short form, no year suffix).
          * Rendered as badges at the top of the page where applicable.
-         * Example: owasp: [A03]   // Injection
+         * Example: owasp: [A05]   // Injection (A03 in the 2021 edition)
          * IDs should match entries in src/data/owasp.ts (A01–A10).
          */
-        owasp: z.array(z.string()).optional(),
+        owasp: registryTags(OWASP_2025, 'src/data/owasp.ts'),
 
         /**
          * CVE references for techniques tied to specific vulnerabilities.
@@ -42,7 +68,7 @@ export const collections = {
          * Example: impact: [RCE, AuthBypass, DataExfil]
          * IDs should match entries in src/data/impact.ts.
          */
-        impact: z.array(z.string()).optional(),
+        impact: registryTags(IMPACT, 'src/data/impact.ts'),
 
         /**
          * MITRE D3FEND defensive countermeasure IDs. Rendered as muted
@@ -51,7 +77,7 @@ export const collections = {
          * Example: d3fend: [D3-MH, D3-NTA]
          * IDs should match entries in src/data/d3fend.ts.
          */
-        d3fend: z.array(z.string()).optional(),
+        d3fend: registryTags(D3FEND, 'src/data/d3fend.ts'),
 
         /**
          * Operator noise budget - single-glance signal for how visible

@@ -1,7 +1,7 @@
 ---
 title: DnsAdmins
 description: Domain Controller compromise via DnsAdmins group membership - the DNS service running on a DC supports a ServerLevelPluginDll registry setting that loads a custom DLL when DNS starts. DnsAdmins members can write this value via dnscmd; the DNS service runs as SYSTEM, so the loaded DLL executes as SYSTEM on the DC. The result is local SYSTEM on the DC, which composes with NTDS.dit extraction for full domain compromise. Three variants covered - msfvenom DLL payload, mimilib.dll, and the WPAD-record alternative for environments where DLL load is restricted.
-mitre: [T1574.002, T1078.002, T1068]
+mitre: [T1574.001, T1078.002, T1068]
 d3fend: [D3-PM]
 impact: [PrivEsc, SystemCompromise, DomainCompromise, AdminCompromise]
 owasp: []

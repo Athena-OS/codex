@@ -2,7 +2,7 @@
 title: XSS + CSRF Chain
 description: When SameSite cookies block cross-origin CSRF, stage the malicious request from the target's own origin via XSS - the XMLHttpRequest pattern that fetches a page containing the anti-CSRF token, extracts it with regex, and issues the authenticated state-change in one same-origin script.
 mitre: [T1212, T1185, T1059.007]
-d3fend: [D3-CBV, D3-IAA]
+d3fend: [D3-AH, D3-IAA]
 impact: [SessionTakeover, AccountTakeover]
 owasp: [A03, A01]
 sidebar:
