@@ -1,0 +1,93 @@
+---
+title: Defending Against File Inclusion
+description: How LFI/RFI is actually prevented - keep user input out of file-loading functions, allowlist and canonicalize paths, and harden the runtime so a slip can't reach remote code or the whole filesystem.
+mitre: [T1190, T1083]
+d3fend: [D3-ACH, D3-AH]
+owasp: [A05]
+sidebar:
+  order: 10
+  label: Defense
+---
+import { Aside } from '@astrojs/starlight/components';
+
+Every technique in this cluster starts the same way: user input reaches a function that loads a file. Close that and the class disappears; harden the runtime and the cases you miss can't escalate to RCE or read the whole disk. This page gathers the fixes in order of effectiveness - the first removes the vulnerability, the rest limit the blast radius.
+
+<Aside type="note">
+For the operator, the absence of these controls is the triage signal: user input flowing straight into an include is the bug; `allow_url_include=On` opens [RFI](../rfi/) and the `data://`/`http://` [wrappers](../wrappers/); no `open_basedir` means traversal reaches the whole filesystem. The controls below are exactly what you're hoping *isn't* in place.
+</Aside>
+
+## 1. Don't pass user input to file-loading functions
+
+The only complete fix. The page should resolve which asset to load on the back end, with no user-controlled value reaching `include`/`require`, `file_get_contents`, `fopen`, `res.render`, `<c:import>`, `Response.WriteFile`, or any other function that reads or executes a file (the [Read vs Execute](/codex/web/lfi/#read-vs-execute) table lists the common sinks). If the template to load is fixed by the route, there is nothing to traverse.
+
+## 2. When input must choose a file, allowlist - don't filter
+
+If a user value genuinely selects content, map it to a known file through an allowlist rather than concatenating it into a path:
+
+```php
+// The input is a KEY, never part of the path
+$pages = ['home' => 'home.php', 'about' => 'about.php', 'contact' => 'contact.php'];
+$page = $pages[$_GET['page']] ?? 'home.php';   // default for anything unknown
+include __DIR__ . '/pages/' . $page;
+```
+
+The allowlist can be a `match`/`switch`, a DB table of id→path, or a static JSON map. The point is identical across forms: **the user input never enters the filesystem call** - only the matched, known value does.
+
+<Aside type="caution">
+Blocklist filtering (stripping `../`, rejecting keywords) is **not** this. The entire [filter-bypasses](/codex/web/lfi/filter-bypasses/) page exists because those filters fall to encoding, non-recursive-strip, approved-path prefixes, and wrappers. The recursive strip some guides suggest -
+
+```php
+while (str_contains($input, '../')) { $input = str_replace('../', '', $input); }
+```
+
+- is strictly better than a single pass but still a blocklist; prefer the allowlist above.
+</Aside>
+
+## 3. If a path is unavoidable, canonicalize then confine
+
+Where a real path must be accepted (a download of a user file, say), reduce it to a filename or resolve it and verify it stays inside an allowed base directory - don't trust the string you were given:
+
+```php
+$base = '/var/www/files/';
+$real = realpath($base . basename($_GET['file']));   // basename drops directories; realpath resolves ../, symlinks
+if ($real === false || !str_starts_with($real, $base)) {
+    http_response_code(404); exit;                    // outside the jail → reject
+}
+readfile($real);
+```
+
+Use a primitive that **resolves symlinks**, and check containment against the resolved paths - PHP `realpath()`, Node `fs.realpath()`, Java `Path.toRealPath()`. String-only normalizers (`path.resolve()`, `Path.normalize()`) collapse `../` but do *not* follow symlinks, so a link planted inside the base directory passes the prefix check while the actual read lands outside it. Resolve both the base and the candidate, then compare at a directory boundary (e.g. base + separator) so `/var/www/files-evil/` can't satisfy a `startsWith('/var/www/files')` test. Hand-rolled canonicalizers miss edge cases - the classic being that `realpath`/`basename` behave differently from a shell, so a custom check can pass input that a later `system()` call expands.
+
+## 4. Harden the runtime (limits the blast radius)
+
+Configuration that turns "arbitrary file read" into "a much smaller problem" - the controls that decide how far [RFI](/codex/web/lfi/rfi/), wrappers, and traversal can reach:
+
+- **Disable remote inclusion:** `allow_url_include = Off` **and** `allow_url_fopen = Off` in `php.ini`. This kills the URL-wrapper [RFI](/codex/web/lfi/rfi/) paths - `http://`, `ftp://`, and the `data://` / `php://input` [wrappers](/codex/web/lfi/wrappers/) - the highest-value LFI→RCE routes. It does **not** stop everything on Windows: a UNC path (`\\attacker\share\shell.php`) is treated as a *filesystem* path, not a URL, so [SMB-based RFI](/codex/web/lfi/rfi/) still works with both flags off. On Windows, also reject UNC/`\\` inputs and block outbound SMB (445) egress.
+- **Confine the filesystem:** `open_basedir = /var/www` (PHP), or run the app in a container. Note what a container does and doesn't do: it limits reads to the *container's* filesystem, not the host's - but a normal image still contains `/etc/passwd`, and app secrets, sibling source, or mounted volumes may be readable inside it. So pair it with a minimal image, restricted/read-only mounts, and a web user without read access to in-container secrets. `open_basedir`/containerization blunts host traversal; it is not "the files aren't there."
+- **Drop dangerous extensions/modules:** don't load the `expect` extension (the [`expect://`](/codex/web/lfi/wrappers/) wrapper); restrict `php://filter` where the app doesn't need it.
+- **Least privilege:** run the web user with no read access to secrets it doesn't need (`/etc/shadow`, other users' homes, SSH keys), and no *write* access to web-served directories. This breaks the [upload-into-webroot](/codex/web/lfi/file-upload-chain/) chain, but note it does **not** stop [log poisoning](/codex/web/lfi/log-poisoning/): the poisoned log is written by another service (not through a webroot write) and the include only needs *read* access to it - likewise uploads or session files written outside the webroot. The control that actually denies these executable inclusion is the fixed allowlist in section 2; least privilege only shrinks what's reachable.
+
+## 5. Defense in depth
+
+- **WAF** (e.g. ModSecurity): catches known traversal/wrapper patterns and, even in permissive/report-only mode, is an early-warning signal. It is evadable ([filter-bypasses](/codex/web/lfi/filter-bypasses/)) - a layer, never the fix.
+- **Logging and alerting:** `../`, `php://`, `data://`, and access-log/`/proc/self/environ` reads in request parameters are high-signal. Hardening's real purpose is to make a successful attack noisier and slower, buying detection time.
+
+## Note for non-PHP stacks
+
+Outside PHP the *execute* path is rarer, but the *read* path (path traversal → file disclosure) is identical, and the fixes are the same: allowlist the selector, or a symlink-resolving canonicalization (`fs.realpath()` / `Path.toRealPath()`, **not** `path.resolve()`/`Path.normalize()`) plus a base-directory containment check. Node's `res.render()` and Java's `<c:import>` do execute/fetch, so treat those exactly like PHP `include` - no user input in the template name, and no remote URLs.
+
+## For the report
+
+1. **Primary:** remove user input from the file-loading call, or map it through an allowlist to a fixed file.
+2. **If a path is required:** canonicalize with a symlink-resolving primitive (`realpath`/`fs.realpath`/`toRealPath`) and verify containment in an allowed base directory.
+3. **Runtime hardening:** `allow_url_include`/`allow_url_fopen = Off` (plus UNC rejection + SMB egress block on Windows), `open_basedir` or a minimal container with restricted mounts, least-privilege web user, drop `expect`.
+4. **Defense in depth:** WAF in at least report-only mode; alert on traversal/wrapper indicators.
+
+Avoid recommending a `../` filter or a WAF as the primary fix - both are bypassable, and this cluster is a catalogue of how.
+
+## Related
+
+- [Read vs Execute](/codex/web/lfi/#read-vs-execute) - which sinks these controls have to protect
+- [Filter bypasses](/codex/web/lfi/filter-bypasses/) - why blocklist filtering isn't a fix
+- [RFI](/codex/web/lfi/rfi/) - what `allow_url_include = Off` closes
+- [Wrappers](/codex/web/lfi/wrappers/) - what dropping `expect` and remote wrappers closes
