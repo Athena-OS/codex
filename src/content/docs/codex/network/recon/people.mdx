@@ -41,8 +41,8 @@ LinkedIn is the primary OSINT source for most engagements. The platform's search
 
 Search for employees by:
 
-- **Company + IT/Security roles** - `"InlaneFreight" "DevOps"`, `"InlaneFreight" "SRE"`, `"InlaneFreight" "Security Engineer"`. These people configure the systems you'll attack.
-- **Specific technology** - `"InlaneFreight" "Kubernetes"`, `"InlaneFreight" "AWS"`, `"InlaneFreight" "Active Directory"`. Confirms what's in use.
+- **Company + IT/Security roles** - `"Example" "DevOps"`, `"Example" "SRE"`, `"Example" "Security Engineer"`. These people configure the systems you'll attack.
+- **Specific technology** - `"Example" "Kubernetes"`, `"Example" "AWS"`, `"Example" "Active Directory"`. Confirms what's in use.
 - **Recent joiners** - new hires often blog about their first month, name internal tools, mention specific projects.
 - **Recent leavers** - they may have updated their LinkedIn with very specific descriptions of what they built/owned ("led migration to Kubernetes 1.28").
 
@@ -51,7 +51,7 @@ Search for employees by:
 A senior backend engineer's profile might list:
 
 ```
-Senior Backend Engineer at InlaneFreight (2019 - present)
+Senior Backend Engineer at Example (2019 - present)
 
 Skills: Python, Django, PostgreSQL, Redis, Docker, AWS,
         Kafka, Elasticsearch, OAuth2, JWT, REST APIs
@@ -85,7 +85,7 @@ Job posts are the most explicit possible tech inventory the organization will ev
 
 ### Anatomy of a high-signal job post
 
-A real-world sample (paraphrased from HTB's example):
+A representative sample:
 
 ```
 Required Skills:
@@ -135,18 +135,18 @@ Public GitHub repositories are an underrated source. The org's main GitHub accou
 https://github.com/<org-name>
 
 # Search the org for sensitive patterns
-"org:inlanefreight password"
-"org:inlanefreight token"
-"org:inlanefreight aws_secret_access_key"
+"org:example password"
+"org:example token"
+"org:example aws_secret_access_key"
 ```
 
 GitHub's search API supports `org:`, `user:`, `path:`, `extension:`, and content searches. Combine for narrow queries:
 
 ```
-org:inlanefreight extension:env
-org:inlanefreight filename:.env
-org:inlanefreight filename:config.json password
-org:inlanefreight filename:terraform.tfvars
+org:example extension:env
+org:example filename:.env
+org:example filename:config.json password
+org:example filename:terraform.tfvars
 ```
 
 ### Employee-level recon
@@ -162,7 +162,7 @@ A typical pattern that leaks information:
 
 ```python
 # in a personal "data-pipeline-tutorial" repo
-DB_HOST = "prod-postgres-1.internal.inlanefreight.local"
+DB_HOST = "prod-postgres-1.internal.example.local"
 DB_USER = "data_pipeline"
 DB_PASSWORD = "<some_real_password>"
 ```
@@ -174,7 +174,7 @@ The engineer was building a quick tutorial. They used real values from work for 
 GitHub Gists are an even bigger leak surface than full repos because they feel "throwaway." Search:
 
 ```
-"inlanefreight" site:gist.github.com
+"example" site:gist.github.com
 ```
 
 Or via the GitHub search API with `user:<engineer>` for each identified employee.
@@ -199,9 +199,9 @@ For employees you've identified, check their Stack Overflow profiles. Many engin
 For employee names found on LinkedIn, the email format is usually:
 
 ```
-firstname.lastname@inlanefreight.com
-flastname@inlanefreight.com
-firstinitiallast@inlanefreight.com
+firstname.lastname@example.com
+flastname@example.com
+firstinitiallast@example.com
 ```
 
 Verify a format works via:

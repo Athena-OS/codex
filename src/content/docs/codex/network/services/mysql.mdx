@@ -117,7 +117,7 @@ The big two are `bind-address = 0.0.0.0` (the precondition for everything) and e
 ### Service scan
 
 ```shell
-sudo nmap 10.129.14.128 -sV -sC -p3306 --script mysql*
+sudo nmap 10.0.14.128 -sV -sC -p3306 --script mysql*
 ```
 
 ```
@@ -158,19 +158,19 @@ Watch out for **false positives** on automated mysql scripts. The `mysql-empty-p
 
 ```shell
 # Empty password
-mysql -u root -h 10.129.14.128
+mysql -u root -h 10.0.14.128
 
 # Explicit password (note: NO space between -p and the password)
-mysql -u root -pP4SSw0rd -h 10.129.14.128
+mysql -u root -pP4SSw0rd -h 10.0.14.128
 
 # Prompt for password
-mysql -u root -p -h 10.129.14.128
+mysql -u root -p -h 10.0.14.128
 
 # Specify database on connect
-mysql -u root -pP4SSw0rd -h 10.129.14.128 -D mydb
+mysql -u root -pP4SSw0rd -h 10.0.14.128 -D mydb
 
 # Custom port
-mysql -u root -pP4SSw0rd -h 10.129.14.128 -P 33060
+mysql -u root -pP4SSw0rd -h 10.0.14.128 -P 33060
 ```
 
 Connection-refused responses to know:

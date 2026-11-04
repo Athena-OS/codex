@@ -78,7 +78,7 @@ Samba's main config (`/etc/samba/smb.conf`) has two sections: `[global]` and per
 
 ```ini
 [global]
-   workgroup = DEV.INFREIGHT.HTB
+   workgroup = DEV.EXAMPLE.LOCAL
    server string = DEVSMB
    log file = /var/log/samba/log.%m
    max log size = 1000
@@ -147,7 +147,7 @@ That's unauthenticated read/write to `/mnt/notes/`. If `/mnt/notes/` happens to 
 ### Service detection
 
 ```shell
-sudo nmap 10.129.14.128 -sV -sC -p139,445
+sudo nmap 10.0.14.128 -sV -sC -p139,445
 ```
 
 ```
@@ -172,14 +172,14 @@ Two important findings here:
 `smbclient -N -L` enumerates shares using a null session:
 
 ```shell
-smbclient -N -L //10.129.14.128
+smbclient -N -L //10.0.14.128
 ```
 
 ```
         Sharename       Type      Comment
         ---------       ----      -------
         print$          Disk      Printer Drivers
-        home            Disk      INFREIGHT Samba
+        home            Disk      EXAMPLE Samba
         dev             Disk      DEVenv
         notes           Disk      CheckIT
         IPC$            IPC       IPC Service (DEVSM)
@@ -191,7 +191,7 @@ SMB1 disabled -- no workgroup available
 ### Connecting to a share
 
 ```shell
-smbclient //10.129.14.128/notes
+smbclient //10.0.14.128/notes
 ```
 
 ```
@@ -222,7 +222,7 @@ The shell that opens has FTP-like commands:
 `rpcclient` exposes the [MS-RPC](https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-rpce/) interfaces SMB rides on top of. Anonymous binding:
 
 ```shell
-rpcclient -U "" -N 10.129.14.128
+rpcclient -U "" -N 10.0.14.128
 ```
 
 ```
@@ -257,13 +257,13 @@ rpcclient $> srvinfo
         server type     :       0x809a03
 
 rpcclient $> enumdomusers
-user:[mrb3n] rid:[0x3e8]
-user:[cry0l1t3] rid:[0x3e9]
+user:[bjones] rid:[0x3e8]
+user:[jdoe] rid:[0x3e9]
 
 rpcclient $> queryuser 0x3e9
-        User Name   :   cry0l1t3
-        Full Name   :   cry0l1t3
-        Home Drive  :   \\devsmb\cry0l1t3
+        User Name   :   jdoe
+        Full Name   :   jdoe
+        Home Drive  :   \\devsmb\jdoe
         ...
         Password last set Time   : Wed, 22 Sep 2021 17:50:56 CEST
         Password must change Time: Thu, 14 Sep 30828 04:48:05 CEST   # = never
@@ -281,7 +281,7 @@ When `enumdomusers` is blocked but `queryuser <RID>` is allowed, brute-force RID
 
 ```shell
 for i in $(seq 500 1100); do
-  rpcclient -N -U "" 10.129.14.128 \
+  rpcclient -N -U "" 10.0.14.128 \
     -c "queryuser 0x$(printf '%x\n' $i)" 2>/dev/null \
     | grep "User Name\|user_rid\|group_rid" && echo
 done
@@ -294,11 +294,11 @@ Output:
         user_rid :      0x1f5
         group_rid:      0x201
 
-        User Name   :   mrb3n
+        User Name   :   bjones
         user_rid :      0x3e8
         group_rid:      0x201
 
-        User Name   :   cry0l1t3
+        User Name   :   jdoe
         user_rid :      0x3e9
         group_rid:      0x201
 ```
@@ -316,7 +316,7 @@ RIDs to know:
 The Impacket equivalent - `samrdump.py` - does the same enumeration in one command:
 
 ```shell
-samrdump.py 10.129.14.128
+samrdump.py 10.0.14.128
 ```
 
 ### enum4linux-ng
@@ -324,7 +324,7 @@ samrdump.py 10.129.14.128
 The catch-all SMB enumerator. Runs most of the above queries automatically:
 
 ```shell
-enum4linux-ng 10.129.14.128 -A
+enum4linux-ng 10.0.14.128 -A
 ```
 
 Sections produced:
@@ -345,7 +345,7 @@ Sample useful output sections:
 
 ```
 ========================================
-|    Policies via RPC for 10.129.14.128 |
+|    Policies via RPC for 10.0.14.128 |
 ========================================
 domain_password_information:
   min_pw_length: 5
@@ -364,16 +364,16 @@ domain_lockout_information:
 `smbmap` is share-focused - fast triage of "what can I see?" across many shares:
 
 ```shell
-smbmap -H 10.129.14.128
+smbmap -H 10.0.14.128
 ```
 
 ```
-[+] User SMB session established on 10.129.14.128...
-[+] IP: 10.129.14.128:445       Name: 10.129.14.128
+[+] User SMB session established on 10.0.14.128...
+[+] IP: 10.0.14.128:445       Name: 10.0.14.128
         Disk                                            Permissions     Comment
         ----                                            -----------     -------
         print$                                          NO ACCESS       Printer Drivers
-        home                                            NO ACCESS       INFREIGHT Samba
+        home                                            NO ACCESS       EXAMPLE Samba
         dev                                             NO ACCESS       DEVenv
         notes                                           READ,WRITE      CheckIT     # <-- 
         IPC$                                            NO ACCESS       IPC Service
@@ -382,9 +382,9 @@ smbmap -H 10.129.14.128
 With credentials:
 
 ```shell
-smbmap -H 10.129.14.128 -u cry0l1t3 -p P455w0rD!
-smbmap -H 10.129.14.128 -u cry0l1t3 -p P455w0rD! -R notes        # recursive listing
-smbmap -H 10.129.14.128 -u cry0l1t3 -p P455w0rD! -A pw -R notes  # find files matching pattern
+smbmap -H 10.0.14.128 -u jdoe -p P455w0rD!
+smbmap -H 10.0.14.128 -u jdoe -p P455w0rD! -R notes        # recursive listing
+smbmap -H 10.0.14.128 -u jdoe -p P455w0rD! -A pw -R notes  # find files matching pattern
 ```
 
 ### crackmapexec / netexec
@@ -393,16 +393,16 @@ smbmap -H 10.129.14.128 -u cry0l1t3 -p P455w0rD! -A pw -R notes  # find files ma
 
 ```shell
 # Anonymous enumeration
-crackmapexec smb 10.129.14.128 --shares -u '' -p ''
+crackmapexec smb 10.0.14.128 --shares -u '' -p ''
 
 # Credentialed enumeration
-crackmapexec smb 10.129.14.128 -u cry0l1t3 -p P455w0rD! --shares --users --groups
+crackmapexec smb 10.0.14.128 -u jdoe -p P455w0rD! --shares --users --groups
 
 # Spray a single password against a list of users
-crackmapexec smb 10.129.14.128 -u users.txt -p 'Winter2024!' --continue-on-success
+crackmapexec smb 10.0.14.128 -u users.txt -p 'Winter2024!' --continue-on-success
 
 # Across a subnet
-crackmapexec smb 10.129.14.0/24 -u cry0l1t3 -p P455w0rD!
+crackmapexec smb 10.0.14.0/24 -u jdoe -p P455w0rD!
 ```
 
 The subnet form is invaluable for password-reuse checks. If the local Administrator hash from one host works on twenty others, you've just mapped a lateral-movement path.

@@ -46,9 +46,9 @@ XML is a structured text format using tags to nest elements:
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
 <email>
-  <sender>john@inlanefreight.com</sender>
+  <sender>john@example.com</sender>
   <recipients>
-    <to>HR@inlanefreight.com</to>
+    <to>HR@example.com</to>
   </recipients>
   <body>Hello, kindly share the invoice...</body>
 </email>
@@ -159,7 +159,7 @@ The most common deliverable is file read - extracting `/etc/passwd`, configurati
 | [Blind exfil](/codex/web/xxe/blind-exfil/) | CDATA wrap via external parameter entities, error-based exfil, full out-of-band HTTP exfil with hosted DTD |
 | [RCE and SSRF](/codex/web/xxe/rce-and-ssrf/) | PHP `expect://` to webshell drop, internal port scanning, billion-laughs DoS, Windows UNC hash theft |
 | [Automation](/codex/web/xxe/automation/) | XXEinjector tool walkthrough, request-file format, automated CDATA/error/OOB modes |
-| [Skill assessment chain](/codex/web/xxe/skill-assessment-chain/) | Capstone walkthrough - IDOR + verb tampering + XXE combining to read `/flag.php` |
+| [Capstone chain](/codex/web/xxe/capstone-chain/) | Capstone walkthrough - IDOR + verb tampering + XXE combining to read `/flag.php` |
 | [Defense](/codex/web/xxe/defense/) | Disable DTDs/external entities in the parser (per-language), patch XML libraries, suppress parser errors, reduce surface |
 
 ## Cross-cluster references

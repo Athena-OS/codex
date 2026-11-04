@@ -102,14 +102,14 @@ The two big findings are `auth_debug_passwords = yes` (creates a credential log 
 ### Service scan
 
 ```shell
-sudo nmap 10.129.14.128 -sV -p110,143,993,995 -sC
+sudo nmap 10.0.14.128 -sV -p110,143,993,995 -sC
 ```
 
 ```
 PORT    STATE SERVICE  VERSION
 110/tcp open  pop3     Dovecot pop3d
 |_pop3-capabilities: AUTH-RESP-CODE SASL STLS TOP UIDL RESP-CODES CAPA PIPELINING
-| ssl-cert: Subject: commonName=mail1.inlanefreight.htb/organizationName=Inlanefreight/
+| ssl-cert: Subject: commonName=mail1.example.local/organizationName=Example/
                      stateOrProvinceName=California/countryName=US
 | Not valid before: 2021-09-19T19:44:58
 |_Not valid after:  2295-07-04T19:44:58
@@ -128,12 +128,12 @@ What's in the output:
 - **`AUTH=PLAIN`** is in the IMAPS capabilities - plain-text auth is permitted on the TLS-wrapped channel (which is fine because TLS protects the wire)
 - **`LOGINDISABLED`** on plaintext IMAP - plain `LOGIN` is rejected on 143 until STARTTLS is performed
 - **`STLS`** (the POP3 equivalent of STARTTLS) is advertised on 110
-- **Cert subject** reveals `commonName=mail1.inlanefreight.htb` - the internal hostname
+- **Cert subject** reveals `commonName=mail1.example.local` - the internal hostname
 
 ### Credentialed login with curl
 
 ```shell
-curl -k 'imaps://10.129.14.128' --user user:p4ssw0rd
+curl -k 'imaps://10.0.14.128' --user user:p4ssw0rd
 ```
 
 `-k` accepts self-signed certs. If the creds work, you get a folder listing:
@@ -146,20 +146,20 @@ curl -k 'imaps://10.129.14.128' --user user:p4ssw0rd
 `--verbose` shows the protocol exchange:
 
 ```shell
-curl -k 'imaps://10.129.14.128' --user cry0l1t3:1234 -v
+curl -k 'imaps://10.0.14.128' --user jdoe:1234 -v
 ```
 
 ```
-*   Trying 10.129.14.128:993...
-* Connected to 10.129.14.128 (10.129.14.128) port 993 (#0)
+*   Trying 10.0.14.128:993...
+* Connected to 10.0.14.128 (10.0.14.128) port 993 (#0)
 * TLSv1.3 (OUT), TLS handshake, Client hello (1):
 ...
 * SSL connection using TLSv1.3 / TLS_AES_256_GCM_SHA384
 * Server certificate:
-*  subject: C=US; ST=California; L=Sacramento; O=Inlanefreight; OU=Customer Support;
-            CN=mail1.inlanefreight.htb; emailAddress=cry0l1t3@inlanefreight.htb
+*  subject: C=US; ST=California; L=Sacramento; O=Example; OU=Customer Support;
+            CN=mail1.example.local; emailAddress=jdoe@example.local
 < * OK [CAPABILITY IMAP4rev1 SASL-IR LOGIN-REFERRALS ID ENABLE IDLE LITERAL+ AUTH=PLAIN]
-      HTB-Academy IMAP4 v.0.21.4
+      Example IMAP4 v.0.21.4
 > A001 CAPABILITY
 < * CAPABILITY IMAP4rev1 SASL-IR LOGIN-REFERRALS ID ENABLE IDLE LITERAL+ AUTH=PLAIN
 < A001 OK Pre-login capabilities listed, post-login capabilities have more.
@@ -181,34 +181,34 @@ The verbose output gives you:
 For POP3:
 
 ```shell
-curl -k 'pop3s://10.129.14.128' --user 'user:p4ssw0rd'
+curl -k 'pop3s://10.0.14.128' --user 'user:p4ssw0rd'
 ```
 
 Lists message IDs and sizes. To fetch a specific message:
 
 ```shell
-curl -k 'pop3s://10.129.14.128/1' --user 'user:p4ssw0rd'    # message 1
+curl -k 'pop3s://10.0.14.128/1' --user 'user:p4ssw0rd'    # message 1
 ```
 
 To list folders / fetch via IMAP:
 
 ```shell
-curl -k 'imaps://10.129.14.128/INBOX' --user 'user:p4ssw0rd'              # folder content
-curl -k 'imaps://10.129.14.128/INBOX;UID=5' --user 'user:p4ssw0rd'        # message UID 5
-curl -k 'imaps://10.129.14.128/INBOX;UID=5;SECTION=TEXT' --user '...'     # just the body
+curl -k 'imaps://10.0.14.128/INBOX' --user 'user:p4ssw0rd'              # folder content
+curl -k 'imaps://10.0.14.128/INBOX;UID=5' --user 'user:p4ssw0rd'        # message UID 5
+curl -k 'imaps://10.0.14.128/INBOX;UID=5;SECTION=TEXT' --user '...'     # just the body
 ```
 
 ### Manual IMAP via openssl
 
 ```shell
-openssl s_client -connect 10.129.14.128:imaps -quiet
+openssl s_client -connect 10.0.14.128:imaps -quiet
 ```
 
 ```
 * OK [CAPABILITY IMAP4rev1 SASL-IR LOGIN-REFERRALS ID ENABLE IDLE LITERAL+ AUTH=PLAIN]
-   HTB-Academy IMAP4 v.0.21.4
+   Example IMAP4 v.0.21.4
 
-a1 LOGIN cry0l1t3 1234
+a1 LOGIN jdoe 1234
 a1 OK Logged in
 
 a2 LIST "" *
@@ -227,8 +227,8 @@ a3 OK [READ-WRITE] Select completed (0.001 + 0.000 secs).
 
 a4 FETCH 1 BODY[HEADER.FIELDS (FROM TO SUBJECT DATE)]
 * 1 FETCH (BODY[HEADER.FIELDS (FROM TO SUBJECT DATE)] {142}
-From: <admin@inlanefreight.htb>
-To: <cry0l1t3@inlanefreight.htb>
+From: <admin@example.local>
+To: <jdoe@example.local>
 Subject: Welcome
 Date: Wed, 22 Sep 2021 12:00:00 +0200
 
@@ -237,9 +237,9 @@ a4 OK Fetch completed.
 
 a5 FETCH 1 BODY[TEXT]
 * 1 FETCH (BODY[TEXT] {198}
-Hi cry0l1t3,
+Hi jdoe,
 Welcome to the team. Your initial password is hunter2.
-Please change it on first login at https://portal.inlanefreight.htb/
+Please change it on first login at https://portal.example.local/
 
 - Admin
 )
@@ -278,13 +278,13 @@ That last fetch - `hunter2` as an initial password - is the kind of mail-content
 ### Manual POP3 via openssl
 
 ```shell
-openssl s_client -connect 10.129.14.128:pop3s -quiet
+openssl s_client -connect 10.0.14.128:pop3s -quiet
 ```
 
 ```
-+OK HTB-Academy POP3 Server
++OK Example POP3 Server
 
-USER cry0l1t3
+USER jdoe
 +OK
 
 PASS hunter2
@@ -303,13 +303,13 @@ LIST
 
 RETR 1
 +OK 2048 octets
-Return-Path: <admin@inlanefreight.htb>
-From: <admin@inlanefreight.htb>
-To: <cry0l1t3@inlanefreight.htb>
+Return-Path: <admin@example.local>
+From: <admin@example.local>
+To: <jdoe@example.local>
 Subject: Welcome
 ...
 
-Hi cry0l1t3, your initial password is hunter2 ...
+Hi jdoe, your initial password is hunter2 ...
 .
 
 QUIT
@@ -339,12 +339,12 @@ QUIT
 When you have a username list and want to try common passwords:
 
 ```shell
-hydra -L users.txt -P passwords.txt imap://10.129.14.128
-hydra -L users.txt -P passwords.txt pop3://10.129.14.128
+hydra -L users.txt -P passwords.txt imap://10.0.14.128
+hydra -L users.txt -P passwords.txt pop3://10.0.14.128
 
 # Or against TLS-wrapped variants
-hydra -L users.txt -P passwords.txt imaps://10.129.14.128
-hydra -L users.txt -P passwords.txt pop3s://10.129.14.128
+hydra -L users.txt -P passwords.txt imaps://10.0.14.128
+hydra -L users.txt -P passwords.txt pop3s://10.0.14.128
 ```
 
 Or with Metasploit:
@@ -352,7 +352,7 @@ Or with Metasploit:
 ```shell
 msfconsole
 > use auxiliary/scanner/imap/imap_login
-> set RHOSTS 10.129.14.128
+> set RHOSTS 10.0.14.128
 > set USER_FILE users.txt
 > set PASS_FILE passwords.txt
 > set BLANK_PASSWORDS true

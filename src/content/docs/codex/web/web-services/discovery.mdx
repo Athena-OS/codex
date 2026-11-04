@@ -171,9 +171,9 @@ A complete WSDL file looks intimidating but breaks down into six predictable sec
 
   <wsdl:types>...</wsdl:types>
   <wsdl:message name="LoginSoapIn">...</wsdl:message>
-  <wsdl:portType name="HacktheBoxSoapPort">...</wsdl:portType>
-  <wsdl:binding name="HacktheboxServiceSoapBinding" type="tns:HacktheBoxSoapPort">...</wsdl:binding>
-  <wsdl:service name="HacktheboxService">...</wsdl:service>
+  <wsdl:portType name="ExampleSoapPort">...</wsdl:portType>
+  <wsdl:binding name="ExampleServiceSoapBinding" type="tns:ExampleSoapPort">...</wsdl:binding>
+  <wsdl:service name="ExampleService">...</wsdl:service>
 
 </wsdl:definitions>
 ```
@@ -218,7 +218,7 @@ This is the parameter catalog. Each `<s:element name="X">` is a request you can 
 Lists every operation the service exposes:
 
 ```xml
-<wsdl:portType name="HacktheBoxSoapPort">
+<wsdl:portType name="ExampleSoapPort">
   <wsdl:operation name="Login">
     <wsdl:input message="tns:LoginSoapIn"/>
     <wsdl:output message="tns:LoginSoapOut"/>
@@ -237,8 +237,8 @@ From this, two operations are available: `Login` and `ExecuteCommand`. Both have
 Tells you where the service actually lives:
 
 ```xml
-<wsdl:service name="HacktheboxService">
-  <wsdl:port name="HacktheboxServiceSoapPort" binding="tns:HacktheboxServiceSoapBinding">
+<wsdl:service name="ExampleService">
+  <wsdl:port name="ExampleServiceSoapPort" binding="tns:ExampleServiceSoapBinding">
     <soap:address location="http://localhost:80/wsdl"/>
   </wsdl:port>
 </wsdl:service>
@@ -372,7 +372,7 @@ When reflection is enabled, `grpcurl list` returns every service name. `describe
 
 ## A worked WSDL discovery walkthrough
 
-The HTB-style scenario: a SOAP service at `http://target:3002` with WSDL hidden.
+The typical scenario: a SOAP service at `http://target:3002` with WSDL hidden.
 
 ```shell
 # Step 1 - Probe canonical paths

@@ -225,7 +225,7 @@ When the reference isn't a sequential integer but a hash/encoding of one, the ma
 
 ### Build the hash list
 
-For the canonical `md5(base64(uid))` case (HTB-style):
+For the canonical `md5(base64(uid))` case (typical):
 
 ```bash
 # Generate first 1000 hashed references
@@ -447,4 +447,4 @@ grep -lE 'SSN|social|credit card|password' docs/*.txt
 | Refresh CSRF token per request | Fetch page, regex token, use in request |
 | Skip already-downloaded files | `[ -f "$file" ] && continue` |
 
-For the API-mutation patterns (PUT/POST/DELETE that need both disclosure and modification), continue to [Insecure APIs](/codex/web/idor/insecure-apis/). For the end-to-end skill-assessment chain combining disclosure + role escalation + function call, see [Chaining](/codex/web/idor/chaining/).
+For the API-mutation patterns (PUT/POST/DELETE that need both disclosure and modification), continue to [Insecure APIs](/codex/web/idor/insecure-apis/). For the end-to-end capstone chain combining disclosure + role escalation + function call, see [Chaining](/codex/web/idor/chaining/).

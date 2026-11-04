@@ -54,7 +54,7 @@ The three-line baseline. Always start here.
 
 ```cmd
 C:\> whoami
-winlpe-srv01\htb-student
+srv01\student
 ```
 
 Reads as `MACHINENAME\username` (local account) or `DOMAIN\username` (domain account). The presence of a domain in the output indicates this host is domain-joined and the current session has domain context - important for credential reuse and lateral-movement planning.
@@ -157,9 +157,9 @@ If `systeminfo` doesn't print hotfixes (some configurations hide them), query di
 C:\> wmic qfe
 
 Caption                                     CSName        Description      HotFixID   InstallDate  InstalledBy          InstalledOn
-http://support.microsoft.com/?kbid=3199986  WINLPE-SRV01  Update           KB3199986               NT AUTHORITY\SYSTEM  11/21/2016
-https://support.microsoft.com/help/5001078  WINLPE-SRV01  Security Update  KB5001078               NT AUTHORITY\SYSTEM  3/25/2021
-http://support.microsoft.com/?kbid=4103723  WINLPE-SRV01  Security Update  KB4103723               NT AUTHORITY\SYSTEM  3/25/2021
+http://support.microsoft.com/?kbid=3199986  SRV01  Update           KB3199986               NT AUTHORITY\SYSTEM  11/21/2016
+https://support.microsoft.com/help/5001078  SRV01  Security Update  KB5001078               NT AUTHORITY\SYSTEM  3/25/2021
+http://support.microsoft.com/?kbid=4103723  SRV01  Security Update  KB4103723               NT AUTHORITY\SYSTEM  3/25/2021
 ```
 
 Or with PowerShell:
@@ -169,9 +169,9 @@ PS> Get-HotFix | ft -AutoSize
 
 Source       Description     HotFixID  InstalledBy                InstalledOn
 ------       -----------     --------  -----------                -----------
-WINLPE-SRV01 Update          KB3199986 NT AUTHORITY\SYSTEM        11/21/2016 12:00:00 AM
-WINLPE-SRV01 Update          KB4054590 WINLPE-SRV01\Administrator 3/30/2021 12:00:00 AM
-WINLPE-SRV01 Security Update KB5001078 NT AUTHORITY\SYSTEM        3/25/2021 12:00:00 AM
+SRV01 Update          KB3199986 NT AUTHORITY\SYSTEM        11/21/2016 12:00:00 AM
+SRV01 Update          KB4054590 SRV01\Administrator 3/30/2021 12:00:00 AM
+SRV01 Security Update KB5001078 NT AUTHORITY\SYSTEM        3/25/2021 12:00:00 AM
 ```
 
 Save the `systeminfo` output to a file and feed it to [WES-NG](https://github.com/bitsadmin/wesng) on the attacker side:
@@ -279,11 +279,11 @@ PS> netstat -ano | Select-String '127\.0\.0\.1:|\[::1\]:'
 ```cmd
 C:\> net user
 
-User accounts for \\WINLPE-SRV01
+User accounts for \\SRV01
 
 -------------------------------------------------------------------------------
 Administrator            DefaultAccount           Guest
-helpdesk                 htb-student              jordan
+helpdesk                 student              jordan
 sarah                    secsvc
 ```
 
@@ -335,7 +335,7 @@ sarah
 secsvc
 ```
 
-The members of `administrators` are your immediate-promotion targets if you can capture their credentials. Domain accounts here (e.g., `INLANEFREIGHT\jordan_adm`) indicate a domain user with local admin rights - useful for lateral movement to other domain hosts.
+The members of `administrators` are your immediate-promotion targets if you can capture their credentials. Domain accounts here (e.g., `EXAMPLE\jordan_adm`) indicate a domain user with local admin rights - useful for lateral movement to other domain hosts.
 
 Repeat for any operationally interesting group (`net localgroup "Backup Operators"`, `net localgroup "Server Operators"`, etc.).
 

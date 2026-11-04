@@ -66,7 +66,7 @@ Pick the interface that sees the victim's traffic:
 
 - `eth0` / `enp*s*` - wired Ethernet on attacker's host
 - `wlan0` / `wlp*s*` - wireless (only sees broadcast / your own; rarely useful unless you're on the same SSID and the AP isn't isolating clients)
-- `tun0` - VPN tunnel (useful in HTB-style lab environments where the lab is on a shared tun network)
+- `tun0` - VPN tunnel (useful in typical lab environments where the lab is on a shared tun network)
 - `lo` - loopback (only useful if you're proxying victim traffic to localhost first)
 
 For a real on-network attack, the interface needs to be in promiscuous mode and you need ARP spoofing (with `arpspoof` / `ettercap`) to redirect victim traffic through you - or you're on a hub-like network (rare in 2024).

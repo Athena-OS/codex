@@ -47,7 +47,7 @@ Each segment is base64url-encoded JSON. Header declares the algorithm, payload c
 
 ```
 Header   {"alg":"HS256","typ":"JWT"}
-Payload  {"sub":"htbuser","role":"user","iat":1647135274,"exp":1647138874}
+Payload  {"sub":"appuser","role":"user","iat":1647135274,"exp":1647138874}
 ```
 
 Standard payload claims:
@@ -84,12 +84,12 @@ The original JWT vulnerability. Set the `alg` header to `none` and drop the sign
 ```
 # Original
 header   {"alg":"HS256"}
-payload  {"user":"htb","role":"user"}
+payload  {"user":"bob","role":"user"}
 signature  XYZ
 
 # Attack
 header   {"alg":"none"}
-payload  {"user":"htb","role":"admin"}
+payload  {"user":"bob","role":"admin"}
 signature  (empty)
 ```
 

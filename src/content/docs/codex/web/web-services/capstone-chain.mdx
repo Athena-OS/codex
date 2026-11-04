@@ -1,5 +1,5 @@
 ---
-title: Skill Assessment Chain
+title: Capstone Chain
 description: The capstone end-to-end walkthrough - WSDL discovery to enumerate operations and parameters, SOAPAction spoofing to bypass the external-network restriction on ExecuteCommand, then SQL injection through the Login operation's <username> parameter to extract the admin password hash from a SQLite users table. Two SOAP-specific primitives chained into one engagement.
 mitre: [T1190, T1213, T1556, T1078]
 d3fend: [D3-IAA, D3-RAPA]
@@ -7,7 +7,7 @@ impact: [DataExfil, AuthBypass, CredentialTheft]
 owasp: [A03, A05, A07]
 sidebar:
   order: 7
-  label: Skill assessment chain
+  label: Capstone chain
 ---
 
 ## TL;DR
@@ -199,7 +199,7 @@ Response:
 </soap:Envelope>
 ```
 
-SOAPAction spoofing works. `whoami` executed as `root`. But the brief asks for the admin password, not RCE. Reverse shell attempts (as the source doc notes) get blocked - there's something in the environment preventing easy command-line egress.
+SOAPAction spoofing works. `whoami` executed as `root`. But the brief asks for the admin password, not RCE. Reverse shell attempts get blocked - there's something in the environment preventing easy command-line egress.
 
 The SQL injection path is more direct.
 
@@ -448,4 +448,4 @@ Composite: critical. Unauthenticated attacker reads all stored credentials.
 | SQLMap on SOAP | `--method=POST --headers='Content-Type: text/xml\nSOAPAction: "Login"' --data='<soap...><username>*</username>...'` |
 | Parse `<result>` from response | `re.findall(r'<result>(.*?)</result>', response.text)` |
 
-This walkthrough closes Round 14. The pattern - WSDL discovery, operation enumeration, SOAPAction spoofing as a bypass, classic injection through API parameters - is the canonical SOAP-attack arc. Real engagements vary in the specific operations and bypass paths but follow this structure.
+This walkthrough closes the web-services cluster. The pattern - WSDL discovery, operation enumeration, SOAPAction spoofing as a bypass, classic injection through API parameters - is the canonical SOAP-attack arc. Real engagements vary in the specific operations and bypass paths but follow this structure.

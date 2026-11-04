@@ -44,7 +44,7 @@ Use both. Passive first to enumerate the obvious set; active to expand coverage 
 When WordPress loads a plugin or theme, it typically enqueues that extension's CSS or JS files, which appear as `<link>` or `<script>` tags in the HTML. Path: `/wp-content/plugins/<plugin>/...` or `/wp-content/themes/<theme>/...`.
 
 ```shell
-curl -s http://blog.inlanefreight.com/ \
+curl -s http://blog.example.com/ \
   | grep -oE '/wp-content/(plugins|themes)/[^/"]+' \
   | sort -u
 ```
@@ -60,7 +60,7 @@ Three extensions visible without an active probe.
 For more depth, look at the full asset URLs - they often include the plugin's own version in the `?ver=` query string (not the WP core version, but the plugin's):
 
 ```shell
-curl -s http://blog.inlanefreight.com/ \
+curl -s http://blog.example.com/ \
   | grep -oE '/wp-content/(plugins|themes)/[^"]+?ver=[^"\&]+' \
   | sort -u
 ```
@@ -97,7 +97,7 @@ These signals catch plugins that don't enqueue obvious assets (e.g., a security 
 When a plugin exists on disk, requesting its directory or a known file inside it returns a non-404 response - even if the plugin is deactivated.
 
 ```shell
-curl -sI http://blog.inlanefreight.com/wp-content/plugins/mail-masta/ | head -1
+curl -sI http://blog.example.com/wp-content/plugins/mail-masta/ | head -1
 ```
 
 Three meaningful response patterns:
