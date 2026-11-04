@@ -126,7 +126,7 @@ www       IN   CNAME server2
 The reverse-lookup zone file maps IPs back to names. For the 10.0.14.0/24 subnet:
 
 ```named
-$ORIGIN 14.129.10.in-addr.arpa
+$ORIGIN 14.0.10.in-addr.arpa
 $TTL 86400
 @   IN   SOA   dns1.domain.com.  hostmaster.domain.com. (...)
     IN   NS    ns1.domain.com.
@@ -322,9 +322,9 @@ done
 ```
 
 ```
-1.14.129.10.in-addr.arpa domain name pointer gateway.example.local.
-5.14.129.10.in-addr.arpa domain name pointer mail.example.local.
-136.14.129.10.in-addr.arpa domain name pointer ns.example.local.
+1.14.0.10.in-addr.arpa domain name pointer gateway.example.local.
+5.14.0.10.in-addr.arpa domain name pointer mail.example.local.
+136.14.0.10.in-addr.arpa domain name pointer ns.example.local.
 ```
 
 Hosts that have PTR records (because their admins set them up cleanly) reveal themselves. Hosts without PTRs are still there but harder to attribute.
