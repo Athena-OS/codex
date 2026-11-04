@@ -230,9 +230,9 @@ The whole pattern works best with *stored* XSS - payload sitting in the applicat
 | Comment field on a popular post | Anyone reading the comment | High-volume reach |
 | Username | Any list view of users | Wide reach |
 | Support ticket body | Support staff viewing the ticket | Targets admin-equivalent staff |
-| "Country" / freeform user fields | Any page rendering them | HTB-style scenario |
+| "Country" / freeform user fields | Any page rendering them | typical scenario |
 
-The HTB-style "Country" field in a user profile is a recurring pattern - apps that don't expect HTML in fields like that often render them unsanitized.
+The typical "Country" field in a user profile is a recurring pattern - apps that don't expect HTML in fields like that often render them unsanitized.
 
 ### Picking the right XSS landing page
 
@@ -246,7 +246,7 @@ When the affected page isn't admin-accessible, the chain stops at "compromise th
 
 ## Defeating the popup blocker
 
-When the XSS payload needs to open another window (e.g., to host a callback iframe), modern browsers block `window.open` unless the call is in response to user interaction. The HTB-style workaround:
+When the XSS payload needs to open another window (e.g., to host a callback iframe), modern browsers block `window.open` unless the call is in response to user interaction. The typical workaround:
 
 ```html
 <h1>Click here to win!</h1>
@@ -291,7 +291,7 @@ To run JavaScript at all, you need a CSP bypass. Common avenues:
 
 When CSP is well-designed, the XSS→CSRF chain breaks not because the chain itself is wrong but because the XSS step can't fire. The bypass story is then about CSP itself.
 
-## The HTB-style worked example
+## The typical worked example
 
 A profile-page XSS in a "Country" field that fires when anyone views the profile, targeting the "change visibility" action. The change-visibility flow:
 
@@ -333,7 +333,7 @@ Victim viewing the profile triggers both XHRs. The state change happens on the v
 
 ### Adapting to delete-account
 
-The HTB extra-practice: adapt the payload to delete the victim's account. The delete endpoint is `POST /app/delete` with `csrf=TOKEN` (and email-bound URL `/app/delete/<email>`):
+A useful extension: adapt the payload to delete the victim's account. The delete endpoint is `POST /app/delete` with `csrf=TOKEN` (and email-bound URL `/app/delete/<email>`):
 
 ```javascript
 <script>

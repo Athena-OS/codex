@@ -94,7 +94,7 @@ Given this WSDL fragment from [Discovery](/codex/web/web-services/discovery/):
   </s:element>
 </wsdl:types>
 
-<wsdl:binding name="HacktheboxServiceSoapBinding" type="tns:HacktheBoxSoapPort">
+<wsdl:binding name="ExampleServiceSoapBinding" type="tns:ExampleSoapPort">
   <wsdl:operation name="Login">
     <soap:operation soapAction="Login" style="document"/>
     ...
@@ -378,7 +378,7 @@ Particularly useful: SQL errors that surface through SOAP faults give you a clea
 </faultstring>
 ```
 
-That's a SQLite injection-positive signal - see [Skill assessment chain](/codex/web/web-services/skill-assessment-chain/) for the full SQL injection through SOAP walkthrough.
+That's a SQLite injection-positive signal - see [Capstone chain](/codex/web/web-services/capstone-chain/) for the full SQL injection through SOAP walkthrough.
 
 ## SOAP 1.1 vs SOAP 1.2
 
@@ -424,4 +424,4 @@ Note: no separate `SOAPAction:` header in 1.2 - the action moved into Content-Ty
 | 500 + Fault | Server-side error, often informative |
 | Generate templates from WSDL | soapUI auto-generation, or `wsdl2py`/`wsdl2java`/`svcutil.exe` |
 
-For the canonical SOAP-specific bypass attack, continue to [SOAPAction spoofing](/codex/web/web-services/soapaction-spoofing/). For the end-to-end skill-assessment chain combining SOAPAction spoofing with SQL injection, see [Skill assessment chain](/codex/web/web-services/skill-assessment-chain/).
+For the canonical SOAP-specific bypass attack, continue to [SOAPAction spoofing](/codex/web/web-services/soapaction-spoofing/). For the end-to-end capstone chain combining SOAPAction spoofing with SQL injection, see [Capstone chain](/codex/web/web-services/capstone-chain/).

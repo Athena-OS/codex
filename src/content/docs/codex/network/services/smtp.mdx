@@ -115,12 +115,12 @@ biff = no
 append_dot_mydomain = no
 compatibility_level = 2
 smtp_tls_session_cache_database = btree:${data_directory}/smtp_scache
-myhostname = mail1.inlanefreight.htb
+myhostname = mail1.example.local
 alias_maps = hash:/etc/aliases
 alias_database = hash:/etc/aliases
 mydestination = $myhostname, localhost
 masquerade_domains = $myhostname
-mynetworks = 127.0.0.0/8 10.129.0.0/16
+mynetworks = 127.0.0.0/8 10.0.0.0/16
 mailbox_size_limit = 0
 recipient_delimiter = +
 smtp_bind_address = 0.0.0.0
@@ -155,19 +155,19 @@ The big two: open relay (`mynetworks = 0.0.0.0/0` or equivalent) and VRFY enable
 ### Banner + script scan
 
 ```shell
-sudo nmap 10.129.14.128 -sC -sV -p25
+sudo nmap 10.0.14.128 -sC -sV -p25
 ```
 
 ```
 PORT   STATE SERVICE VERSION
 25/tcp open  smtp    Postfix smtpd
-|_smtp-commands: mail1.inlanefreight.htb, PIPELINING, SIZE 10240000, VRFY, ETRN,
+|_smtp-commands: mail1.example.local, PIPELINING, SIZE 10240000, VRFY, ETRN,
                  ENHANCEDSTATUSCODES, 8BITMIME, DSN, SMTPUTF8, CHUNKING,
 ```
 
 Two key data points in that output:
 
-- **`mail1.inlanefreight.htb`** - the server's `myhostname` setting, an internal-facing hostname
+- **`mail1.example.local`** - the server's `myhostname` setting, an internal-facing hostname
 - **`VRFY` is in the capability list** - user enumeration is possible
 
 The default `smtp-commands` NSE script does the EHLO/capabilities probe automatically. Other scripts to consider:
@@ -179,19 +179,19 @@ nmap -p25 --script smtp-commands,smtp-enum-users,smtp-open-relay,smtp-vuln-* <ta
 ### Manual interaction with telnet/nc
 
 ```shell
-telnet 10.129.14.128 25
+telnet 10.0.14.128 25
 ```
 
 ```
-Trying 10.129.14.128...
-Connected to 10.129.14.128.
+Trying 10.0.14.128...
+Connected to 10.0.14.128.
 220 ESMTP Server
 
 HELO test
-250 mail1.inlanefreight.htb
+250 mail1.example.local
 
 EHLO test
-250-mail1.inlanefreight.htb
+250-mail1.example.local
 250-PIPELINING
 250-SIZE 10240000
 250-ETRN
@@ -210,8 +210,8 @@ The EHLO response advertises capabilities. If `VRFY` appears, user enumeration w
 VRFY root
 252 2.0.0 root
 
-VRFY cry0l1t3
-252 2.0.0 cry0l1t3
+VRFY jdoe
+252 2.0.0 jdoe
 
 VRFY testuser
 252 2.0.0 testuser
@@ -226,7 +226,7 @@ When VRFY actually works as designed, you get different codes for valid vs. inva
 
 ```
 VRFY postmaster
-250 2.1.5 postmaster@inlanefreight.htb
+250 2.1.5 postmaster@example.local
 
 VRFY nonexistent_user
 550 5.1.1 <nonexistent_user>: Recipient address rejected: User unknown in local recipient table
@@ -242,11 +242,11 @@ When VRFY is disabled (or returns 252 for everything), try `MAIL FROM`/`RCPT TO`
 MAIL FROM:<test@test.com>
 250 2.1.0 Ok
 
-RCPT TO:<root@inlanefreight.htb>
+RCPT TO:<root@example.local>
 250 2.1.5 Ok
 
-RCPT TO:<nonexistent@inlanefreight.htb>
-550 5.1.1 <nonexistent@inlanefreight.htb>: Recipient address rejected: User unknown in local recipient table
+RCPT TO:<nonexistent@example.local>
+550 5.1.1 <nonexistent@example.local>: Recipient address rejected: User unknown in local recipient table
 ```
 
 Same primitive, different command. Often works when VRFY is locked down because `RCPT TO` can't easily be disabled (mail wouldn't work).
@@ -255,20 +255,20 @@ Same primitive, different command. Often works when VRFY is locked down because 
 
 ```
 EXPN admins
-250 2.1.5 admin1@inlanefreight.htb
-250 2.1.5 admin2@inlanefreight.htb
+250 2.1.5 admin1@example.local
+250 2.1.5 admin2@example.local
 ```
 
 EXPN expands a mailing list to its members. Often disabled, but when enabled it's better than VRFY because you get the membership of group aliases in one shot.
 
 ### Automated user enumeration
 
-The `smtp-user-enum` tool exists but as the HTB source notes, results are sometimes wrong. The Metasploit module is more reliable:
+The `smtp-user-enum` tool exists but as is well documented, results are sometimes wrong. The Metasploit module is more reliable:
 
 ```shell
 msfconsole
 > use auxiliary/scanner/smtp/smtp_enum
-> set RHOSTS 10.129.14.128
+> set RHOSTS 10.0.14.128
 > set USER_FILE /usr/share/seclists/Usernames/Names/names.txt
 > set THREADS 5
 > run
@@ -278,7 +278,7 @@ For a quick manual sweep:
 
 ```shell
 while read user; do
-  echo -e "VRFY $user\nQUIT" | nc -q 1 10.129.14.128 25 | grep -E '^25[02]'
+  echo -e "VRFY $user\nQUIT" | nc -q 1 10.0.14.128 25 | grep -E '^25[02]'
 done < users.txt
 ```
 
@@ -287,7 +287,7 @@ done < users.txt
 The dedicated NSE script runs 16 different relay tests:
 
 ```shell
-sudo nmap 10.129.14.128 -p25 --script smtp-open-relay -v
+sudo nmap 10.0.14.128 -p25 --script smtp-open-relay -v
 ```
 
 ```
@@ -309,24 +309,24 @@ The `relaytest@nmap.scanme.org` recipient is a mailbox actually monitored by the
 When you want to spoof a sender or test a specific path:
 
 ```
-telnet 10.129.14.128 25
+telnet 10.0.14.128 25
 220 ESMTP Server
 
-EHLO inlanefreight.htb
-250-mail1.inlanefreight.htb
+EHLO example.local
+250-mail1.example.local
 ...
 250 CHUNKING
 
-MAIL FROM: <cry0l1t3@inlanefreight.htb>
+MAIL FROM: <jdoe@example.local>
 250 2.1.0 Ok
 
-RCPT TO: <mrb3n@inlanefreight.htb> NOTIFY=success,failure
+RCPT TO: <bjones@example.local> NOTIFY=success,failure
 250 2.1.5 Ok
 
 DATA
 354 End data with <CR><LF>.<CR><LF>
-From: <cry0l1t3@inlanefreight.htb>
-To: <mrb3n@inlanefreight.htb>
+From: <jdoe@example.local>
+To: <bjones@example.local>
 Subject: Quick question
 Date: Tue, 28 Sept 2021 16:32:51 +0200
 
@@ -350,7 +350,7 @@ For repeatable testing, [`swaks`](http://www.jetmore.org/john/code/swaks/) autom
 
 ```shell
 swaks --to victim@target.com --from spoofed@target.com \
-      --server 10.129.14.128:25 \
+      --server 10.0.14.128:25 \
       --header "Subject: Test" \
       --body "Test body"
 ```
@@ -360,7 +360,7 @@ swaks --to victim@target.com --from spoofed@target.com \
 If you're tunneling through a CONNECT proxy (corporate proxy with allow-listed destinations):
 
 ```
-CONNECT 10.129.14.128:25 HTTP/1.0
+CONNECT 10.0.14.128:25 HTTP/1.0
 
 HTTP/1.0 200 Connection established
 
@@ -376,13 +376,13 @@ Works when the proxy permits CONNECT to arbitrary ports (often it does, because 
 For port 465 (SMTPS):
 
 ```shell
-openssl s_client -connect 10.129.14.128:465
+openssl s_client -connect 10.0.14.128:465
 ```
 
 For port 25 or 587 with STARTTLS:
 
 ```shell
-openssl s_client -connect 10.129.14.128:25 -starttls smtp
+openssl s_client -connect 10.0.14.128:25 -starttls smtp
 ```
 
 After the TLS handshake, the SMTP conversation continues encrypted but with the same commands.
@@ -392,18 +392,18 @@ After the TLS handshake, the SMTP conversation continues encrypted but with the 
 The mail *header* is intel-rich. When you receive (or capture) a mail from the target, the headers reveal the server chain it traversed:
 
 ```
-Received: from mail1.inlanefreight.htb (mail1.internal.inlanefreight.htb [10.129.18.200])
-    by mail.relay.inlanefreight.com with ESMTPS id ABC123
+Received: from mail1.example.local (mail1.internal.example.local [10.0.18.200])
+    by mail.relay.example.com with ESMTPS id ABC123
     for <recipient@external.com>; Tue, 28 Sep 2021 16:33:12 +0200
-Received: from web01.inlanefreight.htb (unknown [10.129.42.50])
-    by mail1.inlanefreight.htb (Postfix) with ESMTP id XYZ789
-    for <sender@inlanefreight.com>; Tue, 28 Sep 2021 16:32:51 +0200
+Received: from web01.example.local (unknown [10.0.42.50])
+    by mail1.example.local (Postfix) with ESMTP id XYZ789
+    for <sender@example.com>; Tue, 28 Sep 2021 16:32:51 +0200
 ```
 
 What this reveals:
 
-- Internal hostnames (`mail1.internal.inlanefreight.htb`, `web01.inlanefreight.htb`)
-- Internal IP addresses (`10.129.18.200`, `10.129.42.50`)
+- Internal hostnames (`mail1.internal.example.local`, `web01.example.local`)
+- Internal IP addresses (`10.0.18.200`, `10.0.42.50`)
 - The path the mail took through internal infrastructure
 - Software versions (`Postfix` here, sometimes with version)
 

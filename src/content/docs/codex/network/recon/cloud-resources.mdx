@@ -18,8 +18,8 @@ Cloud storage misconfigurations are one of the easiest wins in modern engagement
 grep -E '(amazonaws|blob.core.windows|storage.googleapis)' subdomains.txt
 
 # 2. Google dorks - find indexed bucket URLs
-"site:s3.amazonaws.com inlanefreight"
-"site:blob.core.windows.net inlanefreight"
+"site:s3.amazonaws.com example"
+"site:blob.core.windows.net example"
 
 # 3. Source-code crawl - buckets referenced in JS/CSS/HTML of the main site
 curl -s https://target.com | grep -Eo 'https?://[^"]*\.(amazonaws\.com|blob\.core\.windows\.net|storage\.googleapis\.com)[^"]*'
@@ -50,11 +50,11 @@ Cloud storage gets named via DNS for the same reason any other service does - hu
 
 ```shell
 # After resolving subdomains to IPs (or to CNAMEs):
-host -t cname assets.inlanefreight.com
+host -t cname assets.example.com
 ```
 
 ```
-assets.inlanefreight.com is an alias for s3-website-us-west-2.amazonaws.com.
+assets.example.com is an alias for s3-website-us-west-2.amazonaws.com.
 ```
 
 Or check the resolved IPs against known cloud ranges:
@@ -70,7 +70,7 @@ When you find a `*.amazonaws.com` alias, the actual bucket name often follows a 
 - `<bucket>.s3-us-west-2.amazonaws.com`
 - `<bucket>.s3-website-us-west-2.amazonaws.com`
 
-If `assets.inlanefreight.com` aliases to the S3 website endpoint, the bucket is very likely named `assets.inlanefreight.com` (the alias works because the bucket name matches the host header).
+If `assets.example.com` aliases to the S3 website endpoint, the bucket is very likely named `assets.example.com` (the alias works because the bucket name matches the host header).
 
 ## Provider naming conventions
 
@@ -88,11 +88,11 @@ If `assets.inlanefreight.com` aliases to the S3 website endpoint, the bucket is 
 Useful pattern: companies tend to name buckets after either the application, the environment, or the data. So you might see:
 
 ```
-inlanefreight-assets
-inlanefreight-backups
-inlanefreight-prod
-inlanefreight-staging
-ilfreight-prod
+example-assets
+example-backups
+example-prod
+example-staging
+example-prod
 ilf-data
 ```
 
@@ -105,23 +105,23 @@ Google has indexed massive amounts of bucket content. Cloud provider URLs follow
 ### AWS S3
 
 ```
-site:s3.amazonaws.com inlanefreight
-site:s3-us-west-2.amazonaws.com "inlanefreight" filetype:pdf
-inurl:s3.amazonaws.com "inlanefreight" intext:"confidential"
+site:s3.amazonaws.com example
+site:s3-us-west-2.amazonaws.com "example" filetype:pdf
+inurl:s3.amazonaws.com "example" intext:"confidential"
 ```
 
 ### Azure Blob
 
 ```
-site:blob.core.windows.net "inlanefreight"
-inurl:blob.core.windows.net filetype:xlsx "inlanefreight"
+site:blob.core.windows.net "example"
+inurl:blob.core.windows.net filetype:xlsx "example"
 ```
 
 ### GCP
 
 ```
-site:storage.googleapis.com "inlanefreight"
-inurl:storage.googleapis.com "inlanefreight" filetype:json
+site:storage.googleapis.com "example"
+inurl:storage.googleapis.com "example" filetype:json
 ```
 
 ### General cloud bucket dorking
@@ -146,9 +146,9 @@ curl -sL https://target.com \
 ```
 
 ```
-https://cdn-images.inlanefreight.com.s3.amazonaws.com/banner.png
-https://inlanefreight-static.s3-us-west-2.amazonaws.com/main.css
-https://inlanefreight-docs.blob.core.windows.net/public/whitepaper.pdf
+https://cdn-images.example.com.s3.amazonaws.com/banner.png
+https://example-static.s3-us-west-2.amazonaws.com/main.css
+https://example-docs.blob.core.windows.net/public/whitepaper.pdf
 ```
 
 Each unique hostname is a bucket worth investigating. The full URL is what's referenced; the bucket itself often has *additional* content beyond what's linked in HTML.
@@ -156,7 +156,7 @@ Each unique hostname is a bucket worth investigating. The full URL is what's ref
 For comprehensive crawling, use a tool like [`waybackurls`](https://github.com/tomnomnom/waybackurls) or [`gau`](https://github.com/lc/gau) to pull URLs the Wayback Machine has archived for the domain - historical references often include staging buckets that aren't linked anymore.
 
 ```shell
-waybackurls inlanefreight.com | grep -E 'amazonaws|blob|googleapis' | sort -u
+waybackurls example.com | grep -E 'amazonaws|blob|googleapis' | sort -u
 ```
 
 ## GrayHatWarfare
@@ -167,15 +167,15 @@ waybackurls inlanefreight.com | grep -E 'amazonaws|blob|googleapis' | sort -u
 - Filename / extension
 - Content type
 
-This service has cataloged hundreds of thousands of misconfigured buckets. Search for the company name, then for common abbreviations (companies often abbreviate in internal naming - `InlaneFreight` → `ilf` → `if`). Search for likely file types:
+This service has cataloged hundreds of thousands of misconfigured buckets. Search for the company name, then for common abbreviations (companies often abbreviate in internal naming - `Example` → `ilf` → `if`). Search for likely file types:
 
 ```
-inlanefreight        → matches bucket names
+example        → matches bucket names
 ilf                  → matches abbreviations  
-inlanefreight .sql   → backup dumps
-inlanefreight .pem   → private keys
-inlanefreight id_rsa → SSH keys
-inlanefreight .env   → environment configs
+example .sql   → backup dumps
+example .pem   → private keys
+example id_rsa → SSH keys
+example .env   → environment configs
 ```
 
 Common high-value finds:
@@ -200,10 +200,10 @@ Even when no DNS pointer or source-code link reveals a bucket, you can guess nam
 
 ```shell
 # cloud_enum example
-python cloud_enum.py -k inlanefreight -k ilfreight -k ilf -k if
+python cloud_enum.py -k example -k example -k ilf -k if
 ```
 
-The tool generates permutations: `inlanefreight-prod`, `prod-inlanefreight`, `inlanefreight-backup`, `inlanefreight.us-west-2`, etc. - and checks each against AWS, Azure, and GCP simultaneously.
+The tool generates permutations: `example-prod`, `prod-example`, `example-backup`, `example.us-west-2`, etc. - and checks each against AWS, Azure, and GCP simultaneously.
 
 ### Wordlist patterns that work
 
@@ -232,7 +232,7 @@ For each bucket you discover that belongs to the target:
 4. **Note credentials within content** - config files, `.env`, scripts often contain hardcoded keys.
 5. **Don't exfiltrate** - confirm the bucket is open, document the access level, take screenshots, don't pull gigabytes of customer data unless explicitly authorized.
 
-The finding writes itself: "Bucket `inlanefreight-backups` is publicly readable and contains [N] database backup files spanning [date range]. Recommended remediation: set bucket ACL to private, audit access logs."
+The finding writes itself: "Bucket `example-backups` is publicly readable and contains [N] database backup files spanning [date range]. Recommended remediation: set bucket ACL to private, audit access logs."
 
 ## SSH keys and credentials in cloud buckets
 

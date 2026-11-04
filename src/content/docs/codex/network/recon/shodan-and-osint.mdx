@@ -53,14 +53,14 @@ The free tier limits queries hard; a paid Membership ($59 one-time) raises limit
 ### Querying a single host
 
 ```shell
-shodan host 10.129.24.93
+shodan host 10.0.24.93
 ```
 
 ```
-10.129.24.93
+10.0.24.93
 City:                    Berlin
 Country:                 Germany
-Organization:            InlaneFreight
+Organization:            Example
 Updated:                 2021-09-01T09:02:11.370085
 Number of open ports:    2
 
@@ -71,7 +71,7 @@ Ports:
 
 Useful fields:
 
-- **Organization** - confirms (or contradicts) attribution. If `Organization` says `InlaneFreight`, the IP genuinely belongs to them. If it says `Cloudflare, Inc.`, the IP is a CDN front for the real origin server.
+- **Organization** - confirms (or contradicts) attribution. If `Organization` says `Example`, the IP genuinely belongs to them. If it says `Cloudflare, Inc.`, the IP is a CDN front for the real origin server.
 - **Open ports** - what was observed open. Often more revealing than a fresh nmap because Shodan catches services that open intermittently.
 - **Banners** - version strings. `OpenSSH (7.6p1 Ubuntu-4ubuntu0.3)` tells you Ubuntu 18.04 with that specific OpenSSH version. Match against the [CVE database](https://www.cvedetails.com/) for known issues.
 
@@ -91,15 +91,15 @@ A medium-sized target might have 20-50 unique IPs. This loop completes in under 
 ### Sample multi-host pattern from a real target
 
 ```
-10.129.24.93        Berlin, Germany    nginx on 80/443                    → web app
-10.129.27.33        Berlin, Germany    OpenSSH 7.6p1, nginx on 80/443     → bastion or main web
-10.129.27.22        Berlin, Germany    SMTP 25, DNS 53, HTTP 80/81, POP3  → likely mail + DNS host
-10.129.95.250       AWS us-west-2      S3 static website                  → third-party (cloud)
+10.0.24.93        Berlin, Germany    nginx on 80/443                    → web app
+10.0.27.33        Berlin, Germany    OpenSSH 7.6p1, nginx on 80/443     → bastion or main web
+10.0.27.22        Berlin, Germany    SMTP 25, DNS 53, HTTP 80/81, POP3  → likely mail + DNS host
+10.0.95.250       AWS us-west-2      S3 static website                  → third-party (cloud)
 ```
 
 Immediate observations:
 
-- The mail server (`10.129.27.22`) runs both SMTP and DNS, and exposes ports `80` and `81` (an admin panel?) and a non-standard `444`. Worth deeper investigation.
+- The mail server (`10.0.27.22`) runs both SMTP and DNS, and exposes ports `80` and `81` (an admin panel?) and a non-standard `444`. Worth deeper investigation.
 - The Ubuntu version visible in the SSH banner can be tracked back to specific kernel versions and out-of-band update windows.
 - The `s3-website` IP is third-party hosted - out of scope for active testing, but worth checking for bucket misconfigurations (see [Cloud Resources](/codex/network/recon/cloud-resources/)).
 
@@ -109,16 +109,16 @@ The CLI also supports search queries:
 
 ```shell
 # Find hosts matching a banner string
-shodan search 'nginx country:DE org:"InlaneFreight"'
+shodan search 'nginx country:DE org:"Example"'
 
 # Find hosts running specific software versions
 shodan search 'product:"OpenSSH" version:"7.6"'
 
 # Find hosts with specific HTTP titles (useful for admin panels)
-shodan search 'http.title:"Login Page" org:"InlaneFreight"'
+shodan search 'http.title:"Login Page" org:"Example"'
 
 # Find hosts exposing specific services
-shodan search 'port:3306 country:DE org:"InlaneFreight"'
+shodan search 'port:3306 country:DE org:"Example"'
 ```
 
 Operators are documented at [Shodan Filters](https://www.shodan.io/search/filters). Combine `org:`, `country:`, `port:`, `product:`, `version:` to narrow searches to in-scope assets.
@@ -132,13 +132,13 @@ Operators are documented at [Shodan Filters](https://www.shodan.io/search/filter
 # CLI:
 pip install censys
 censys config  # add API ID + secret
-censys hosts 10.129.27.33
+censys hosts 10.0.27.33
 ```
 
 Censys also offers certificate search - useful for finding IPs that present a TLS cert with a specific issuer/subject. Sometimes catches subdomains that crt.sh missed:
 
 ```shell
-censys search 'services.tls.certificates.leaf_data.subject.organization: "InlaneFreight"'
+censys search 'services.tls.certificates.leaf_data.subject.organization: "Example"'
 ```
 
 ## Other passive intel sources

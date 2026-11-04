@@ -48,12 +48,12 @@ C:\> ipconfig /all
 Read for:
 
 - **Number of interfaces** - Multiple Ethernet adapters mean the host bridges networks. Note each interface's IP, mask, gateway.
-- **DNS Suffix Search List** - Tells you the AD domain(s) this host knows about. `.htb` or `corp.example.com` in the search list points at the AD environment.
+- **DNS Suffix Search List** - Tells you the AD domain(s) this host knows about. `.local` or `corp.example.com` in the search list points at the AD environment.
 - **Primary DNS Suffix** - The host's own domain membership. Empty = workgroup machine; populated = domain-joined.
 - **DNS Servers** - Often Domain Controllers in AD environments. The DCs are obvious targets once you have credentials.
 - **Connection-specific DNS Suffix per adapter** - Each interface may be in a different DNS zone, confirming dual-homed hosts.
 
-A dual-homed Server 2016 with one NIC on `192.168.20.0/24` and another on `10.129.0.0/16` is bridging environments - possibly a management network, a backup network, or a different security zone. Document it and note for pivot planning.
+A dual-homed Server 2016 with one NIC on `192.168.20.0/24` and another on `10.0.0.0/16` is bridging environments - possibly a management network, a backup network, or a different security zone. Document it and note for pivot planning.
 
 ### ARP cache - who has this host been talking to
 
@@ -61,7 +61,7 @@ A dual-homed Server 2016 with one NIC on `192.168.20.0/24` and another on `10.12
 C:\> arp -a
 ```
 
-The ARP table reveals hosts that have recently exchanged traffic with this one. Hosts in the cache are either gateways/services *or* hosts that admins regularly RDP/WinRM into from here. The latter set is high-signal for credential-hunting later: if `10.129.43.12` and `10.129.43.13` are in the ARP table of a sysadmin workstation, those are likely admin-accessed servers.
+The ARP table reveals hosts that have recently exchanged traffic with this one. Hosts in the cache are either gateways/services *or* hosts that admins regularly RDP/WinRM into from here. The latter set is high-signal for credential-hunting later: if `10.0.43.12` and `10.0.43.13` are in the ARP table of a sysadmin workstation, those are likely admin-accessed servers.
 
 ### Routing - second-order networks
 
@@ -72,7 +72,7 @@ C:\> route print
 The routing table tells you what *other* networks this host can reach. Look at the IPv4 Route Table for:
 
 - **Multiple default routes** (`0.0.0.0`) - Almost always indicates a dual-homed host with both interfaces having gateways. The metric values control which interface traffic prefers.
-- **Persistent routes** - Static routes configured by admins. If `192.168.20.0/24 → 10.129.0.5` is persistent, somebody set it deliberately; that network is reachable via that gateway.
+- **Persistent routes** - Static routes configured by admins. If `192.168.20.0/24 → 10.0.0.5` is persistent, somebody set it deliberately; that network is reachable via that gateway.
 - **Non-obvious networks** - Routes to `172.16.0.0/12` or `10.0.0.0/8` blocks when the host's IP is in `192.168.x.x` suggest VPN connections or site-to-site links.
 
 The combination of interfaces, ARP cache, and routing tells you the host's *reachable surface*. If the engagement requires lateral movement, this is the first place to look.

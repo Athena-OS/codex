@@ -55,7 +55,7 @@ WordPress maps the URL parameter `author=N` (where N is a numeric user ID) to th
 The redirect's `Location:` header *contains the user's slug*. That's the operator-relevant detail.
 
 ```shell
-curl -sI 'http://blog.inlanefreight.com/?author=1'
+curl -sI 'http://blog.example.com/?author=1'
 ```
 
 ```
@@ -63,7 +63,7 @@ HTTP/1.1 301 Moved Permanently
 Date: Wed, 13 May 2020 20:47:08 GMT
 Server: Apache/2.4.29 (Ubuntu)
 X-Redirect-By: WordPress
-Location: http://blog.inlanefreight.com/index.php/author/admin/
+Location: http://blog.example.com/index.php/author/admin/
 Content-Length: 0
 Content-Type: text/html; charset=UTF-8
 ```
@@ -73,7 +73,7 @@ The `Location:` is `.../author/admin/` - user ID 1's slug is `admin`.
 For non-existent IDs:
 
 ```shell
-curl -sI 'http://blog.inlanefreight.com/?author=999'
+curl -sI 'http://blog.example.com/?author=999'
 ```
 
 ```

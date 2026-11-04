@@ -324,7 +324,7 @@ See [Uploads cluster](/codex/web/uploads/) for the complete bypass catalog.
 
 The substance: untrusted input flows into a shell command. The API delta: API parameters often reach `system()`/`shell_exec()`/`exec()` calls in router-style code that uses `call_user_func_array` or equivalent dynamic dispatch.
 
-The HTB-style pattern:
+The typical pattern:
 
 ```php
 <?php
@@ -459,4 +459,4 @@ This bridges into deserialization attacks, which are large enough for their own 
 | WordPress XML-RPC abuse | `xmlrpc.php` brute / pingback / multicall | [WP XML-RPC](/codex/web/wordpress/xmlrpc-abuse/) |
 | SOAPAction spoofing | Body operation ≠ header SOAPAction | [SOAPAction spoofing](/codex/web/web-services/soapaction-spoofing/) |
 
-For the standalone API-specific topic (ReDoS), see [ReDoS](/codex/web/web-services/redos/). For the capstone chain (SOAPAction spoofing + SQL injection), see [Skill assessment chain](/codex/web/web-services/skill-assessment-chain/).
+For the standalone API-specific topic (ReDoS), see [ReDoS](/codex/web/web-services/redos/). For the capstone chain (SOAPAction spoofing + SQL injection), see [Capstone chain](/codex/web/web-services/capstone-chain/).

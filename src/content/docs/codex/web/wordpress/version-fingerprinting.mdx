@@ -55,7 +55,7 @@ WordPress writes a `<meta name="generator">` tag into every page's `<head>` by d
 Curl + grep extracts it:
 
 ```shell
-curl -s http://blog.inlanefreight.com/ | grep -i 'meta name="generator"'
+curl -s http://blog.example.com/ | grep -i 'meta name="generator"'
 ```
 
 ```
@@ -155,10 +155,10 @@ curl -s http://target/wp-json/ | jq '.'
 
 ```json
 {
-  "name": "Inlanefreight Blog",
+  "name": "Example Blog",
   "description": "Just another WordPress site",
-  "url": "http://blog.inlanefreight.com",
-  "home": "http://blog.inlanefreight.com",
+  "url": "http://blog.example.com",
+  "home": "http://blog.example.com",
   "gmt_offset": "0",
   "timezone_string": "",
   "namespaces": [

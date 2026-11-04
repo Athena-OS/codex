@@ -93,7 +93,7 @@ When an OR alternative can match the same prefix as another, the engine consider
 
 ### The infamous email regex
 
-The HTB-style example:
+The typical example:
 
 ```regex
 ^([a-zA-Z0-9_.-])+@(([a-zA-Z0-9-])+.)+([a-zA-Z0-9]{2,4})+$
@@ -217,9 +217,9 @@ done
 
 Each request occupies one worker for ~30-60 seconds. Six workers locked at any time. Service is "available" by uptime metrics but practically unusable. Detection requires the defender to notice worker pool saturation, which is a thinner signal than request flood.
 
-## The HTB-style worked walkthrough
+## The typical worked walkthrough
 
-Walking through the source-doc scenario:
+Walking through a representative scenario:
 
 ### Step 1 - Identify the surface
 
@@ -354,4 +354,4 @@ The proof-of-concept is one crafted-input response time. Anything beyond that ri
 | Backtracking-immune engines | RE2 (Go regexp, Rust regex), Hyperscan |
 | Backtracking-vulnerable engines | PCRE (PHP), V8 (JS), `re` (Python), `regex` (Ruby), .NET, Java `Pattern` |
 
-For the API-specific context this attack lives in, see the [Overview](/codex/web/web-services/) and [API vuln context](/codex/web/web-services/api-vuln-context/). For the capstone chain combining SOAPAction spoofing + SQL injection, see [Skill assessment chain](/codex/web/web-services/skill-assessment-chain/).
+For the API-specific context this attack lives in, see the [Overview](/codex/web/web-services/) and [API vuln context](/codex/web/web-services/api-vuln-context/). For the capstone chain combining SOAPAction spoofing + SQL injection, see [Capstone chain](/codex/web/web-services/capstone-chain/).

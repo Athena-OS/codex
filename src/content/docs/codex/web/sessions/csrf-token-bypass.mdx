@@ -378,7 +378,7 @@ This is the canonical [XSS + CSRF chain](/codex/web/sessions/xss-csrf-chain/) - 
 
 ## A worked weak-token bypass
 
-The HTB-style scenario: app generates CSRF tokens as `md5(username)`. Operator owns account `attacker`, victim is `victim`.
+The typical scenario: app generates CSRF tokens as `md5(username)`. Operator owns account `attacker`, victim is `victim`.
 
 ```shell
 # 1. Confirm the formula on attacker's own account
