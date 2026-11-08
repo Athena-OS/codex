@@ -10,11 +10,11 @@
     "astro": "astro"
   },
   "dependencies": {
-    "@astrojs/netlify": "^7.0.8",
-    "@astrojs/starlight": "^0.39.2",
-    "@tsparticles/engine": "^3.9.1",
-    "@tsparticles/slim": "^3.9.1",
-    "astro": "^6.3.1",
-    "sharp": "^0.34.5"
+    "@astrojs/netlify": "8.2.12",
+    "@astrojs/starlight": "0.42.10",
+    "@tsparticles/engine": "^4.5.3",
+    "@tsparticles/slim": "^4.5.3",
+    "astro": "7.4.7",
+    "sharp": "^0.35.5"
   }
 }

@@ -4,6 +4,7 @@ import starlight from '@astrojs/starlight';
 import netlify from '@astrojs/netlify';
 
 export default defineConfig({
+        site: 'https://codex.athenaos.org',
 	output: 'static',
 	adapter: netlify(),
 	vite: {
